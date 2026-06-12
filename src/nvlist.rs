@@ -47,7 +47,7 @@ pub enum NvError {
     #[rustfmt::skip]
     #[error("buffer truncated: need {need} bytes at offset {at}, have {have}")]
     Truncated { at: usize, need: usize, have: usize },
-    #[error("unsupported nvlist encoding {0} (only native supported)")]
+    #[error("unsupported nvlist encoding {0} (native and XDR supported)")]
     UnsupportedEncoding(u8),
     #[error("unsupported endianness {0}")]
     UnsupportedEndian(u8),
@@ -185,27 +185,58 @@ impl<'a> Cursor<'a> {
         }
         Ok(i32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap()))
     }
+
+    // XDR payloads are big-endian regardless of host order.
+
+    fn read_i32_be(&mut self) -> Result<i32> {
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn read_u32_be(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn read_u64_be(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    /// XDR string: u32 length (no NUL), bytes, padded to a 4-byte boundary.
+    fn read_xdr_string(&mut self) -> Result<String> {
+        let len = self.read_u32_be()? as usize;
+        let bytes = self.take(len)?;
+        let s = String::from_utf8_lossy(bytes).into_owned();
+        self.take(xdr_pad(len))?;
+        Ok(s)
+    }
+}
+
+/// Bytes of padding XDR adds after `len` bytes of payload.
+const fn xdr_pad(len: usize) -> usize {
+    (4 - (len % 4)) % 4
 }
 
 impl NvList {
-    /// Decode a packed nvlist (with stream header) in native encoding.
-    #[rustfmt::skip]
+    /// Decode a packed nvlist (with stream header) in native or XDR encoding.
     pub fn unpack(buf: &[u8]) -> Result<NvList> {
         let mut cur = Cursor { buf, pos: 0 };
         let hdr = cur.take(4)?;
         match hdr[0] {
-            0 => (),
-            other => return Err(NvError::UnsupportedEncoding(other)),
+            0 => {
+                // nvs_header_t.nvh_endian: 1 = little. Big-endian native
+                // streams only occur on big-endian hosts, not targeted yet.
+                if hdr[1] != 1 {
+                    return Err(NvError::UnsupportedEndian(hdr[1]));
+                }
+                let version = cur.read_i32()?;
+                let nvflag = cur.read_u32()?;
+                let pairs = decode_pairs(&mut cur, 0)?;
+                Ok(NvList { version, nvflag, pairs })
+            }
+            // XDR payload is big-endian on the wire regardless of the
+            // host-endianness recorded in the header byte.
+            1 => decode_xdr_list(&mut cur, 0),
+            other => Err(NvError::UnsupportedEncoding(other)),
         }
-        // nvs_header_t.nvh_endian: 1 = little. Big-endian streams only occur
-        // on big-endian hosts, which we don't target yet.
-        if hdr[1] != 1 {
-            return Err(NvError::UnsupportedEndian(hdr[1]));
-        }
-        let version = cur.read_i32()?;
-        let nvflag = cur.read_u32()?;
-        let pairs = decode_pairs(&mut cur, 0)?;
-        Ok(NvList { version, nvflag, pairs })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &NvPair> {
@@ -427,6 +458,186 @@ fn read_cstr(buf: &[u8], pair_name: &str) -> Result<(String, usize)> {
         Some(n) => Ok((String::from_utf8_lossy(&buf[..n]).into_owned(), n + 1)),
         None => Err(NvError::BadString(pair_name.to_string())),
     }
+}
+
+/* ------------------------------ XDR decoding ----------------------------- */
+
+/*
+Format per the comment above `nvs_xdr_create` in doc/reference/nvpair.c:
+every list (root and embedded alike) is `i32 version, u32 nvflag`, then
+nvpairs, then an 8-byte double-zero terminator. Each nvpair is:
+`i32 encoded_size, i32 decoded_size, name (xdr string), i32 type,
+i32 nelem, value`. Scalars ≤32 bits occupy 4 bytes, 64-bit ones 8.
+Scalar arrays (xdr_array) repeat the element count in a leading u32;
+byte arrays (xdr_opaque) and string arrays do not.
+*/
+
+/// Decode one XDR nvlist starting at version/nvflag, consuming its terminator.
+fn decode_xdr_list(cur: &mut Cursor, depth: usize) -> Result<NvList> {
+    if depth > MAX_DEPTH {
+        return Err(NvError::TooDeep);
+    }
+    let version = cur.read_i32_be()?;
+    let nvflag = cur.read_u32_be()?;
+    let mut pairs = Vec::new();
+    loop {
+        let pair_start = cur.pos;
+        let encode_sz = cur.read_i32_be()?;
+        let decode_sz = cur.read_i32_be()?;
+        if encode_sz == 0 && decode_sz == 0 {
+            return Ok(NvList { version, nvflag, pairs });
+        }
+        // encoded size covers the whole pair, the two size words included
+        if encode_sz < 20 || (encode_sz as usize) > cur.remaining() + 8 {
+            return Err(NvError::BadPairSize { at: pair_start, size: encode_sz as i64 });
+        }
+        let name = cur.read_xdr_string()?;
+        let dtype = cur.read_i32_be()?;
+        let nelem = cur.read_i32_be()?.max(0) as usize;
+        let data = decode_xdr_value(cur, dtype, nelem, pair_start, encode_sz, depth)?;
+        pairs.push(NvPair { name, data });
+    }
+}
+
+fn decode_xdr_value(
+    cur: &mut Cursor,
+    dtype: i32,
+    nelem: usize,
+    pair_start: usize,
+    encode_sz: i32,
+    depth: usize,
+) -> Result<NvData> {
+    // xdr_array repeats the element count on the wire; read and cross-check
+    fn array_count(cur: &mut Cursor, nelem: usize, elem_sz: usize) -> Result<usize> {
+        let count = cur.read_u32_be()? as usize;
+        let n = count.min(nelem);
+        if n * elem_sz > cur.remaining() {
+            return Err(NvError::Truncated {
+                at: cur.pos,
+                need: n * elem_sz,
+                have: cur.remaining(),
+            });
+        }
+        Ok(n)
+    }
+
+    Ok(match dtype {
+        DT_BOOLEAN => NvData::BooleanFlag,
+        DT_BOOLEAN_VALUE => NvData::Boolean(cur.read_i32_be()? != 0),
+        // sub-32-bit scalars are stretched to the 4-byte XDR unit
+        DT_BYTE => NvData::Byte(cur.read_i32_be()? as u8),
+        DT_INT8 => NvData::Int8(cur.read_i32_be()? as i8),
+        DT_UINT8 => NvData::Uint8(cur.read_i32_be()? as u8),
+        DT_INT16 => NvData::Int16(cur.read_i32_be()? as i16),
+        DT_UINT16 => NvData::Uint16(cur.read_i32_be()? as u16),
+        DT_INT32 => NvData::Int32(cur.read_i32_be()?),
+        DT_UINT32 => NvData::Uint32(cur.read_u32_be()?),
+        DT_INT64 => NvData::Int64(cur.read_u64_be()? as i64),
+        DT_UINT64 => NvData::Uint64(cur.read_u64_be()?),
+        DT_HRTIME => NvData::HrTime(cur.read_u64_be()? as i64),
+        DT_DOUBLE => NvData::Double(f64::from_bits(cur.read_u64_be()?)),
+        DT_STRING => NvData::Str(cur.read_xdr_string()?),
+        // xdr_opaque: raw bytes padded to 4, no repeated count
+        DT_BYTE_ARRAY => {
+            let bytes = cur.take(nelem)?.to_vec();
+            cur.take(xdr_pad(nelem))?;
+            NvData::ByteArray(bytes)
+        }
+        DT_INT8_ARRAY => {
+            let n = array_count(cur, nelem, 4)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_i32_be()? as i8);
+            }
+            NvData::Int8Array(v)
+        }
+        DT_UINT8_ARRAY => {
+            let n = array_count(cur, nelem, 4)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_i32_be()? as u8);
+            }
+            NvData::Uint8Array(v)
+        }
+        DT_INT16_ARRAY => {
+            let n = array_count(cur, nelem, 4)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_i32_be()? as i16);
+            }
+            NvData::Int16Array(v)
+        }
+        DT_UINT16_ARRAY => {
+            let n = array_count(cur, nelem, 4)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_i32_be()? as u16);
+            }
+            NvData::Uint16Array(v)
+        }
+        DT_INT32_ARRAY => {
+            let n = array_count(cur, nelem, 4)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_i32_be()?);
+            }
+            NvData::Int32Array(v)
+        }
+        DT_UINT32_ARRAY => {
+            let n = array_count(cur, nelem, 4)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_u32_be()?);
+            }
+            NvData::Uint32Array(v)
+        }
+        DT_BOOLEAN_ARRAY => {
+            let n = array_count(cur, nelem, 4)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_i32_be()? != 0);
+            }
+            NvData::BooleanArray(v)
+        }
+        DT_INT64_ARRAY => {
+            let n = array_count(cur, nelem, 8)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_u64_be()? as i64);
+            }
+            NvData::Int64Array(v)
+        }
+        DT_UINT64_ARRAY => {
+            let n = array_count(cur, nelem, 8)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(cur.read_u64_be()?);
+            }
+            NvData::Uint64Array(v)
+        }
+        DT_STRING_ARRAY => {
+            let mut v = Vec::with_capacity(nelem.min(cur.remaining() / 4));
+            for _ in 0..nelem {
+                v.push(cur.read_xdr_string()?);
+            }
+            NvData::StrArray(v)
+        }
+        DT_NVLIST => NvData::List(decode_xdr_list(cur, depth + 1)?),
+        DT_NVLIST_ARRAY => {
+            let mut v = Vec::with_capacity(nelem.min(cur.remaining() / 16));
+            for _ in 0..nelem {
+                v.push(decode_xdr_list(cur, depth + 1)?);
+            }
+            NvData::ListArray(v)
+        }
+        _ => {
+            // skip to the end of the pair using its encoded size
+            let end = pair_start + encode_sz as usize;
+            let raw = cur.buf.get(cur.pos..end).unwrap_or(&[]).to_vec();
+            cur.pos = end.min(cur.buf.len());
+            NvData::Unknown { dtype, raw }
+        }
+    })
 }
 
 impl NvData {
@@ -657,5 +868,141 @@ mod tests {
         let mut e = Enc::new();
         e.buf.extend_from_slice(&(-5i32).to_le_bytes());
         assert!(NvList::unpack(&e.buf).is_err());
+    }
+
+    /* ------------------------------- XDR tests --------------------------- */
+
+    /// Test-only XDR encoder mirroring nvs_xdr_* output.
+    struct XdrEnc {
+        buf: Vec<u8>,
+    }
+
+    impl XdrEnc {
+        fn new() -> Self {
+            let mut buf = vec![1u8, 1, 0, 0]; // xdr encoding, LE host marker
+            buf.extend_from_slice(&0i32.to_be_bytes());
+            buf.extend_from_slice(&NV_UNIQUE_NAME.to_be_bytes());
+            XdrEnc { buf }
+        }
+
+        fn xdr_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+            out.resize(out.len() + xdr_pad(s.len()), 0);
+        }
+
+        /// Emit one nvpair. `value` is already in XDR wire form.
+        fn pair(&mut self, name: &str, dtype: i32, nelem: i32, value: &[u8]) {
+            let mut body = Vec::new();
+            Self::xdr_str(&mut body, name);
+            body.extend_from_slice(&dtype.to_be_bytes());
+            body.extend_from_slice(&nelem.to_be_bytes());
+            body.extend_from_slice(value);
+            // encode size covers the two size words + body
+            self.buf.extend_from_slice(&((body.len() + 8) as i32).to_be_bytes());
+            // decode size: in-memory estimate, only sanity-checked
+            self.buf.extend_from_slice(&64i32.to_be_bytes());
+            self.buf.extend_from_slice(&body);
+        }
+
+        fn end(&mut self) {
+            self.buf.extend_from_slice(&[0u8; 8]);
+        }
+    }
+
+    #[test]
+    fn xdr_scalars() {
+        let mut e = XdrEnc::new();
+        e.pair("guid", DT_UINT64, 1, &0xdeadbeefcafef00du64.to_be_bytes());
+        let mut sval = Vec::new();
+        XdrEnc::xdr_str(&mut sval, "tank");
+        e.pair("name", DT_STRING, 1, &sval);
+        e.pair("flag", DT_BOOLEAN, 0, &[]);
+        e.pair("ashift", DT_UINT16, 1, &12i32.to_be_bytes()); // stretched to 4B
+        e.end();
+        let l = NvList::unpack(&e.buf).unwrap();
+        assert_eq!(l.nvflag, NV_UNIQUE_NAME);
+        assert_eq!(l.get_u64("guid"), Some(0xdeadbeefcafef00d));
+        assert_eq!(l.get_str("name"), Some("tank"));
+        assert_eq!(l.get("flag"), Some(&NvData::BooleanFlag));
+        assert_eq!(l.get("ashift"), Some(&NvData::Uint16(12)));
+    }
+
+    #[test]
+    fn xdr_arrays() {
+        let mut e = XdrEnc::new();
+        // u64 array: repeated count + 8-byte elements
+        let mut v = 3u32.to_be_bytes().to_vec();
+        for x in [1u64, 2, 3] {
+            v.extend_from_slice(&x.to_be_bytes());
+        }
+        e.pair("nums", DT_UINT64_ARRAY, 3, &v);
+        // u16 array: repeated count + 4-byte elements
+        let mut v = 2u32.to_be_bytes().to_vec();
+        v.extend_from_slice(&7i32.to_be_bytes());
+        v.extend_from_slice(&9i32.to_be_bytes());
+        e.pair("shorts", DT_UINT16_ARRAY, 2, &v);
+        // byte array: opaque, padded, no repeated count
+        e.pair("blob", DT_BYTE_ARRAY, 5, &[1, 2, 3, 4, 5, 0, 0, 0]);
+        // string array: strings only, no repeated count
+        let mut v = Vec::new();
+        XdrEnc::xdr_str(&mut v, "a");
+        XdrEnc::xdr_str(&mut v, "bc");
+        e.pair("strs", DT_STRING_ARRAY, 2, &v);
+        e.end();
+        let l = NvList::unpack(&e.buf).unwrap();
+        assert_eq!(l.get_u64_array("nums"), Some(&[1u64, 2, 3][..]));
+        assert_eq!(l.get("shorts"), Some(&NvData::Uint16Array(vec![7, 9])));
+        assert_eq!(l.get("blob"), Some(&NvData::ByteArray(vec![1, 2, 3, 4, 5])));
+        assert_eq!(
+            l.get("strs"),
+            Some(&NvData::StrArray(vec!["a".into(), "bc".into()]))
+        );
+    }
+
+    #[test]
+    fn xdr_embedded_lists() {
+        let mut e = XdrEnc::new();
+        // embedded nvlist: full list (version+nvflag+pairs+terminator) inline
+        let mut child = Vec::new();
+        child.extend_from_slice(&0i32.to_be_bytes());
+        child.extend_from_slice(&NV_UNIQUE_NAME.to_be_bytes());
+        {
+            let mut inner = XdrEnc { buf: Vec::new() };
+            inner.pair("answer", DT_UINT64, 1, &42u64.to_be_bytes());
+            inner.end();
+            child.extend_from_slice(&inner.buf);
+        }
+        e.pair("child", DT_NVLIST, 1, &child);
+        // nvlist array: two full lists back to back
+        let mut arr = Vec::new();
+        for id in [0u64, 1] {
+            arr.extend_from_slice(&0i32.to_be_bytes());
+            arr.extend_from_slice(&NV_UNIQUE_NAME.to_be_bytes());
+            let mut inner = XdrEnc { buf: Vec::new() };
+            inner.pair("id", DT_UINT64, 1, &id.to_be_bytes());
+            inner.end();
+            arr.extend_from_slice(&inner.buf);
+        }
+        e.pair("vdevs", DT_NVLIST_ARRAY, 2, &arr);
+        e.end();
+        let l = NvList::unpack(&e.buf).unwrap();
+        assert_eq!(l.get_list("child").unwrap().get_u64("answer"), Some(42));
+        let vdevs = l.get_list_array("vdevs").unwrap();
+        assert_eq!(vdevs.len(), 2);
+        assert_eq!(vdevs[1].get_u64("id"), Some(1));
+    }
+
+    #[test]
+    fn xdr_truncation_is_an_error_not_a_panic() {
+        let mut e = XdrEnc::new();
+        e.pair("guid", DT_UINT64, 1, &1u64.to_be_bytes());
+        let mut sval = Vec::new();
+        XdrEnc::xdr_str(&mut sval, "tank");
+        e.pair("name", DT_STRING, 1, &sval);
+        e.end();
+        for cut in 0..e.buf.len() - 1 {
+            assert!(NvList::unpack(&e.buf[..cut]).is_err(), "cut at {cut}");
+        }
     }
 }

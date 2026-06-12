@@ -98,3 +98,75 @@ fn datasets_and_snapshots_enumerate() {
         }
     }
 }
+
+/// Walk a vdev tree to the first leaf device path.
+fn first_disk_path(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<String> {
+    if let Some(path) = tree.get_str("path") {
+        return Some(path.to_string());
+    }
+    for child in tree.get_list_array("children")? {
+        if let Some(p) = first_disk_path(child) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[test]
+fn on_disk_labels_match_ioctl_config() {
+    use zfs_browser::zfs::ondisk::label::read_device_labels;
+
+    let Some(zfs) = handle() else { return };
+    let configs = zfs.pool_configs().expect("pool configs");
+    let mut checked = 0;
+    for pair in configs.iter() {
+        let stats = zfs.pool_stats(&pair.name).expect("pool stats");
+        let tree = stats.get_list("vdev_tree").expect("vdev tree");
+        let Some(path) = first_disk_path(tree) else { continue };
+        let dl = match read_device_labels(std::path::Path::new(&path)) {
+            Ok(dl) => dl,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping {}: {path}: permission denied (run as root)", pair.name);
+                continue;
+            }
+            Err(e) => panic!("{}: reading labels from {path}: {e}", pair.name),
+        };
+        let pool_guid = stats.get_u64("pool_guid").expect("pool guid");
+        for label in &dl.labels {
+            let config = label
+                .config
+                .as_ref()
+                .unwrap_or_else(|e| panic!("{path} L{}: config: {e}", label.index));
+            assert_eq!(config.get_str("name"), Some(pair.name.as_str()), "L{}", label.index);
+            assert_eq!(config.get_u64("pool_guid"), Some(pool_guid), "L{}", label.index);
+            assert_eq!(
+                label.cksum_ok,
+                Some(true),
+                "{path} L{}: vdev_phys checksum",
+                label.index
+            );
+            assert!(!label.uberblocks.is_empty(), "{path} L{}: no uberblocks", label.index);
+            for slot in &label.uberblocks {
+                assert_eq!(
+                    slot.cksum_ok,
+                    Some(true),
+                    "{path} L{} ub slot {}: checksum",
+                    label.index,
+                    slot.slot
+                );
+            }
+            let best = label.best_uberblock().unwrap();
+            assert!(best.ub.txg > 0);
+            assert!(!best.ub.rootbp.is_hole(), "active rootbp should not be a hole");
+        }
+        let best_txg =
+            dl.labels.iter().filter_map(|l| l.best_uberblock()).map(|s| s.ub.txg).max().unwrap();
+        eprintln!(
+            "{}: {path}: 4 labels OK, best uberblock txg {best_txg} (ioctl txg {})",
+            pair.name,
+            stats.get_u64("txg").unwrap_or(0),
+        );
+        checked += 1;
+    }
+    eprintln!("verified labels on {checked} pool(s)");
+}
