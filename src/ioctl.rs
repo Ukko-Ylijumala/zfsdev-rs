@@ -192,32 +192,12 @@ pub struct ObjsetStats {
     pub num_clones: u64,
     pub creation_txg: u64,
     pub guid: u64,
-    pub objset_type: ObjsetType,
+    /// Raw dmu_objset_type_t; render via [`crate::zfs::enums::ObjsetType`].
+    pub objset_type: u32,
     pub is_snapshot: bool,
     pub inconsistent: bool,
     pub redacted: bool,
     pub origin: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjsetType {
-    None,
-    Meta,
-    Zfs,
-    Zvol,
-    Other(u32),
-}
-
-impl ObjsetType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ObjsetType::None => "none",
-            ObjsetType::Meta => "meta",
-            ObjsetType::Zfs => "filesystem",
-            ObjsetType::Zvol => "volume",
-            ObjsetType::Other(_) => "other",
-        }
-    }
 }
 
 impl From<&DmuObjsetStatsRaw> for ObjsetStats {
@@ -226,13 +206,7 @@ impl From<&DmuObjsetStatsRaw> for ObjsetStats {
             num_clones: raw.dds_num_clones,
             creation_txg: raw.dds_creation_txg,
             guid: raw.dds_guid,
-            objset_type: match raw.dds_type {
-                0 => ObjsetType::None,
-                1 => ObjsetType::Meta,
-                2 => ObjsetType::Zfs,
-                3 => ObjsetType::Zvol,
-                other => ObjsetType::Other(other),
-            },
+            objset_type: raw.dds_type,
             is_snapshot: raw.dds_is_snapshot != 0,
             inconsistent: raw.dds_inconsistent != 0,
             redacted: raw.dds_redacted != 0,
