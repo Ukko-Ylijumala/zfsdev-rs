@@ -1,0 +1,100 @@
+// Copyright (c) 2026 Mikko Tanner. All rights reserved.
+// Licensed under the MIT License or the Apache License, Version 2.0.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Integration tests against the live /dev/zfs interface. They skip
+//! gracefully on machines without ZFS so CI stays green.
+
+use zfs_browser::zfs::ioctl::ZfsHandle;
+
+fn handle() -> Option<ZfsHandle> {
+    if !std::path::Path::new("/dev/zfs").exists() {
+        eprintln!("skipping: no /dev/zfs");
+        return None;
+    }
+    Some(ZfsHandle::open().expect("open /dev/zfs"))
+}
+
+#[test]
+fn pool_configs_decode_and_match_cli() {
+    let Some(zfs) = handle() else { return };
+    let configs = zfs.pool_configs().expect("ZFS_IOC_POOL_CONFIGS");
+    let mut ours: Vec<String> = configs.iter().map(|p| p.name.clone()).collect();
+    ours.sort();
+    eprintln!("pools via ioctl: {ours:?}");
+    assert!(!ours.is_empty(), "machine has pools but ioctl returned none");
+
+    // each pool config must decode with the essentials present
+    for pair in configs.iter() {
+        let config = match &pair.data {
+            zfs_browser::zfs::nvlist::NvData::List(l) => l,
+            other => panic!("pool {} config is not an nvlist: {other:?}", pair.name),
+        };
+        assert_eq!(config.get_str("name"), Some(pair.name.as_str()));
+        assert!(config.get_u64("pool_guid").is_some(), "{}: no pool_guid", pair.name);
+        assert!(config.get_u64("txg").is_some(), "{}: no txg", pair.name);
+    }
+
+    // cross-check against the CLI if available
+    if let Ok(out) = std::process::Command::new("zpool").args(["list", "-H", "-o", "name"]).output()
+        && out.status.success()
+    {
+        let mut cli: Vec<String> =
+            String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        cli.sort();
+        assert_eq!(ours, cli, "ioctl pool list != zpool list");
+    }
+}
+
+#[test]
+fn pool_stats_has_vdev_tree() {
+    let Some(zfs) = handle() else { return };
+    let configs = zfs.pool_configs().expect("pool configs");
+    for pair in configs.iter() {
+        let stats = zfs.pool_stats(&pair.name).expect("ZFS_IOC_POOL_STATS");
+        let tree = stats.get_list("vdev_tree").expect("config has vdev_tree");
+        assert_eq!(tree.get_str("type"), Some("root"));
+        let kids = tree.get_list_array("children").expect("root vdev has children");
+        assert!(!kids.is_empty());
+        eprintln!(
+            "{}: {} top-level vdev(s), first: {}",
+            pair.name,
+            kids.len(),
+            kids[0].get_str("type").unwrap_or("?")
+        );
+    }
+}
+
+#[test]
+fn pool_props_decode() {
+    let Some(zfs) = handle() else { return };
+    let configs = zfs.pool_configs().expect("pool configs");
+    let Some(first) = configs.iter().next() else { return };
+    let props = zfs.pool_props(&first.name).expect("ZFS_IOC_POOL_GET_PROPS");
+    assert!(props.get("size").is_some(), "pool props missing 'size'");
+    eprintln!("{}: {} pool properties", first.name, props.pairs.len());
+}
+
+#[test]
+fn datasets_and_snapshots_enumerate() {
+    let Some(zfs) = handle() else { return };
+    let configs = zfs.pool_configs().expect("pool configs");
+    for pair in configs.iter() {
+        let (stats, props) = zfs.objset_stats(&pair.name).expect("objset stats of root dataset");
+        assert!(!stats.is_snapshot);
+        assert!(props.get("used").is_some(), "{}: no 'used' prop", pair.name);
+
+        let children = zfs.datasets(&pair.name).expect("dataset list");
+        eprintln!("{}: {} child datasets", pair.name, children.len());
+        for child in &children {
+            assert!(child.name.starts_with(pair.name.as_str()));
+        }
+
+        let snaps = zfs.snapshots(&pair.name).expect("snapshot list");
+        eprintln!("{}: {} snapshots of root dataset", pair.name, snaps.len());
+        for s in &snaps {
+            assert!(s.stats.is_snapshot, "{} not marked as snapshot", s.name);
+            assert!(s.name.contains('@'));
+        }
+    }
+}
