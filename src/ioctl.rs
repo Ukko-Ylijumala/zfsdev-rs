@@ -51,6 +51,7 @@ const ZFS_IOC_SNAPSHOT: u64 = 0x5a23;
 const ZFS_IOC_POOL_SET_PROPS: u64 = 0x5a26;
 const ZFS_IOC_INHERIT_PROP: u64 = 0x5a2b;
 const ZFS_IOC_DESTROY_SNAPS: u64 = 0x5a3b;
+const ZFS_IOC_LOG_HISTORY: u64 = 0x5a3f;
 
 const MAXPATHLEN: usize = 4096;
 const MAXNAMELEN: usize = 256;
@@ -648,6 +649,23 @@ impl ZfsHandle {
         zc.zc_perm_action = unset as u64; // 0 = allow, 1 = unallow
         let op = if unset { "unallow" } else { "allow" };
         self.write_ioctl(ZFS_IOC_SET_FSACL, op, &mut zc, Some(&fsacl))?;
+        Ok(())
+    }
+
+    /**
+    Log a command string to a pool's history (ZFS_IOC_LOG_HISTORY), so a
+    mutation made through this tool shows up in `zpool history` like the
+    `zfs`/`zpool` CLIs' own entries. The kernel takes the target pool from
+    thread-local state left by the *immediately preceding* loggable ioctl —
+    so this must be the very next ioctl after the mutation, on the same
+    thread, before any other (`zc_name` is intentionally left empty). Callers
+    treat it as best-effort.
+    */
+    pub fn log_history(&self, message: &str) -> Result<()> {
+        let mut innvl = NvList::new();
+        innvl.add_str("message", message);
+        let mut zc = ZfsCmd::new();
+        self.write_ioctl(ZFS_IOC_LOG_HISTORY, "log history", &mut zc, Some(&innvl))?;
         Ok(())
     }
 }
