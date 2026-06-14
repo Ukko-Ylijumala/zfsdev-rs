@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /*!
-Pure-Rust decoder for packed Solaris/OpenZFS name-value lists (nvlists).
+Pure-Rust codec for packed Solaris/OpenZFS name-value lists (nvlists).
 
-This implements the "native" encoding used by the `/dev/zfs` ioctl
-interface. The format is defined by `nvs_native_*` in
-`doc/reference/nvpair.c` (vendored from OpenZFS 2.2.2):
+[`NvList::unpack`] decodes both the native and XDR encodings; [`NvList::pack`]
+encodes the native one (the only encoding the `/dev/zfs` ioctls accept on
+input). The format is defined by `nvs_native_*` in `doc/reference/nvpair.c`
+(vendored from OpenZFS 2.2.2):
 
 ```text
 [0..4)   stream header: u8 encoding (0=native, 1=xdr), u8 endian
@@ -281,6 +282,61 @@ impl NvList {
             _ => None,
         }
     }
+
+    /* ------------------------------- building ---------------------------- */
+
+    /**
+    An empty nvlist carrying `NV_UNIQUE_NAME` — the flag the kernel
+    expects on lists handed in through the `/dev/zfs` ioctl interface.
+    (Derived `default()` leaves `nvflag` zero, which is for decode output.)
+    */
+    pub fn new() -> NvList {
+        NvList { version: 0, nvflag: NV_UNIQUE_NAME, pairs: Vec::new() }
+    }
+
+    /// Append a raw pair. Returns `&mut self` for chaining.
+    pub fn push(&mut self, name: impl Into<String>, data: NvData) -> &mut Self {
+        self.pairs.push(NvPair { name: name.into(), data });
+        self
+    }
+
+    pub fn add_u64(&mut self, name: impl Into<String>, v: u64) -> &mut Self {
+        self.push(name, NvData::Uint64(v))
+    }
+
+    pub fn add_str(&mut self, name: impl Into<String>, v: impl Into<String>) -> &mut Self {
+        self.push(name, NvData::Str(v.into()))
+    }
+
+    pub fn add_boolean(&mut self, name: impl Into<String>, v: bool) -> &mut Self {
+        self.push(name, NvData::Boolean(v))
+    }
+
+    /// A valueless `DATA_TYPE_BOOLEAN` flag (presence is the information).
+    pub fn add_bool_flag(&mut self, name: impl Into<String>) -> &mut Self {
+        self.push(name, NvData::BooleanFlag)
+    }
+
+    pub fn add_nvlist(&mut self, name: impl Into<String>, v: NvList) -> &mut Self {
+        self.push(name, NvData::List(v))
+    }
+
+    pub fn add_str_array(&mut self, name: impl Into<String>, v: Vec<String>) -> &mut Self {
+        self.push(name, NvData::StrArray(v))
+    }
+
+    /**
+    Pack into the native little-endian wire format consumed by the
+    `/dev/zfs` ioctls (the inverse of [`NvList::unpack`]'s native path).
+    Native is the only encoding the kernel accepts on input.
+    */
+    pub fn pack(&self) -> Vec<u8> {
+        let mut out = vec![0u8, 1, 0, 0]; // NV_ENCODE_NATIVE, little-endian
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&self.nvflag.to_le_bytes());
+        encode_pairs(&mut out, &self.pairs);
+        out
+    }
 }
 
 /// Decode a sequence of nvpairs up to and including the zero terminator.
@@ -458,6 +514,132 @@ fn read_cstr(buf: &[u8], pair_name: &str) -> Result<(String, usize)> {
         Some(n) => Ok((String::from_utf8_lossy(&buf[..n]).into_owned(), n + 1)),
         None => Err(NvError::BadString(pair_name.to_string())),
     }
+}
+
+/* ----------------------------- native encoding --------------------------- */
+
+/// Encode a pair sequence and its 4-byte zero terminator (used for the root
+/// list and for every embedded child stream).
+fn encode_pairs(out: &mut Vec<u8>, pairs: &[NvPair]) {
+    for p in pairs {
+        encode_pair(out, &p.name, &p.data);
+    }
+    out.extend_from_slice(&0i32.to_le_bytes()); // terminator
+}
+
+/// Encode one nvpair blob, then — for embedded nvlists — its child pair
+/// stream, which the kernel format places immediately after the parent blob.
+fn encode_pair(out: &mut Vec<u8>, name: &str, data: &NvData) {
+    let (dtype, nelem, value) = encode_value(data);
+    write_pair(out, name, dtype, nelem, &value);
+    match data {
+        NvData::List(l) => encode_pairs(out, &l.pairs),
+        NvData::ListArray(a) => {
+            for l in a {
+                encode_pairs(out, &l.pairs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/**
+Map an [`NvData`] to its `(data_type_t, nvp_value_elem, value bytes)`.
+The value region is the unpadded natural size; [`write_pair`] applies the
+`NV_ALIGN` padding that `NVP_SIZE_CALC` accounts for.
+*/
+fn encode_value(data: &NvData) -> (i32, usize, Vec<u8>) {
+    fn flat<T: Copy, const N: usize>(v: &[T], f: impl Fn(T) -> [u8; N]) -> Vec<u8> {
+        v.iter().flat_map(|&x| f(x)).collect()
+    }
+    match data {
+        NvData::BooleanFlag => (DT_BOOLEAN, 0, Vec::new()),
+        // boolean_t is a 4-byte int on the wire
+        NvData::Boolean(b) => (DT_BOOLEAN_VALUE, 1, (*b as i32).to_le_bytes().to_vec()),
+        NvData::Byte(v) => (DT_BYTE, 1, vec![*v]),
+        NvData::Int8(v) => (DT_INT8, 1, vec![*v as u8]),
+        NvData::Uint8(v) => (DT_UINT8, 1, vec![*v]),
+        NvData::Int16(v) => (DT_INT16, 1, v.to_le_bytes().to_vec()),
+        NvData::Uint16(v) => (DT_UINT16, 1, v.to_le_bytes().to_vec()),
+        NvData::Int32(v) => (DT_INT32, 1, v.to_le_bytes().to_vec()),
+        NvData::Uint32(v) => (DT_UINT32, 1, v.to_le_bytes().to_vec()),
+        NvData::Int64(v) => (DT_INT64, 1, v.to_le_bytes().to_vec()),
+        NvData::Uint64(v) => (DT_UINT64, 1, v.to_le_bytes().to_vec()),
+        NvData::HrTime(v) => (DT_HRTIME, 1, v.to_le_bytes().to_vec()),
+        NvData::Double(v) => (DT_DOUBLE, 1, v.to_le_bytes().to_vec()),
+        NvData::Str(s) => {
+            let mut b = s.as_bytes().to_vec();
+            b.push(0);
+            (DT_STRING, 1, b)
+        }
+        NvData::ByteArray(v) => (DT_BYTE_ARRAY, v.len(), v.clone()),
+        NvData::Uint8Array(v) => (DT_UINT8_ARRAY, v.len(), v.clone()),
+        NvData::Int8Array(v) => (DT_INT8_ARRAY, v.len(), v.iter().map(|&x| x as u8).collect()),
+        NvData::Int16Array(v) => (DT_INT16_ARRAY, v.len(), flat(v, i16::to_le_bytes)),
+        NvData::Uint16Array(v) => (DT_UINT16_ARRAY, v.len(), flat(v, u16::to_le_bytes)),
+        NvData::Int32Array(v) => (DT_INT32_ARRAY, v.len(), flat(v, i32::to_le_bytes)),
+        NvData::Uint32Array(v) => (DT_UINT32_ARRAY, v.len(), flat(v, u32::to_le_bytes)),
+        NvData::Int64Array(v) => (DT_INT64_ARRAY, v.len(), flat(v, i64::to_le_bytes)),
+        NvData::Uint64Array(v) => (DT_UINT64_ARRAY, v.len(), flat(v, u64::to_le_bytes)),
+        // boolean_t array elements are 4 bytes each
+        NvData::BooleanArray(v) => (
+            DT_BOOLEAN_ARRAY,
+            v.len(),
+            v.iter().flat_map(|&b| (b as i32).to_le_bytes()).collect(),
+        ),
+        NvData::StrArray(v) => {
+            // nelem 8-byte pointer placeholders, then packed NUL-terminated strings
+            let mut buf = vec![0u8; v.len() * 8];
+            for s in v {
+                buf.extend_from_slice(s.as_bytes());
+                buf.push(0);
+            }
+            (DT_STRING_ARRAY, v.len(), buf)
+        }
+        NvData::List(l) => (DT_NVLIST, 1, nvlist_struct(l.version, l.nvflag)),
+        NvData::ListArray(a) => {
+            // nelem pointer placeholders, then nelem nvlist_t struct copies;
+            // each child's pair stream is appended after the blob by encode_pair.
+            let n = a.len();
+            let mut buf = vec![0u8; n * 8];
+            for l in a {
+                buf.extend_from_slice(&nvlist_struct(l.version, l.nvflag));
+            }
+            (DT_NVLIST_ARRAY, n, buf)
+        }
+        // Best-effort: round-trips type+bytes but not the original nvp_value_elem.
+        NvData::Unknown { dtype, raw } => (*dtype, 0, raw.clone()),
+    }
+}
+
+/// A 24-byte in-memory `nvlist_t` copy as it appears in an embedded value
+/// region; only the leading version/nvflag words are meaningful on the wire.
+fn nvlist_struct(version: i32, nvflag: u32) -> Vec<u8> {
+    let mut s = vec![0u8; NVLIST_STRUCT_SIZE];
+    s[0..4].copy_from_slice(&version.to_le_bytes());
+    s[4..8].copy_from_slice(&nvflag.to_le_bytes());
+    s
+}
+
+/**
+Write one nvpair blob: header, NUL-terminated name, then the value padded
+to the `NV_ALIGN` boundary. `nvp_size = NV_ALIGN(16 + name_sz) +
+NV_ALIGN(value_sz)` per `NVP_SIZE_CALC`.
+*/
+fn write_pair(out: &mut Vec<u8>, name: &str, dtype: i32, nelem: usize, value: &[u8]) {
+    let name_sz = name.len() + 1;
+    let val_off = align8(NVPAIR_HDR_SIZE + name_sz);
+    let size = val_off + align8(value.len());
+    out.extend_from_slice(&(size as i32).to_le_bytes());
+    out.extend_from_slice(&(name_sz as i16).to_le_bytes());
+    out.extend_from_slice(&0i16.to_le_bytes()); // nvp_reserve
+    out.extend_from_slice(&(nelem as i32).to_le_bytes());
+    out.extend_from_slice(&dtype.to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.resize(out.len() + (val_off - NVPAIR_HDR_SIZE - name_sz), 0); // name padding
+    out.extend_from_slice(value);
+    out.resize(out.len() + (align8(value.len()) - value.len()), 0); // value padding
 }
 
 /* ------------------------------ XDR decoding ----------------------------- */
@@ -868,6 +1050,85 @@ mod tests {
         let mut e = Enc::new();
         e.buf.extend_from_slice(&(-5i32).to_le_bytes());
         assert!(NvList::unpack(&e.buf).is_err());
+    }
+
+    /* ----------------------------- encode (pack) ------------------------- */
+
+    /**
+    The production `pack()` must be byte-identical to the reference `Enc`
+    for the same pairs in the same order (both emit the kernel's native
+    format with version 0 / NV_UNIQUE_NAME).
+    */
+    #[test]
+    fn pack_matches_reference_encoder() {
+        let mut e = Enc::new();
+        e.pair("guid", DT_UINT64, 1, &0x1122334455667788u64.to_le_bytes());
+        e.pair("name", DT_STRING, 1, b"tank\0");
+        e.pair("flag", DT_BOOLEAN, 0, &[]);
+        e.pair("ok", DT_BOOLEAN_VALUE, 1, &1i32.to_le_bytes());
+        e.end();
+
+        let mut l = NvList::new();
+        l.add_u64("guid", 0x1122334455667788)
+            .add_str("name", "tank")
+            .add_bool_flag("flag")
+            .add_boolean("ok", true);
+
+        assert_eq!(l.pack(), e.buf);
+    }
+
+    /// pack → unpack is the identity for every value variant writes can use.
+    #[test]
+    fn pack_unpack_round_trip() {
+        let mut child = NvList::new();
+        child.add_u64("answer", 42).add_str("who", "deep thought");
+
+        let mut grandchild_a = NvList::new();
+        grandchild_a.add_u64("id", 0);
+        let mut grandchild_b = NvList::new();
+        grandchild_b.add_u64("id", 1).add_bool_flag("is_log");
+
+        let mut l = NvList::new();
+        l.push("u64", NvData::Uint64(0xdead_beef_cafe_f00d))
+            .push("i32", NvData::Int32(-7))
+            .push("u16", NvData::Uint16(12))
+            .push("byte", NvData::Byte(0xab))
+            .push("bool", NvData::Boolean(false))
+            .push("flag", NvData::BooleanFlag)
+            .push("hrt", NvData::HrTime(-123))
+            .push("dbl", NvData::Double(3.5))
+            .add_str("str", "hello")
+            .push("bytes", NvData::ByteArray(vec![1, 2, 3, 4, 5]))
+            .push("u64s", NvData::Uint64Array(vec![1, 2, 3]))
+            .push("i16s", NvData::Int16Array(vec![-1, 0, 1]))
+            .push("bools", NvData::BooleanArray(vec![true, false, true]))
+            .add_str_array("strs", vec!["a".into(), "bc".into(), "".into()])
+            .add_nvlist("child", child)
+            .push("vdevs", NvData::ListArray(vec![grandchild_a, grandchild_b]));
+
+        let packed = l.pack();
+        let back = NvList::unpack(&packed).unwrap();
+        assert_eq!(back, l);
+    }
+
+    #[test]
+    fn pack_empty_round_trip() {
+        let l = NvList::new();
+        let back = NvList::unpack(&l.pack()).unwrap();
+        assert_eq!(back, l);
+        assert!(back.pairs.is_empty());
+        assert_eq!(back.nvflag, NV_UNIQUE_NAME);
+    }
+
+    /// A nested-empty list still produces a parseable stream (the embedded
+    /// child reduces to a lone terminator after its parent blob).
+    #[test]
+    fn pack_nested_empty_round_trip() {
+        let mut l = NvList::new();
+        l.add_nvlist("snaps", NvList::new());
+        let back = NvList::unpack(&l.pack()).unwrap();
+        assert_eq!(back, l);
+        assert!(back.get_list("snaps").unwrap().pairs.is_empty());
     }
 
     /* ------------------------------- XDR tests --------------------------- */
