@@ -30,6 +30,7 @@ const ZFS_DEV: &str = "/dev/zfs";
 
 const ZFS_IOC_POOL_CONFIGS: u64 = 0x5a04;
 const ZFS_IOC_POOL_STATS: u64 = 0x5a05;
+const ZFS_IOC_POOL_GET_HISTORY: u64 = 0x5a0a;
 const ZFS_IOC_OBJSET_STATS: u64 = 0x5a12;
 const ZFS_IOC_DATASET_LIST_NEXT: u64 = 0x5a14;
 const ZFS_IOC_SNAPSHOT_LIST_NEXT: u64 = 0x5a15;
@@ -152,6 +153,26 @@ fn deleg_whokey(who: &DelegWho, inherit: char) -> String {
         DelegWho::Group(id) => format!("g{inherit}${id}"),
         DelegWho::Everyone => format!("e{inherit}$"),
     }
+}
+
+/**
+Parse concatenated pool-history records — each a little-endian `u64` length
+followed by that many bytes of `NV_ENCODE_NATIVE` nvlist (the framing
+`spa_history_log_sync` writes, doc/reference/spa_history.c). Whole records
+are appended to `out`; returns the bytes consumed, leaving any trailing
+partial record for the caller to re-read from an advanced offset.
+*/
+fn unpack_history(buf: &[u8], out: &mut Vec<NvList>) -> Result<usize> {
+    let mut pos = 0;
+    while pos + 8 <= buf.len() {
+        let reclen = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
+        if reclen == 0 || pos + 8 + reclen > buf.len() {
+            break; // partial record at the buffer tail
+        }
+        out.push(NvList::unpack(&buf[pos + 8..pos + 8 + reclen])?);
+        pos += 8 + reclen;
+    }
+    Ok(pos)
 }
 
 #[repr(C)]
@@ -403,6 +424,50 @@ impl ZfsHandle {
         let mut zc = ZfsCmd::new();
         zc.set_name(pool);
         self.ioctl_nv(ZFS_IOC_POOL_GET_PROPS, &mut zc)
+    }
+
+    /**
+    A pool's command/event history (ZFS_IOC_POOL_GET_HISTORY), decoded into
+    one nvlist per record, oldest first. Reading history requires root (it
+    fails with EPERM otherwise). Records carry keys like `history_command`,
+    `history_time`, `history_who`; internal events use `history_internal_*`.
+    */
+    pub fn pool_history(&self, pool: &str) -> Result<Vec<NvList>> {
+        let mut records = Vec::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        /*
+        The kernel advances zc_history_offset itself, in its own logical
+        (ring-buffer-aware) coordinates — and the first read returns only
+        the "pool create" region, with later reads walking the ring where
+        the command records live. So we drive it exactly like libzfs: feed
+        back the kernel's offset, but backed up over any partial record
+        left at the buffer tail so it's re-read whole next round. EOF is a
+        zero-length read.
+        */
+        let mut offset = 0u64;
+        loop {
+            let mut zc = ZfsCmd::new();
+            zc.set_name(pool);
+            zc.zc_history = buf.as_mut_ptr() as u64;
+            zc.zc_history_len = buf.len() as u64;
+            zc.zc_history_offset = offset;
+            self.ioctl(ZFS_IOC_POOL_GET_HISTORY, &mut zc).map_err(|err| ZfsError::Ioctl {
+                ioc: ZFS_IOC_POOL_GET_HISTORY,
+                name: pool.to_string(),
+                err,
+            })?;
+            let bytes_read = (zc.zc_history_len as usize).min(buf.len());
+            if bytes_read == 0 {
+                break; // EOF
+            }
+            let consumed = unpack_history(&buf[..bytes_read], &mut records)?;
+            if consumed == 0 {
+                break; // a record larger than the buffer — avoid spinning
+            }
+            let leftover = (bytes_read - consumed) as u64;
+            offset = zc.zc_history_offset.saturating_sub(leftover);
+        }
+        Ok(records)
     }
 
     /**
@@ -697,5 +762,36 @@ mod tests {
         assert_eq!(resolve_who("group:root").unwrap(), DelegWho::Group(0));
         assert!(resolve_who("no_such_user_zzz_qx").is_err());
         assert!(resolve_who("bogus:thing").is_err());
+    }
+
+    #[test]
+    fn history_records_unpack_with_trailing_partial() {
+        // frame = [u64 LE len][native-packed nvlist]
+        fn frame(buf: &mut Vec<u8>, nv: &NvList) {
+            let packed = nv.pack();
+            buf.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&packed);
+        }
+        // ZPOOL_HIST_* keys are spelled with spaces (doc/reference/zfs.h)
+        let mut a = NvList::new();
+        a.add_str("history command", "zfs snapshot tank@x").add_u64("history time", 1000);
+        let mut b = NvList::new();
+        b.add_str("history command", "zfs destroy tank@x");
+
+        let mut buf = Vec::new();
+        frame(&mut buf, &a);
+        frame(&mut buf, &b);
+        let whole = buf.len();
+        // a truncated record at the end must be left for the next read
+        buf.extend_from_slice(&4096u64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 16]);
+
+        let mut out = Vec::new();
+        let consumed = unpack_history(&buf, &mut out).unwrap();
+        assert_eq!(consumed, whole);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].get_str("history command"), Some("zfs snapshot tank@x"));
+        assert_eq!(out[0].get_u64("history time"), Some(1000));
+        assert_eq!(out[1].get_str("history command"), Some("zfs destroy tank@x"));
     }
 }
