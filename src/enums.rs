@@ -23,7 +23,7 @@ macro_rules! name_or_unknown {
 }
 
 /// zio_compress (zio_compress.h)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr, EnumString)]
 #[strum(serialize_all = "lowercase")]
 #[repr(u8)]
 pub enum ZioCompress {
