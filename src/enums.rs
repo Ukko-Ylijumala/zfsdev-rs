@@ -134,6 +134,60 @@ impl VdevState {
     }
 }
 
+/// vdev_aux_t (zfs.h) — the auxiliary state explaining a non-healthy vdev.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[repr(u8)]
+pub enum VdevAux {
+    #[strum(serialize = "none")]
+    None = 0,
+    #[strum(serialize = "open failed")]
+    OpenFailed,
+    #[strum(serialize = "corrupt data")]
+    CorruptData,
+    #[strum(serialize = "no replicas")]
+    NoReplicas,
+    #[strum(serialize = "bad guid sum")]
+    BadGuidSum,
+    #[strum(serialize = "too small")]
+    TooSmall,
+    #[strum(serialize = "bad label")]
+    BadLabel,
+    #[strum(serialize = "version newer")]
+    VersionNewer,
+    #[strum(serialize = "version older")]
+    VersionOlder,
+    #[strum(serialize = "unsupported feature")]
+    UnsupFeat,
+    #[strum(serialize = "spared")]
+    Spared,
+    #[strum(serialize = "too many errors")]
+    ErrExceeded,
+    #[strum(serialize = "I/O failure")]
+    IoFailure,
+    #[strum(serialize = "bad log")]
+    BadLog,
+    #[strum(serialize = "external fault")]
+    External,
+    #[strum(serialize = "split pool")]
+    SplitPool,
+    #[strum(serialize = "bad ashift")]
+    BadAshift,
+    #[strum(serialize = "external persistent fault")]
+    ExternalPersist,
+    #[strum(serialize = "active on another host")]
+    Active,
+    #[strum(serialize = "children offline")]
+    ChildrenOffline,
+    #[strum(serialize = "ashift too big")]
+    AshiftTooBig,
+}
+
+impl VdevAux {
+    pub fn name(v: u64) -> String {
+        name_or_unknown!(VdevAux, v)
+    }
+}
+
 /// dmu_objset_type_t (dmu.h), shared by the live ioctl stats and the
 /// on-disk objset_phys decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
