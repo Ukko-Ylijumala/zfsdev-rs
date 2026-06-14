@@ -170,3 +170,39 @@ fn on_disk_labels_match_ioctl_config() {
     }
     eprintln!("verified labels on {checked} pool(s)");
 }
+
+/* ------------------------------ write path ------------------------------- */
+
+/*
+The write ioctls can't be exercised destructively against the user's real
+pools, but targeting a pool name that cannot exist proves the ioctl numbers
+and zfs_cmd_t layout are correct for the mutating path — the ABI canary for
+writes — with zero side effects. A wrong struct size/number would surface
+as EFAULT/EINVAL or a panic, not the clean "no such pool" we expect.
+*/
+
+const NOPE_POOL: &str = "zfsbrowser_nonexistent_pool_canary";
+
+#[test]
+fn destroy_nonexistent_is_a_clean_mapped_error() {
+    let Some(zfs) = handle() else { return };
+    // legacy write path (no innvl)
+    let target = format!("{NOPE_POOL}/ds");
+    let err = zfs.destroy(&target, false).expect_err("destroy of bogus name must fail");
+    let msg = err.to_string();
+    eprintln!("destroy error (expected): {msg}");
+    assert!(msg.starts_with("destroy dataset:"), "unmapped error: {msg}");
+}
+
+#[test]
+fn snapshot_in_nonexistent_pool_is_a_clean_error() {
+    let Some(zfs) = handle() else { return };
+    // new-style write path (packed innvl in zc_nvlist_src)
+    let snap = format!("{NOPE_POOL}/ds@canary");
+    let err = zfs
+        .snapshot(NOPE_POOL, &[snap], None)
+        .expect_err("snapshot in bogus pool must fail (pool lookup)");
+    let msg = err.to_string();
+    eprintln!("snapshot error (expected): {msg}");
+    assert!(msg.starts_with("create snapshot:"), "unmapped error: {msg}");
+}

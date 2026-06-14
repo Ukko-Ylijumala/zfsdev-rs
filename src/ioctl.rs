@@ -11,8 +11,12 @@ versions, so layout changes must be tracked when supporting newer
 releases. Ioctl numbers (`0x5a00 + n`, `doc/reference/zfs.h`) live in the
 "legacy" range that has been stable since 2.0.
 
-Everything here is read-only for the moment: only GET/LIST ioctls are
-implemented and no mutating request numbers are defined yet.
+Reads use the GET/LIST ioctls; the mutating ioctls (SET_PROP, CREATE,
+DESTROY, SNAPSHOT, …) are also defined. Write requests pass their
+parameters in as a packed nvlist (`NvList::pack`) in `zc_nvlist_src` and
+read the kernel's per-element errors nvlist back from `zc_nvlist_dst`.
+Whether a given write is permitted for the calling uid is decided by the
+kernel (root, or a matching `zfs allow` delegation).
 */
 
 use super::nvlist::{NvError, NvList};
@@ -31,6 +35,21 @@ const ZFS_IOC_DATASET_LIST_NEXT: u64 = 0x5a14;
 const ZFS_IOC_SNAPSHOT_LIST_NEXT: u64 = 0x5a15;
 const ZFS_IOC_POOL_GET_PROPS: u64 = 0x5a27;
 
+/*
+Mutating ioctls (ordinals from doc/reference/zfs.h). SET_PROP, DESTROY,
+RENAME and INHERIT_PROP are "legacy" (parameters in zc_ fields); SNAPSHOT,
+DESTROY_SNAPS and CREATE are "new"-style (parameters as a packed nvlist in
+zc_nvlist_src).
+*/
+const ZFS_IOC_SET_PROP: u64 = 0x5a16;
+const ZFS_IOC_CREATE: u64 = 0x5a17;
+const ZFS_IOC_DESTROY: u64 = 0x5a18;
+const ZFS_IOC_RENAME: u64 = 0x5a1a;
+const ZFS_IOC_SNAPSHOT: u64 = 0x5a23;
+const ZFS_IOC_POOL_SET_PROPS: u64 = 0x5a26;
+const ZFS_IOC_INHERIT_PROP: u64 = 0x5a2b;
+const ZFS_IOC_DESTROY_SNAPS: u64 = 0x5a3b;
+
 const MAXPATHLEN: usize = 4096;
 const MAXNAMELEN: usize = 256;
 
@@ -45,9 +64,27 @@ pub enum ZfsError {
     Ioctl { ioc: u64, name: String, err: io::Error },
     #[error("decoding nvlist from kernel: {0}")]
     Nv(#[from] NvError),
+    /// A mutating operation failed; message already carries an errno hint.
+    #[error("{0}")]
+    Op(String),
 }
 
 type Result<T> = std::result::Result<T, ZfsError>;
+
+/// A human hint for the errnos write ioctls commonly return.
+fn errno_hint(err: &io::Error) -> &'static str {
+    match err.raw_os_error() {
+        Some(libc::EPERM) | Some(libc::EACCES) => {
+            " (need root, or a `zfs allow` delegation for this operation)"
+        }
+        Some(libc::EEXIST) => " (already exists)",
+        Some(libc::ENOENT) => " (no such pool/dataset)",
+        Some(libc::EBUSY) => " (busy — mounted, held, or has children)",
+        Some(libc::ENAMETOOLONG) => " (name too long)",
+        Some(libc::EINVAL) => " (invalid argument — bad name or property value?)",
+        _ => "",
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -173,6 +210,15 @@ impl ZfsCmd {
         assert!(bytes.len() < MAXPATHLEN, "dataset name too long");
         self.zc_name[..bytes.len()].copy_from_slice(bytes);
         self.zc_name[bytes.len()] = 0;
+    }
+
+    /// Set `zc_value` (the secondary name field: rename target, inherited
+    /// property name, …). It is `MAXPATHLEN * 2` bytes wide.
+    fn set_value(&mut self, value: &str) {
+        let bytes = value.as_bytes();
+        assert!(bytes.len() < MAXPATHLEN * 2, "value too long");
+        self.zc_value[..bytes.len()].copy_from_slice(bytes);
+        self.zc_value[bytes.len()] = 0;
     }
 
     fn name(&self) -> String {
@@ -334,5 +380,165 @@ impl ZfsHandle {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /* -------------------------------- writes ----------------------------- */
+
+    /**
+    Issue a mutating ioctl. `innvl`, if present, is packed into
+    `zc_nvlist_src`; the kernel's output/errors nvlist is read back from
+    `zc_nvlist_dst` (empty if it filled none). `op` names the operation for
+    error messages. Errors are returned as [`ZfsError::Op`] with an errno
+    hint already appended.
+    */
+    fn write_ioctl(
+        &self,
+        ioc: u64,
+        op: &str,
+        zc: &mut ZfsCmd,
+        innvl: Option<&NvList>,
+    ) -> Result<NvList> {
+        // The packed source must outlive the ioctl call(s); hold it here.
+        let src = innvl.map(|nv| nv.pack());
+        if let Some(s) = &src {
+            zc.zc_nvlist_src = s.as_ptr() as u64;
+            zc.zc_nvlist_src_size = s.len() as u64;
+        }
+        let mut dst: Vec<u8> = vec![0; DST_INITIAL];
+        loop {
+            zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
+            zc.zc_nvlist_dst_size = dst.len() as u64;
+            zc.zc_nvlist_dst_filled = 0;
+            match self.ioctl(ioc, zc) {
+                Ok(()) => {
+                    // Only some ioctls return an nvlist; honor the filled flag.
+                    let len = zc.zc_nvlist_dst_size as usize;
+                    if zc.zc_nvlist_dst_filled != 0 && len <= dst.len() {
+                        return Ok(NvList::unpack(&dst[..len])?);
+                    }
+                    return Ok(NvList::default());
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+                    let need = zc.zc_nvlist_dst_size as usize;
+                    dst.resize(need.max(dst.len() * 2), 0);
+                }
+                Err(err) => {
+                    return Err(ZfsError::Op(format!("{op}: {err}{}", errno_hint(&err))));
+                }
+            }
+        }
+    }
+
+    /**
+    Set one or more properties on a dataset (ZFS_IOC_SET_PROP). `props` maps
+    prop name → value (use an `NvList` built with `add_str`/`add_u64`).
+    Returns the kernel's errors nvlist, keyed by any prop that failed (empty
+    on full success).
+    */
+    pub fn set_prop(&self, dataset: &str, props: &NvList) -> Result<NvList> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        self.write_ioctl(ZFS_IOC_SET_PROP, "set property", &mut zc, Some(props))
+    }
+
+    /// Set pool properties (ZFS_IOC_POOL_SET_PROPS).
+    pub fn pool_set_props(&self, pool: &str, props: &NvList) -> Result<NvList> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.write_ioctl(ZFS_IOC_POOL_SET_PROPS, "set pool property", &mut zc, Some(props))
+    }
+
+    /// Reset a property to its inherited value (ZFS_IOC_INHERIT_PROP).
+    /// `received` reverts to the received value rather than clearing it.
+    pub fn inherit_prop(&self, dataset: &str, prop: &str, received: bool) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        zc.set_value(prop);
+        zc.zc_cookie = received as u64;
+        self.write_ioctl(ZFS_IOC_INHERIT_PROP, "inherit property", &mut zc, None)?;
+        Ok(())
+    }
+
+    /**
+    Create snapshots (ZFS_IOC_SNAPSHOT). Every name in `snaps` must be a full
+    `dataset@snap` within `pool` and share the same snap suffix. `props` are
+    applied to the new snapshots. Returns the per-snapshot errors nvlist
+    (empty on success).
+    */
+    pub fn snapshot(&self, pool: &str, snaps: &[String], props: Option<&NvList>) -> Result<NvList> {
+        let mut snap_set = NvList::new();
+        for s in snaps {
+            snap_set.add_bool_flag(s.clone());
+        }
+        let mut innvl = NvList::new();
+        innvl.add_nvlist("snaps", snap_set);
+        if let Some(p) = props {
+            innvl.add_nvlist("props", p.clone());
+        }
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.write_ioctl(ZFS_IOC_SNAPSHOT, "create snapshot", &mut zc, Some(&innvl))
+    }
+
+    /**
+    Destroy snapshots (ZFS_IOC_DESTROY_SNAPS); all names must be in `pool`.
+    `defer` marks them for deferred destruction if held or cloned. Returns
+    the per-snapshot errors nvlist (empty on success).
+    */
+    pub fn destroy_snaps(&self, pool: &str, snaps: &[String], defer: bool) -> Result<NvList> {
+        let mut snap_set = NvList::new();
+        for s in snaps {
+            snap_set.add_bool_flag(s.clone());
+        }
+        let mut innvl = NvList::new();
+        innvl.add_nvlist("snaps", snap_set);
+        if defer {
+            innvl.add_bool_flag("defer");
+        }
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.write_ioctl(ZFS_IOC_DESTROY_SNAPS, "destroy snapshots", &mut zc, Some(&innvl))
+    }
+
+    /**
+    Create a filesystem or volume (ZFS_IOC_CREATE). `objset_type` is a
+    `dmu_objset_type_t` (2 = ZFS filesystem, 3 = zvol; see
+    [`crate::zfs::enums::ObjsetType`]). `props` are the creation-time
+    properties (a zvol needs at least `volsize`).
+    */
+    pub fn create(&self, name: &str, objset_type: u64, props: Option<&NvList>) -> Result<()> {
+        let mut innvl = NvList::new();
+        innvl.add_u64("type", objset_type);
+        if let Some(p) = props {
+            innvl.add_nvlist("props", p.clone());
+        }
+        let mut zc = ZfsCmd::new();
+        zc.set_name(name);
+        self.write_ioctl(ZFS_IOC_CREATE, "create dataset", &mut zc, Some(&innvl))?;
+        Ok(())
+    }
+
+    /**
+    Destroy a dataset or snapshot (ZFS_IOC_DESTROY). `defer` defers the
+    destroy if the target is busy. This is not recursive — destroy children
+    first (or use `destroy_snaps` for snapshots in bulk).
+    */
+    pub fn destroy(&self, name: &str, defer: bool) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(name);
+        zc.zc_defer_destroy = defer as u32;
+        self.write_ioctl(ZFS_IOC_DESTROY, "destroy dataset", &mut zc, None)?;
+        Ok(())
+    }
+
+    /// Rename a dataset (ZFS_IOC_RENAME). `recursive` also renames the
+    /// snapshots of descendants (only meaningful when renaming a snapshot).
+    pub fn rename(&self, from: &str, to: &str, recursive: bool) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(from);
+        zc.set_value(to);
+        zc.zc_cookie = recursive as u64;
+        self.write_ioctl(ZFS_IOC_RENAME, "rename dataset", &mut zc, None)?;
+        Ok(())
     }
 }
