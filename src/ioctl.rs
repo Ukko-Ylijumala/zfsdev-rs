@@ -20,7 +20,7 @@ kernel (root, or a matching `zfs allow` delegation).
 */
 
 use super::nvlist::{NvError, NvList};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -34,6 +34,7 @@ const ZFS_IOC_OBJSET_STATS: u64 = 0x5a12;
 const ZFS_IOC_DATASET_LIST_NEXT: u64 = 0x5a14;
 const ZFS_IOC_SNAPSHOT_LIST_NEXT: u64 = 0x5a15;
 const ZFS_IOC_POOL_GET_PROPS: u64 = 0x5a27;
+const ZFS_IOC_GET_FSACL: u64 = 0x5a29;
 
 /*
 Mutating ioctls (ordinals from doc/reference/zfs.h). SET_PROP, DESTROY,
@@ -42,6 +43,7 @@ DESTROY_SNAPS and CREATE are "new"-style (parameters as a packed nvlist in
 zc_nvlist_src).
 */
 const ZFS_IOC_SET_PROP: u64 = 0x5a16;
+const ZFS_IOC_SET_FSACL: u64 = 0x5a28;
 const ZFS_IOC_CREATE: u64 = 0x5a17;
 const ZFS_IOC_DESTROY: u64 = 0x5a18;
 const ZFS_IOC_RENAME: u64 = 0x5a1a;
@@ -83,6 +85,71 @@ fn errno_hint(err: &io::Error) -> &'static str {
         Some(libc::ENAMETOOLONG) => " (name too long)",
         Some(libc::EINVAL) => " (invalid argument — bad name or property value?)",
         _ => "",
+    }
+}
+
+/// A `zfs allow` subject: a user/group (by numeric id) or everyone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegWho {
+    User(u64),
+    Group(u64),
+    Everyone,
+}
+
+/**
+Resolve a who-spec to a [`DelegWho`]: `everyone`; `group:NAME` / `g:NAME`;
+`user:NAME` / `u:NAME` / a bare name (defaults to user); or a bare numeric id.
+Names are looked up via the system passwd/group databases.
+*/
+pub fn resolve_who(spec: &str) -> std::result::Result<DelegWho, String> {
+    let spec = spec.trim();
+    if spec.eq_ignore_ascii_case("everyone") {
+        return Ok(DelegWho::Everyone);
+    }
+    let (is_group, name) = match spec.split_once(':') {
+        Some(("group" | "g", n)) => (true, n.trim()),
+        Some(("user" | "u", n)) => (false, n.trim()),
+        Some((other, _)) => return Err(format!("unknown who type '{other}' (use user:/group:)")),
+        None => (false, spec),
+    };
+    if let Ok(id) = name.parse::<u64>() {
+        return Ok(if is_group { DelegWho::Group(id) } else { DelegWho::User(id) });
+    }
+    if is_group {
+        resolve_id(name, true).map(DelegWho::Group).ok_or_else(|| format!("no such group '{name}'"))
+    } else {
+        resolve_id(name, false).map(DelegWho::User).ok_or_else(|| format!("no such user '{name}'"))
+    }
+}
+
+/// Look up a user (or group) name in the system database, returning its id.
+fn resolve_id(name: &str, group: bool) -> Option<u64> {
+    let cname = CString::new(name).ok()?;
+    // SAFETY: getpwnam/getgrnam return a pointer into static storage (or null);
+    // we read the id field immediately and don't retain the pointer.
+    unsafe {
+        if group {
+            let gr = libc::getgrnam(cname.as_ptr());
+            (!gr.is_null()).then(|| (*gr).gr_gid as u64)
+        } else {
+            let pw = libc::getpwnam(cname.as_ptr());
+            (!pw.is_null()).then(|| (*pw).pw_uid as u64)
+        }
+    }
+}
+
+/**
+Build a delegation key: `<type><inherit>$<id>` for a user/group, `e<inherit>$`
+for everyone. Mirrors `zfs_deleg_whokey` (doc/reference/zfs_deleg.c); `$` is
+ZFS_DELEG_FIELD_SEP_CHR and `inherit` is `l` (ZFS_DELEG_LOCAL) or `d`
+(ZFS_DELEG_DESCENDENT), per doc/reference/zfs_deleg.h. A bare `zfs allow`
+writes both, which `set_fsacl` does.
+*/
+fn deleg_whokey(who: &DelegWho, inherit: char) -> String {
+    match who {
+        DelegWho::User(id) => format!("u{inherit}${id}"),
+        DelegWho::Group(id) => format!("g{inherit}${id}"),
+        DelegWho::Everyone => format!("e{inherit}$"),
     }
 }
 
@@ -337,6 +404,18 @@ impl ZfsHandle {
         self.ioctl_nv(ZFS_IOC_POOL_GET_PROPS, &mut zc)
     }
 
+    /**
+    Delegated permissions for `dataset` — the `zfs allow` table
+    (ZFS_IOC_GET_FSACL). The returned nvlist is keyed by the dataset and each
+    ancestor that carries permissions; each maps to an nvlist of encoded
+    "who" keys → the granted permission set.
+    */
+    pub fn get_fsacl(&self, dataset: &str) -> Result<NvList> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        self.ioctl_nv(ZFS_IOC_GET_FSACL, &mut zc)
+    }
+
     /// Stats and properties for one dataset (ZFS_IOC_OBJSET_STATS).
     pub fn objset_stats(&self, dataset: &str) -> Result<(ObjsetStats, NvList)> {
         let mut zc = ZfsCmd::new();
@@ -540,5 +619,65 @@ impl ZfsHandle {
         zc.zc_cookie = recursive as u64;
         self.write_ioctl(ZFS_IOC_RENAME, "rename dataset", &mut zc, None)?;
         Ok(())
+    }
+
+    /**
+    Grant (`unset` = false) or revoke (`unset` = true) `perms` for `who` on
+    `dataset` (ZFS_IOC_SET_FSACL) — like a bare `zfs allow` / `zfs unallow`,
+    i.e. local + descendent. The fsacl nvlist is keyed by the per-inheritance
+    "who" key, each mapping to an nvlist of permission-name → boolean flag.
+    Permission names are validated by the kernel (a bad one is a clean EINVAL).
+    */
+    pub fn set_fsacl(
+        &self,
+        dataset: &str,
+        who: &DelegWho,
+        perms: &[String],
+        unset: bool,
+    ) -> Result<()> {
+        let mut fsacl = NvList::new();
+        for inherit in ['l', 'd'] {
+            let mut permnv = NvList::new();
+            for p in perms {
+                permnv.add_bool_flag(p.clone());
+            }
+            fsacl.add_nvlist(deleg_whokey(who, inherit), permnv);
+        }
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        zc.zc_perm_action = unset as u64; // 0 = allow, 1 = unallow
+        let op = if unset { "unallow" } else { "allow" };
+        self.write_ioctl(ZFS_IOC_SET_FSACL, op, &mut zc, Some(&fsacl))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whokey_format_matches_kernel() {
+        // mirrors zfs_deleg_whokey: <type><inherit>$<id>, everyone has no id
+        assert_eq!(deleg_whokey(&DelegWho::User(1000), 'l'), "ul$1000");
+        assert_eq!(deleg_whokey(&DelegWho::User(1000), 'd'), "ud$1000");
+        assert_eq!(deleg_whokey(&DelegWho::Group(50), 'l'), "gl$50");
+        assert_eq!(deleg_whokey(&DelegWho::Everyone, 'l'), "el$");
+        assert_eq!(deleg_whokey(&DelegWho::Everyone, 'd'), "ed$");
+    }
+
+    #[test]
+    fn resolve_who_parses_specs() {
+        assert_eq!(resolve_who("everyone").unwrap(), DelegWho::Everyone);
+        assert_eq!(resolve_who("EVERYONE").unwrap(), DelegWho::Everyone);
+        assert_eq!(resolve_who("1000").unwrap(), DelegWho::User(1000));
+        assert_eq!(resolve_who("user:1000").unwrap(), DelegWho::User(1000));
+        assert_eq!(resolve_who("group:50").unwrap(), DelegWho::Group(50));
+        assert_eq!(resolve_who("g:50").unwrap(), DelegWho::Group(50));
+        // root is uid/gid 0 on Linux
+        assert_eq!(resolve_who("root").unwrap(), DelegWho::User(0));
+        assert_eq!(resolve_who("group:root").unwrap(), DelegWho::Group(0));
+        assert!(resolve_who("no_such_user_zzz_qx").is_err());
+        assert!(resolve_who("bogus:thing").is_err());
     }
 }

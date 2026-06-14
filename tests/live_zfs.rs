@@ -206,3 +206,15 @@ fn snapshot_in_nonexistent_pool_is_a_clean_error() {
     eprintln!("snapshot error (expected): {msg}");
     assert!(msg.starts_with("create snapshot:"), "unmapped error: {msg}");
 }
+
+#[test]
+fn get_fsacl_reads_delegations() {
+    let Some(zfs) = handle() else { return };
+    // GET_FSACL is a read; it must succeed on every pool root dataset and
+    // return an nvlist (empty when no `zfs allow` delegations are set). This
+    // is the ABI canary for the GET_FSACL path.
+    for pair in zfs.pool_configs().expect("pool configs").iter() {
+        let acl = zfs.get_fsacl(&pair.name).expect("ZFS_IOC_GET_FSACL");
+        eprintln!("{}: {} delegation entr(y/ies)", pair.name, acl.pairs.len());
+    }
+}
