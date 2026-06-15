@@ -134,7 +134,7 @@ impl VdevState {
     }
 }
 
-/// vdev_aux_t (zfs.h) — the auxiliary state explaining a non-healthy vdev.
+/// vdev_aux_t (zfs.h) - the auxiliary state explaining a non-healthy vdev.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
 #[repr(u8)]
 pub enum VdevAux {
@@ -356,6 +356,68 @@ impl DmuObjectType {
             return "OTN (self-describing)".into();
         }
         name_or_unknown!(DmuObjectType, v)
+    }
+}
+
+/// pool_scan_func_t (zfs.h) - which maintenance scan is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[repr(u8)]
+pub enum PoolScanFunc {
+    #[strum(serialize = "none")]
+    None = 0,
+    #[strum(serialize = "scrub")]
+    Scrub,
+    #[strum(serialize = "resilver")]
+    Resilver,
+    #[strum(serialize = "error scrub")]
+    ErrorScrub,
+}
+
+impl PoolScanFunc {
+    pub fn name(v: u64) -> String {
+        name_or_unknown!(PoolScanFunc, v)
+    }
+}
+
+/// dsl_scan_state_t (zfs.h) - the state of the pool-wide scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[repr(u8)]
+pub enum DslScanState {
+    #[strum(serialize = "none")]
+    None = 0,
+    #[strum(serialize = "scanning")]
+    Scanning,
+    #[strum(serialize = "finished")]
+    Finished,
+    #[strum(serialize = "canceled")]
+    Canceled,
+    #[strum(serialize = "error scrubbing")]
+    ErrorScrubbing,
+}
+
+impl DslScanState {
+    pub fn name(v: u64) -> String {
+        name_or_unknown!(DslScanState, v)
+    }
+}
+
+/// vdev_rebuild_state_t (zfs.h) - sequential-rebuild state of a top-level vdev.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[repr(u8)]
+pub enum VdevRebuildState {
+    #[strum(serialize = "none")]
+    None = 0,
+    #[strum(serialize = "active")]
+    Active,
+    #[strum(serialize = "canceled")]
+    Canceled,
+    #[strum(serialize = "complete")]
+    Complete,
+}
+
+impl VdevRebuildState {
+    pub fn name(v: u64) -> String {
+        name_or_unknown!(VdevRebuildState, v)
     }
 }
 
