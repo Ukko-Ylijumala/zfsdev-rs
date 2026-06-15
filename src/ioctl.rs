@@ -373,8 +373,13 @@ impl ZfsHandle {
     }
 
     fn ioctl(&self, ioc: u64, zc: &mut ZfsCmd) -> io::Result<()> {
+        /*
+        The ioctl request arg is c_ulong on glibc but c_int on musl; the
+        0x5a00-range request numbers fit either. `libc::Ioctl` is the
+        per-target alias, so this casts to the right width on both.
+        */
         let rc = unsafe {
-            libc::ioctl(self.file.as_raw_fd(), ioc as libc::c_ulong, zc as *mut ZfsCmd)
+            libc::ioctl(self.file.as_raw_fd(), ioc as libc::Ioctl, zc as *mut ZfsCmd)
         };
         if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
