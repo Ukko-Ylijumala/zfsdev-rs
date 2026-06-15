@@ -15,7 +15,7 @@ use crate::util::{fmt_unix_time, human_bytes};
 use crate::zfs::enums::{ZioChecksum, ZioCompress};
 use crate::zfs::nvlist::NvData;
 use std::str::FromStr;
-use strum::{Display, EnumString, FromRepr};
+use strum::{Display, EnumIter, EnumString, FromRepr, IntoEnumIterator};
 
 /// Every property name we know how to render. Lowercase matching; names
 /// with underscores are spelled out explicitly.
@@ -107,6 +107,77 @@ enum ZfsProp {
     FailMode,
     KeyFormat,
     Encryption,
+}
+
+/* ----------------------------- vdev properties --------------------------- */
+
+/**
+The vdev properties read via `VDEV_GET_PROPS` (`vdev_prop_t`,
+`module/zcommon/zpool_prop.c`; OpenZFS 2.2+). Only the computed read-only
+stats are modelled here: the kernel returns a property only when it is named
+in the request nvlist, and `vdev_prop_get` aborts the *entire* reply on the
+first requested property whose handler errors - so the settable/tunable props
+whose getters can fail (`comment`, `allocating`, `checksum_n`/`_t`,
+`io_n`/`_t`) are deliberately excluded, leaving only the always-available
+cases. [`request_names`](VdevProp::request_names) yields the full set for the
+input nvlist. Values render via [`format_prop_value`] where the names overlap
+pool/dataset props (size/free/allocated/fragmentation), raw otherwise.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumIter)]
+#[strum(serialize_all = "snake_case")]
+pub enum VdevProp {
+    Name,
+    State,
+    Guid,
+    Capacity,
+    Size,
+    Asize,
+    Psize,
+    Ashift,
+    Free,
+    Allocated,
+    #[strum(serialize = "expandsize")]
+    ExpandSize,
+    Fragmentation,
+    Parity,
+    #[strum(serialize = "numchildren")]
+    NumChildren,
+    ReadErrors,
+    WriteErrors,
+    ChecksumErrors,
+    InitializeErrors,
+    NullOps,
+    ReadOps,
+    WriteOps,
+    FreeOps,
+    ClaimOps,
+    TrimOps,
+    NullBytes,
+    ReadBytes,
+    WriteBytes,
+    FreeBytes,
+    ClaimBytes,
+    TrimBytes,
+    Removing,
+    #[strum(serialize = "failfast")]
+    FailFast,
+    Path,
+    Devid,
+    #[strum(serialize = "physpath")]
+    PhysPath,
+    #[strum(serialize = "encpath")]
+    EncPath,
+    Fru,
+    Parent,
+    Children,
+}
+
+impl VdevProp {
+    /// The vdev-property names to name in the `VDEV_GET_PROPS` input nvlist
+    /// (see the type-level note on why this is a curated subset).
+    pub fn request_names() -> Vec<String> {
+        Self::iter().map(|p| p.to_string()).collect()
+    }
 }
 
 /* --------------------- property value enums (zfs.h) ---------------------- */
@@ -539,6 +610,24 @@ mod tests {
         assert_eq!(format_prop_value("no_such_prop", 7), None);
         // out-of-range enum value falls back to raw display
         assert_eq!(format_prop_value("canmount", 9), None);
+    }
+
+    #[test]
+    fn vdev_prop_names() {
+        let names = VdevProp::request_names();
+        // the snake_case overrides for one-word kernel prop names
+        assert!(names.contains(&"expandsize".to_string()));
+        assert!(names.contains(&"numchildren".to_string()));
+        assert!(names.contains(&"physpath".to_string()));
+        assert!(names.contains(&"encpath".to_string()));
+        assert!(names.contains(&"failfast".to_string()));
+        // underscored names keep their underscores
+        assert!(names.contains(&"read_errors".to_string()));
+        assert!(names.contains(&"trim_bytes".to_string()));
+        // and the abort-prone props are deliberately absent
+        for omit in ["comment", "allocating", "checksum_n", "checksum_t", "io_n", "io_t"] {
+            assert!(!names.contains(&omit.to_string()), "{omit} must not be requested");
+        }
     }
 
     #[rustfmt::skip]

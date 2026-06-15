@@ -171,6 +171,79 @@ fn on_disk_labels_match_ioctl_config() {
     eprintln!("verified labels on {checked} pool(s)");
 }
 
+/// Walk a vdev tree to the first leaf device's guid.
+fn first_disk_guid(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<u64> {
+    if tree.get_str("path").is_some() {
+        return tree.get_u64("guid");
+    }
+    for child in tree.get_list_array("children")? {
+        if let Some(g) = first_disk_guid(child) {
+            return Some(g);
+        }
+    }
+    None
+}
+
+/*
+Read-only batch (VDEV_GET_PROPS, OBJSET_ZPLPROPS, OBJSET_RECVD_PROPS,
+GET_BOOKMARKS, GET_HOLDS, USERSPACE_MANY). These run unprivileged on any pool,
+so they double as ABI canaries for both the legacy (zc-field) and new-style
+(packed innvl) read paths — a wrong ioctl number or struct layout surfaces as
+EFAULT/EINVAL rather than the clean data / empty nvlist we expect.
+*/
+#[test]
+fn read_batch_ioctls() {
+    let Some(zfs) = handle() else { return };
+    let configs = zfs.pool_configs().expect("pool configs");
+    let Some(first) = configs.iter().next() else { return };
+    let pool = first.name.clone();
+
+    // VDEV_GET_PROPS on a leaf disk — guid is always returned (OpenZFS 2.2+).
+    let stats = zfs.pool_stats(&pool).expect("pool stats");
+    let tree = stats.get_list("vdev_tree").expect("vdev tree");
+    if let Some(guid) = first_disk_guid(tree) {
+        match zfs.vdev_get_props(&pool, guid) {
+            Ok(props) => {
+                eprintln!("{pool}: vdev {guid} -> {} props", props.pairs.len());
+                // the requested guid must round-trip in the returned value
+                assert_eq!(props.get_list("guid").and_then(|g| g.get_u64("value")), Some(guid));
+            }
+            // pre-2.2 kernels lack vdev props; an EINVAL here is acceptable
+            Err(e) => eprintln!("{pool}: vdev_get_props unsupported: {e}"),
+        }
+    }
+
+    // OBJSET_ZPLPROPS on the (filesystem) root dataset: ZPL version present.
+    let zpl = zfs.objset_zplprops(&pool).expect("ZFS_IOC_OBJSET_ZPLPROPS");
+    assert!(zpl.get_u64("version").is_some(), "ZPL props missing version");
+    eprintln!("{pool}: ZPL version {:?}", zpl.get_u64("version"));
+
+    // OBJSET_RECVD_PROPS: valid nvlist (often empty) when supported; old-format
+    // pools predating SPA_VERSION_RECVD_PROPS return EOPNOTSUPP, which is fine.
+    match zfs.objset_recvd_props(&pool) {
+        Ok(recvd) => eprintln!("{pool}: {} received props", recvd.pairs.len()),
+        Err(e) => eprintln!("{pool}: recvd props unsupported: {e}"),
+    }
+
+    // GET_BOOKMARKS: new-style read with a packed innvl; valid nvlist.
+    let bms = zfs.get_bookmarks(&pool).expect("ZFS_IOC_GET_BOOKMARKS");
+    eprintln!("{pool}: {} bookmarks", bms.pairs.len());
+
+    // GET_HOLDS on the first snapshot if any; otherwise just exercise the call.
+    let snaps = zfs.snapshots(&pool).expect("snapshot list");
+    if let Some(s) = snaps.first() {
+        let holds = zfs.get_holds(&s.name).expect("ZFS_IOC_GET_HOLDS");
+        eprintln!("{}: {} holds", s.name, holds.pairs.len());
+    }
+
+    // USERSPACE_MANY (userused = type 0): needs privilege; EPERM is fine, but
+    // the raw zfs_useracct_t decode must not panic when it does succeed.
+    match zfs.userspace_many(&pool, 0) {
+        Ok(accts) => eprintln!("{pool}: {} userused entries", accts.len()),
+        Err(e) => eprintln!("{pool}: userspace_many (needs root): {e}"),
+    }
+}
+
 /* ------------------------------ write path ------------------------------- */
 
 /*

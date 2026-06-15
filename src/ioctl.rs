@@ -20,6 +20,7 @@ kernel (root, or a matching `zfs allow` delegation).
 */
 
 use super::nvlist::{NvError, NvList};
+use super::props::VdevProp;
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -32,10 +33,16 @@ const ZFS_IOC_POOL_CONFIGS: u64 = 0x5a04;
 const ZFS_IOC_POOL_STATS: u64 = 0x5a05;
 const ZFS_IOC_POOL_GET_HISTORY: u64 = 0x5a0a;
 const ZFS_IOC_OBJSET_STATS: u64 = 0x5a12;
+const ZFS_IOC_OBJSET_ZPLPROPS: u64 = 0x5a13;
 const ZFS_IOC_DATASET_LIST_NEXT: u64 = 0x5a14;
 const ZFS_IOC_SNAPSHOT_LIST_NEXT: u64 = 0x5a15;
 const ZFS_IOC_POOL_GET_PROPS: u64 = 0x5a27;
 const ZFS_IOC_GET_FSACL: u64 = 0x5a29;
+const ZFS_IOC_USERSPACE_MANY: u64 = 0x5a2e;
+const ZFS_IOC_GET_HOLDS: u64 = 0x5a32;
+const ZFS_IOC_OBJSET_RECVD_PROPS: u64 = 0x5a33;
+const ZFS_IOC_GET_BOOKMARKS: u64 = 0x5a44;
+const ZFS_IOC_VDEV_GET_PROPS: u64 = 0x5a55;
 
 /*
 Mutating ioctls (ordinals from doc/reference/zfs.h). SET_PROP, DESTROY,
@@ -121,6 +128,24 @@ pub fn resolve_who(spec: &str) -> std::result::Result<DelegWho, String> {
         resolve_id(name, true).map(DelegWho::Group).ok_or_else(|| format!("no such group '{name}'"))
     } else {
         resolve_id(name, false).map(DelegWho::User).ok_or_else(|| format!("no such user '{name}'"))
+    }
+}
+
+/// Look up a numeric uid (or gid) in the system database, returning its name.
+/// The inverse of [`resolve_id`]; used to label userused@/groupused@ rows.
+pub fn name_for_id(id: u64, group: bool) -> Option<String> {
+    let id = u32::try_from(id).ok()?;
+    // SAFETY: getpwuid/getgrgid return a pointer into static storage (or null);
+    // we copy the name out immediately and don't retain the pointer.
+    unsafe {
+        let name = if group {
+            let gr = libc::getgrgid(id as libc::gid_t);
+            (!gr.is_null()).then(|| (*gr).gr_name)
+        } else {
+            let pw = libc::getpwuid(id as libc::uid_t);
+            (!pw.is_null()).then(|| (*pw).pw_name)
+        };
+        name.map(|p| CStr::from_ptr(p).to_string_lossy().into_owned())
     }
 }
 
@@ -350,6 +375,18 @@ impl From<&DmuObjsetStatsRaw> for ObjsetStats {
     }
 }
 
+/**
+One decoded `zfs_useracct_t` from USERSPACE_MANY: the space charged to a
+user/group. `domain` is empty on plain POSIX ids (set only for SMB/idmap);
+`rid` is the uid/gid.
+*/
+#[derive(Debug, Clone)]
+pub struct UserAcct {
+    pub domain: String,
+    pub rid: u32,
+    pub space: u64,
+}
+
 /// A dataset or snapshot returned by the LIST_NEXT iterators.
 #[derive(Debug, Clone)]
 pub struct DatasetEntry {
@@ -387,6 +424,21 @@ impl ZfsHandle {
     /// Run an ioctl whose result is an nvlist in `zc_nvlist_dst`, growing the
     /// destination buffer on ENOMEM as the kernel requests.
     fn ioctl_nv(&self, ioc: u64, zc: &mut ZfsCmd) -> Result<NvList> {
+        self.ioctl_nv_in(ioc, zc, None)
+    }
+
+    /**
+    Like [`Self::ioctl_nv`], but for the "new-style" read ioctls that also take
+    an input nvlist (packed into `zc_nvlist_src`) — e.g. VDEV_GET_PROPS and
+    GET_BOOKMARKS, which name what to fetch. The packed source is held for the
+    duration of the call(s).
+    */
+    fn ioctl_nv_in(&self, ioc: u64, zc: &mut ZfsCmd, innvl: Option<&NvList>) -> Result<NvList> {
+        let src = innvl.map(|nv| nv.pack());
+        if let Some(s) = &src {
+            zc.zc_nvlist_src = s.as_ptr() as u64;
+            zc.zc_nvlist_src_size = s.len() as u64;
+        }
         let mut dst: Vec<u8> = vec![0; DST_INITIAL];
         loop {
             zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
@@ -485,6 +537,128 @@ impl ZfsHandle {
         let mut zc = ZfsCmd::new();
         zc.set_name(dataset);
         self.ioctl_nv(ZFS_IOC_GET_FSACL, &mut zc)
+    }
+
+    /**
+    ZPL-layer properties of a filesystem (ZFS_IOC_OBJSET_ZPLPROPS): `version`,
+    `normalization`, `utf8only`, `casesensitivity`. Unlike the dataset prop
+    nvlist, values are stored directly (name → uint64), not wrapped in a
+    `{value, source}` sub-nvlist. Only meaningful for ZFS (not zvol) objsets.
+    */
+    pub fn objset_zplprops(&self, dataset: &str) -> Result<NvList> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        self.ioctl_nv(ZFS_IOC_OBJSET_ZPLPROPS, &mut zc)
+    }
+
+    /**
+    The received (`zfs recv`) property values for a dataset
+    (ZFS_IOC_OBJSET_RECVD_PROPS) — the values a property would revert to on
+    `zfs inherit -S`, distinct from the locally set/inherited values. Same
+    `{value, source}` shape as the live property nvlist; empty if nothing was
+    received.
+    */
+    pub fn objset_recvd_props(&self, dataset: &str) -> Result<NvList> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        self.ioctl_nv(ZFS_IOC_OBJSET_RECVD_PROPS, &mut zc)
+    }
+
+    /**
+    User holds on a snapshot (ZFS_IOC_GET_HOLDS), keyed by hold tag → the
+    hold's creation time (unix seconds). A snapshot with holds cannot be
+    destroyed until they are released. New-style ioctl with no input nvlist.
+    */
+    pub fn get_holds(&self, snapshot: &str) -> Result<NvList> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(snapshot);
+        self.ioctl_nv(ZFS_IOC_GET_HOLDS, &mut zc)
+    }
+
+    /**
+    Vdev properties (ZFS_IOC_VDEV_GET_PROPS) for the vdev `guid` within `pool`,
+    keyed by prop name → `{value, source}`. Vdev props are an OpenZFS 2.2+
+    feature; older kernels reject the unknown ioctl with EINVAL.
+
+    The input nvlist names the target vdev by guid (`ZPOOL_VDEV_PROPS_GET_VDEV`)
+    and the properties to fetch (`ZPOOL_VDEV_PROPS_GET_PROPS`, an nvlist whose
+    *keys* are prop names). Omitting the prop set would return only props
+    explicitly stored in the vdev ZAP (none, by default) — the computed
+    read-only stats must be requested by name. The curated request set (and the
+    reason it omits the kernel-abort-prone props) is [`VdevProp`].
+    */
+    pub fn vdev_get_props(&self, pool: &str, guid: u64) -> Result<NvList> {
+        let mut want = NvList::new();
+        for p in VdevProp::request_names() {
+            want.add_bool_flag(p);
+        }
+        let mut innvl = NvList::new();
+        innvl.add_u64("vdevprops_get_vdev", guid);
+        innvl.add_nvlist("vdevprops_get_props", want);
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.ioctl_nv_in(ZFS_IOC_VDEV_GET_PROPS, &mut zc, Some(&innvl))
+    }
+
+    /**
+    Bookmarks of a dataset (ZFS_IOC_GET_BOOKMARKS), keyed by bookmark short
+    name (the part after `#`) → an nvlist of the requested props, each a
+    `{value: ...}` sub-nvlist. The input nvlist lists which props to return as
+    bare booleans; we ask for `guid`, `createtxg`, `creation`.
+    */
+    pub fn get_bookmarks(&self, dataset: &str) -> Result<NvList> {
+        let mut innvl = NvList::new();
+        for p in ["guid", "createtxg", "creation"] {
+            innvl.add_bool_flag(p);
+        }
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        self.ioctl_nv_in(ZFS_IOC_GET_BOOKMARKS, &mut zc, Some(&innvl))
+    }
+
+    /**
+    Per-user or per-group space accounting (ZFS_IOC_USERSPACE_MANY) for
+    `dataset`. `prop_type` is a `zfs_userquota_prop_t` index (0 = userused,
+    1 = userquota, 2 = groupused, …; doc/reference/zfs.h). Unlike most read
+    ioctls this does *not* return an nvlist: the kernel fills `zc_nvlist_dst`
+    with a packed array of `zfs_useracct_t` (`zu_domain[256]`, `zu_rid` u32,
+    `zu_spare` u32, `zu_space` u64 = 272 bytes) and advances `zc_cookie` as an
+    iteration cursor, so we loop until a read returns no bytes. Reading other
+    users' usage needs privilege; non-root gets EPERM (surfaced to the UI).
+    */
+    pub fn userspace_many(&self, dataset: &str, prop_type: u64) -> Result<Vec<UserAcct>> {
+        const REC: usize = 272;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * REC];
+        let mut cookie = 0u64;
+        loop {
+            let mut zc = ZfsCmd::new();
+            zc.set_name(dataset);
+            zc.zc_objset_type = prop_type;
+            zc.zc_cookie = cookie;
+            zc.zc_nvlist_dst = buf.as_mut_ptr() as u64;
+            zc.zc_nvlist_dst_size = buf.len() as u64;
+            self.ioctl(ZFS_IOC_USERSPACE_MANY, &mut zc).map_err(|err| ZfsError::Ioctl {
+                ioc: ZFS_IOC_USERSPACE_MANY,
+                name: dataset.to_string(),
+                err,
+            })?;
+            let filled = (zc.zc_nvlist_dst_size as usize).min(buf.len());
+            for rec in buf[..filled].chunks_exact(REC) {
+                out.push(UserAcct {
+                    domain: cstr_field(&rec[..MAXNAMELEN]),
+                    rid: u32::from_ne_bytes(rec[256..260].try_into().unwrap()),
+                    space: u64::from_ne_bytes(rec[264..272].try_into().unwrap()),
+                });
+            }
+            // the kernel signals end-of-iteration by returning no entries (and
+            // leaving the cursor unchanged); guard on both
+            if filled < REC || zc.zc_cookie == cookie {
+                break;
+            }
+            cookie = zc.zc_cookie;
+        }
+        Ok(out)
     }
 
     /// Stats and properties for one dataset (ZFS_IOC_OBJSET_STATS).
