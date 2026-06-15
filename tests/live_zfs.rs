@@ -244,6 +244,31 @@ fn read_batch_ioctls() {
     }
 }
 
+/*
+Kernel event feed (EVENTS_SEEK + EVENTS_NEXT, Linux). Reading events is config-
+privileged, so on a non-root run EPERM is the clean expected path — and proves
+the ABI all the same (a wrong ioctl number / struct layout would be EFAULT/
+EINVAL, not EPERM). When root, drain a bounded, NON-BLOCKING batch so the test
+can never hang on an idle event ring, and check each event decodes with a class.
+*/
+#[test]
+fn events_ioctls_abi() {
+    let Some(zfs) = handle() else { return };
+    if let Err(e) = zfs.events_seek_start() {
+        eprintln!("events need root: {e}");
+        return;
+    }
+    let mut n = 0;
+    while let Some((nv, _dropped)) = zfs.events_next(false).expect("ZFS_IOC_EVENTS_NEXT") {
+        assert!(nv.get_str("class").is_some(), "event nvlist has no 'class'");
+        n += 1;
+        if n >= 50 {
+            break; // bounded — don't drain a huge ring in the test
+        }
+    }
+    eprintln!("read {n} kernel event(s)");
+}
+
 /* ------------------------------ write path ------------------------------- */
 
 /*

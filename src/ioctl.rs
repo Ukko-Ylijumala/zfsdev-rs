@@ -45,6 +45,19 @@ const ZFS_IOC_GET_BOOKMARKS: u64 = 0x5a44;
 const ZFS_IOC_VDEV_GET_PROPS: u64 = 0x5a55;
 
 /*
+Linux event-stream ioctls (`zpool events`): ZFS_IOC_PLATFORM = ZFS_IOC_FIRST +
+0x80 = 0x5a80, then EVENTS_NEXT/_CLEAR/_SEEK. The cursor is per-fd (keyed by
+`zc_cleanup_fd`), so a dedicated handle reads the whole kernel ring.
+*/
+const ZFS_IOC_EVENTS_NEXT: u64 = 0x5a81;
+const ZFS_IOC_EVENTS_SEEK: u64 = 0x5a83;
+/// `zc_guid` flag for EVENTS_NEXT: return ENOENT instead of blocking when the
+/// cursor has caught up (doc/reference/zfs_ioctl.h).
+const ZEVENT_NONBLOCK: u64 = 0x1;
+/// EVENTS_SEEK target: rewind the cursor to the oldest retained event.
+const ZEVENT_SEEK_START: u64 = 0;
+
+/*
 Mutating ioctls (ordinals from doc/reference/zfs.h). SET_PROP, DESTROY,
 RENAME and INHERIT_PROP are "legacy" (parameters in zc_ fields); SNAPSHOT,
 DESTROY_SNAPS and CREATE are "new"-style (parameters as a packed nvlist in
@@ -661,6 +674,67 @@ impl ZfsHandle {
         Ok(out)
     }
 
+    /* -------------------------------- zevents ---------------------------- */
+
+    /**
+    Rewind this handle's zevent cursor to the oldest retained event
+    (EVENTS_SEEK → ZEVENT_SEEK_START). The cursor is keyed by `zc_cleanup_fd`
+    (here our own fd), so a handle dedicated to event reading then sees the
+    whole in-kernel ring from the start. Reading events needs root (EPERM).
+    */
+    pub fn events_seek_start(&self) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.zc_cleanup_fd = self.file.as_raw_fd();
+        zc.zc_guid = ZEVENT_SEEK_START;
+        self.ioctl(ZFS_IOC_EVENTS_SEEK, &mut zc).map_err(|err| ZfsError::Ioctl {
+            ioc: ZFS_IOC_EVENTS_SEEK,
+            name: "(zevents)".into(),
+            err,
+        })
+    }
+
+    /**
+    Read the next kernel event (EVENTS_NEXT) through this handle's per-fd
+    cursor, returning the event nvlist and the kernel's "dropped" count (events
+    lost to ring overflow in the gap before this one). `block` waits in-kernel
+    until an event is available; otherwise `Ok(None)` once the cursor has caught
+    up (ENOENT). Reading events needs root.
+    */
+    pub fn events_next(&self, block: bool) -> Result<Option<(NvList, u64)>> {
+        let mut dst: Vec<u8> = vec![0; DST_INITIAL];
+        loop {
+            let mut zc = ZfsCmd::new();
+            zc.zc_cleanup_fd = self.file.as_raw_fd();
+            if !block {
+                zc.zc_guid = ZEVENT_NONBLOCK;
+            }
+            zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
+            zc.zc_nvlist_dst_size = dst.len() as u64;
+            match self.ioctl(ZFS_IOC_EVENTS_NEXT, &mut zc) {
+                Ok(()) => {
+                    let len = (zc.zc_nvlist_dst_size as usize).min(dst.len());
+                    return Ok(Some((NvList::unpack(&dst[..len])?, zc.zc_cookie)));
+                }
+                // cursor caught up (only in non-blocking mode)
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+                // event larger than the buffer: kernel set the needed size; grow
+                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+                    let need = zc.zc_nvlist_dst_size as usize;
+                    dst.resize(need.max(dst.len() * 2), 0);
+                }
+                // a signal interrupted the blocking wait — just retry
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+                Err(err) => {
+                    return Err(ZfsError::Ioctl {
+                        ioc: ZFS_IOC_EVENTS_NEXT,
+                        name: "(zevents)".into(),
+                        err,
+                    });
+                }
+            }
+        }
+    }
+
     /// Stats and properties for one dataset (ZFS_IOC_OBJSET_STATS).
     pub fn objset_stats(&self, dataset: &str) -> Result<(ObjsetStats, NvList)> {
         let mut zc = ZfsCmd::new();
@@ -913,6 +987,8 @@ impl ZfsHandle {
         Ok(())
     }
 }
+
+/* ========================================================================= */
 
 #[cfg(test)]
 mod tests {
