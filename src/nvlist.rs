@@ -859,7 +859,7 @@ impl NvData {
     /// Short single-line rendering for list views.
     pub fn summary(&self) -> String {
         fn arr<T: std::fmt::Display>(v: &[T]) -> String {
-            const MAX: usize = 8;
+            const MAX: usize = 4; // keep summaries (and node labels) short
             let shown: Vec<String> = v.iter().take(MAX).map(|x| x.to_string()).collect();
             let ell = if v.len() > MAX { ", …" } else { "" };
             format!("[{}{ell}] ({} elems)", shown.join(", "), v.len())
