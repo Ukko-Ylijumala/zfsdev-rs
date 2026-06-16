@@ -67,6 +67,10 @@ RENAME and INHERIT_PROP are "legacy" (parameters in zc_ fields); SNAPSHOT,
 DESTROY_SNAPS and CREATE are "new"-style (parameters as a packed nvlist in
 zc_nvlist_src).
 */
+const ZFS_IOC_POOL_SCAN: u64 = 0x5a07;
+const ZFS_IOC_CLEAR: u64 = 0x5a21;
+const ZFS_IOC_POOL_INITIALIZE: u64 = 0x5a4f;
+const ZFS_IOC_POOL_TRIM: u64 = 0x5a50;
 const ZFS_IOC_SET_PROP: u64 = 0x5a16;
 const ZFS_IOC_SET_FSACL: u64 = 0x5a28;
 const ZFS_IOC_CREATE: u64 = 0x5a17;
@@ -1108,6 +1112,83 @@ impl ZfsHandle {
         innvl.add_str("message", message);
         let mut zc = ZfsCmd::new();
         self.write_ioctl(ZFS_IOC_LOG_HISTORY, "log history", &mut zc, Some(&innvl))?;
+        Ok(())
+    }
+
+    /* ---------------------------- pool maintenance ----------------------- */
+
+    /**
+    Control a pool scan (ZFS_IOC_POOL_SCAN). `func` is a `pool_scan_func_t`
+    (0 = stop the running scan, 1 = scrub, 2 = resilver); `pause` issues a
+    pause of the current scan instead (resume = call again with `func` = scrub,
+    `pause` = false). zc_cookie carries the func, zc_flags the
+    `POOL_SCRUB_PAUSE` bit.
+    */
+    pub fn pool_scan(&self, pool: &str, func: u64, pause: bool) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        zc.zc_cookie = func;
+        zc.zc_flags = u32::from(pause); // POOL_SCRUB_PAUSE = 1, else NORMAL
+        self.write_ioctl(ZFS_IOC_POOL_SCAN, "scrub", &mut zc, None)?;
+        Ok(())
+    }
+
+    /**
+    Clear device error counts and the persistent error log (ZFS_IOC_CLEAR),
+    pool-wide when `guid` is 0 or for one vdev otherwise. zc_cookie =
+    `ZPOOL_NO_REWIND` selects the plain (no rewind-policy nvlist) path, which is
+    what clearing an online pool wants.
+    */
+    pub fn clear_errors(&self, pool: &str, guid: u64) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        zc.zc_guid = guid;
+        zc.zc_cookie = 1; // ZPOOL_NO_REWIND
+        self.write_ioctl(ZFS_IOC_CLEAR, "clear errors", &mut zc, None)?;
+        Ok(())
+    }
+
+    /**
+    Build the `{key: guid}` vdev nvlist the trim/initialize ioctls expect
+    (the kernel reads each pair's uint64 *value* as a vdev guid; the key is
+    arbitrary, so the guid itself doubles as a unique key).
+    */
+    fn vdev_guid_nvlist(guids: &[u64]) -> NvList {
+        let mut nv = NvList::new();
+        for g in guids {
+            nv.add_u64(g.to_string(), *g);
+        }
+        nv
+    }
+
+    /**
+    Start (`cmd` = 0), cancel (1) or suspend (2) TRIM on the given vdev guids
+    (ZFS_IOC_POOL_TRIM) — typically a pool's top-level vdevs. The kernel returns
+    EINVAL if any vdev can't be trimmed (e.g. a file vdev), which surfaces as the
+    operation error.
+    */
+    pub fn pool_trim(&self, pool: &str, guids: &[u64], cmd: u64) -> Result<()> {
+        let mut innvl = NvList::new();
+        innvl.add_u64("trim_command", cmd);
+        innvl.add_nvlist("trim_vdevs", Self::vdev_guid_nvlist(guids));
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.write_ioctl(ZFS_IOC_POOL_TRIM, "trim", &mut zc, Some(&innvl))?;
+        Ok(())
+    }
+
+    /**
+    Start (`cmd` = 0), cancel (1), suspend (2) or uninit (3) INITIALIZE on the
+    given vdev guids (ZFS_IOC_POOL_INITIALIZE) — writing a pattern to all
+    unallocated space.
+    */
+    pub fn pool_initialize(&self, pool: &str, guids: &[u64], cmd: u64) -> Result<()> {
+        let mut innvl = NvList::new();
+        innvl.add_u64("initialize_command", cmd);
+        innvl.add_nvlist("initialize_vdevs", Self::vdev_guid_nvlist(guids));
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.write_ioctl(ZFS_IOC_POOL_INITIALIZE, "initialize", &mut zc, Some(&innvl))?;
         Ok(())
     }
 }

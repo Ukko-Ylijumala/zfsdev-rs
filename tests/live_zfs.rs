@@ -15,6 +15,34 @@ fn handle() -> Option<ZfsHandle> {
     Some(ZfsHandle::open().expect("open /dev/zfs"))
 }
 
+/// Walk a vdev tree to the first leaf device path.
+fn first_disk_path(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<String> {
+    if let Some(path) = tree.get_str("path") {
+        return Some(path.to_string());
+    }
+    for child in tree.get_list_array("children")? {
+        if let Some(p) = first_disk_path(child) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Walk a vdev tree to the first leaf device's guid.
+fn first_disk_guid(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<u64> {
+    if tree.get_str("path").is_some() {
+        return tree.get_u64("guid");
+    }
+    for child in tree.get_list_array("children")? {
+        if let Some(g) = first_disk_guid(child) {
+            return Some(g);
+        }
+    }
+    None
+}
+
+/* ========================================================================= */
+
 #[test]
 fn pool_configs_decode_and_match_cli() {
     let Some(zfs) = handle() else { return };
@@ -99,19 +127,6 @@ fn datasets_and_snapshots_enumerate() {
     }
 }
 
-/// Walk a vdev tree to the first leaf device path.
-fn first_disk_path(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<String> {
-    if let Some(path) = tree.get_str("path") {
-        return Some(path.to_string());
-    }
-    for child in tree.get_list_array("children")? {
-        if let Some(p) = first_disk_path(child) {
-            return Some(p);
-        }
-    }
-    None
-}
-
 #[test]
 fn on_disk_labels_match_ioctl_config() {
     use zfs_browser::zfs::ondisk::label::read_device_labels;
@@ -169,19 +184,6 @@ fn on_disk_labels_match_ioctl_config() {
         checked += 1;
     }
     eprintln!("verified labels on {checked} pool(s)");
-}
-
-/// Walk a vdev tree to the first leaf device's guid.
-fn first_disk_guid(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<u64> {
-    if tree.get_str("path").is_some() {
-        return tree.get_u64("guid");
-    }
-    for child in tree.get_list_array("children")? {
-        if let Some(g) = first_disk_guid(child) {
-            return Some(g);
-        }
-    }
-    None
 }
 
 /*
@@ -302,14 +304,13 @@ fn error_log_ioctls_abi() {
 
 /* ------------------------------ write path ------------------------------- */
 
-/*
+/**
 The write ioctls can't be exercised destructively against the user's real
 pools, but targeting a pool name that cannot exist proves the ioctl numbers
 and zfs_cmd_t layout are correct for the mutating path — the ABI canary for
 writes — with zero side effects. A wrong struct size/number would surface
 as EFAULT/EINVAL or a panic, not the clean "no such pool" we expect.
 */
-
 const NOPE_POOL: &str = "zfsbrowser_nonexistent_pool_canary";
 
 #[test]
@@ -337,11 +338,37 @@ fn snapshot_in_nonexistent_pool_is_a_clean_error() {
 }
 
 #[test]
+fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
+    let Some(zfs) = handle() else { return };
+    /*
+    scan/clear are legacy (zc fields); trim/initialize are new-style (packed
+    innvl with a vdev-guid nvlist). Targeting a bogus pool exercises all four
+    struct layouts / ioctl numbers and must fail at pool lookup, not crash.
+    */
+    let scrub = zfs.pool_scan(NOPE_POOL, 1, false).expect_err("scrub of bogus pool must fail");
+    assert!(scrub.to_string().starts_with("scrub:"), "unmapped: {scrub}");
+
+    let clear = zfs.clear_errors(NOPE_POOL, 0).expect_err("clear of bogus pool must fail");
+    assert!(clear.to_string().starts_with("clear errors:"), "unmapped: {clear}");
+
+    let trim = zfs.pool_trim(NOPE_POOL, &[0xdead], 0).expect_err("trim of bogus pool must fail");
+    assert!(trim.to_string().starts_with("trim:"), "unmapped: {trim}");
+
+    let init = zfs
+        .pool_initialize(NOPE_POOL, &[0xdead], 0)
+        .expect_err("initialize of bogus pool must fail");
+    assert!(init.to_string().starts_with("initialize:"), "unmapped: {init}");
+    eprintln!("pool-maintenance canaries all failed cleanly at pool lookup");
+}
+
+#[test]
 fn get_fsacl_reads_delegations() {
     let Some(zfs) = handle() else { return };
-    // GET_FSACL is a read; it must succeed on every pool root dataset and
-    // return an nvlist (empty when no `zfs allow` delegations are set). This
-    // is the ABI canary for the GET_FSACL path.
+    /*
+    GET_FSACL is a read; it must succeed on every pool root dataset and
+    return an nvlist (empty when no `zfs allow` delegations are set). This
+    is the ABI canary for the GET_FSACL path.
+    */
     for pair in zfs.pool_configs().expect("pool configs").iter() {
         let acl = zfs.get_fsacl(&pair.name).expect("ZFS_IOC_GET_FSACL");
         eprintln!("{}: {} delegation entr(y/ies)", pair.name, acl.pairs.len());
