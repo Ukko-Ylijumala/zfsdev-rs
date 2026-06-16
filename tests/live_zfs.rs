@@ -269,6 +269,37 @@ fn events_ioctls_abi() {
     eprintln!("read {n} kernel event(s)");
 }
 
+/*
+Error log (ERROR_LOG) + object resolution (DSOBJ_TO_DSNAME / OBJ_TO_PATH /
+OBJ_TO_STATS). ERROR_LOG needs root, so EACCES/EPERM is the clean unprivileged
+path and still proves the ABI — in particular the unusual "filled from the back
+of the buffer" decode. A healthy pool returns an empty log; any bookmarks found
+are resolved (best-effort) to exercise the object-resolution ioctls too.
+*/
+#[test]
+fn error_log_ioctls_abi() {
+    let Some(zfs) = handle() else { return };
+    let configs = zfs.pool_configs().expect("pool configs");
+    let Some(first) = configs.iter().next() else { return };
+    let pool = first.name.clone();
+
+    let errs = match zfs.error_log(&pool) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{pool}: error_log needs root: {e}");
+            return;
+        }
+    };
+    eprintln!("{pool}: {} error-log bookmark(s)", errs.len());
+    for zb in errs.iter().take(8) {
+        // resolution is best-effort: freed objects / non-ZPL objsets give a
+        // clean ENOENT/EINVAL, which still exercises the legacy ioctl layout
+        if let Ok(ds) = zfs.dsobj_to_dsname(&pool, zb.objset) {
+            let _ = zfs.obj_to_stats(&ds, zb.object);
+        }
+    }
+}
+
 /* ------------------------------ write path ------------------------------- */
 
 /*

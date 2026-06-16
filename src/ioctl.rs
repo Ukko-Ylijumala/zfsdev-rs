@@ -34,6 +34,10 @@ const ZFS_IOC_POOL_STATS: u64 = 0x5a05;
 const ZFS_IOC_POOL_GET_HISTORY: u64 = 0x5a0a;
 const ZFS_IOC_OBJSET_STATS: u64 = 0x5a12;
 const ZFS_IOC_OBJSET_ZPLPROPS: u64 = 0x5a13;
+const ZFS_IOC_ERROR_LOG: u64 = 0x5a20;
+const ZFS_IOC_DSOBJ_TO_DSNAME: u64 = 0x5a24;
+const ZFS_IOC_OBJ_TO_PATH: u64 = 0x5a25;
+const ZFS_IOC_OBJ_TO_STATS: u64 = 0x5a38;
 const ZFS_IOC_DATASET_LIST_NEXT: u64 = 0x5a14;
 const ZFS_IOC_SNAPSHOT_LIST_NEXT: u64 = 0x5a15;
 const ZFS_IOC_POOL_GET_PROPS: u64 = 0x5a27;
@@ -400,6 +404,35 @@ pub struct UserAcct {
     pub space: u64,
 }
 
+/**
+A `zbookmark_phys_t` from the pool error log: the block (objset, object, level,
+blkid) of a permanent data error. `objset` is a dataset object id (resolve via
+[`ZfsHandle::dsobj_to_dsname`]); `object` is an object within that dataset.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Zbookmark {
+    pub objset: u64,
+    pub object: u64,
+    pub level: i64,
+    pub blkid: u64,
+}
+
+/// The `zfs_stat_t` an object resolves to (OBJ_TO_STATS): generation, POSIX
+/// mode bits, link count, and ctime (unix seconds).
+#[derive(Debug, Clone, Copy)]
+pub struct ZStat {
+    pub generation: u64,
+    pub mode: u64,
+    pub links: u64,
+    pub ctime: u64,
+}
+
+impl From<&ZfsStat> for ZStat {
+    fn from(s: &ZfsStat) -> Self {
+        ZStat { generation: s.zs_gen, mode: s.zs_mode, links: s.zs_links, ctime: s.zs_ctime[0] }
+    }
+}
+
 /// A dataset or snapshot returned by the LIST_NEXT iterators.
 #[derive(Debug, Clone)]
 pub struct DatasetEntry {
@@ -733,6 +766,97 @@ impl ZfsHandle {
                 }
             }
         }
+    }
+
+    /* ------------------------------ error log ---------------------------- */
+
+    /**
+    The pool's persistent error log (ZFS_IOC_ERROR_LOG) — the bookmarks of
+    blocks with permanent data errors, i.e. the `errors:` list `zpool status
+    -v` prints. The kernel fills `zc_nvlist_dst` with an array of
+    `zbookmark_phys_t` (32 bytes each), writing them from the *back*: on return
+    `zc_nvlist_dst_size` is the count of *unused* trailing slots, so the valid
+    entries occupy `[remaining, capacity)`. There is no kernel-provided needed
+    size, so we double the buffer and retry on ENOMEM (like libzfs).
+    */
+    pub fn error_log(&self, pool: &str) -> Result<Vec<Zbookmark>> {
+        const ENT: usize = 32; // size_of::<zbookmark_phys_t>()
+        let mut cap: u64 = 128;
+        loop {
+            let mut buf = vec![0u8; cap as usize * ENT];
+            let mut zc = ZfsCmd::new();
+            zc.set_name(pool);
+            zc.zc_nvlist_dst = buf.as_mut_ptr() as u64;
+            zc.zc_nvlist_dst_size = cap;
+            match self.ioctl(ZFS_IOC_ERROR_LOG, &mut zc) {
+                Ok(()) => {
+                    // entries occupy [remaining, cap); `remaining` is the unused
+                    // leading slots the kernel left after back-filling
+                    let remaining = zc.zc_nvlist_dst_size.min(cap) as usize;
+                    let rd = |o: usize| u64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+                    let entries = (remaining..cap as usize)
+                        .map(|i| {
+                            let b = i * ENT;
+                            Zbookmark {
+                                objset: rd(b),
+                                object: rd(b + 8),
+                                level: rd(b + 16) as i64,
+                                blkid: rd(b + 24),
+                            }
+                        })
+                        .collect();
+                    return Ok(entries);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => cap = cap.saturating_mul(2),
+                Err(err) => {
+                    return Err(ZfsError::Ioctl { ioc: ZFS_IOC_ERROR_LOG, name: pool.to_string(), err });
+                }
+            }
+        }
+    }
+
+    /// Resolve a dataset object id to its dataset name within `pool`
+    /// (ZFS_IOC_DSOBJ_TO_DSNAME). Used to name error-log bookmarks.
+    pub fn dsobj_to_dsname(&self, pool: &str, dsobj: u64) -> Result<String> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        zc.zc_obj = dsobj;
+        self.ioctl(ZFS_IOC_DSOBJ_TO_DSNAME, &mut zc).map_err(|err| ZfsError::Ioctl {
+            ioc: ZFS_IOC_DSOBJ_TO_DSNAME,
+            name: pool.to_string(),
+            err,
+        })?;
+        Ok(cstr_field(&zc.zc_value))
+    }
+
+    /**
+    Resolve an object number to its file path within `dataset`
+    (ZFS_IOC_OBJ_TO_PATH). Only ZFS (ZPL) objsets — EINVAL for a zvol or the MOS.
+    */
+    pub fn obj_to_path(&self, dataset: &str, obj: u64) -> Result<String> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        zc.zc_obj = obj;
+        self.ioctl(ZFS_IOC_OBJ_TO_PATH, &mut zc).map_err(|err| ZfsError::Ioctl {
+            ioc: ZFS_IOC_OBJ_TO_PATH,
+            name: dataset.to_string(),
+            err,
+        })?;
+        Ok(cstr_field(&zc.zc_value))
+    }
+
+    /// Resolve an object to its path *and* stat (ZFS_IOC_OBJ_TO_STATS); same
+    /// ZPL-only restriction as [`Self::obj_to_path`].
+    pub fn obj_to_stats(&self, dataset: &str, obj: u64) -> Result<(String, ZStat)> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        zc.zc_obj = obj;
+        self.ioctl(ZFS_IOC_OBJ_TO_STATS, &mut zc).map_err(|err| ZfsError::Ioctl {
+            ioc: ZFS_IOC_OBJ_TO_STATS,
+            name: dataset.to_string(),
+            err,
+        })?;
+        Ok((cstr_field(&zc.zc_value), (&zc.zc_stat).into()))
     }
 
     /// Stats and properties for one dataset (ZFS_IOC_OBJSET_STATS).
