@@ -362,6 +362,19 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
 }
 
 #[test]
+fn hold_release_in_nonexistent_pool_is_a_clean_error() {
+    let Some(zfs) = handle() else { return };
+    // both are new-style (packed innvl); a bogus snapshot fails at lookup,
+    // proving the HOLD/RELEASE struct layouts with no side effects
+    let snap = format!("{NOPE_POOL}/ds@canary");
+    let hold = zfs.hold(NOPE_POOL, &snap, "tag").expect_err("hold of bogus snap must fail");
+    assert!(hold.to_string().starts_with("hold:"), "unmapped: {hold}");
+    let rel = zfs.release(NOPE_POOL, &snap, "tag").expect_err("release of bogus snap must fail");
+    assert!(rel.to_string().starts_with("release:"), "unmapped: {rel}");
+    eprintln!("hold/release canaries failed cleanly");
+}
+
+#[test]
 fn get_fsacl_reads_delegations() {
     let Some(zfs) = handle() else { return };
     /*

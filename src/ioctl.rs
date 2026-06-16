@@ -80,6 +80,8 @@ const ZFS_IOC_SNAPSHOT: u64 = 0x5a23;
 const ZFS_IOC_POOL_SET_PROPS: u64 = 0x5a26;
 const ZFS_IOC_INHERIT_PROP: u64 = 0x5a2b;
 const ZFS_IOC_DESTROY_SNAPS: u64 = 0x5a3b;
+const ZFS_IOC_HOLD: u64 = 0x5a30;
+const ZFS_IOC_RELEASE: u64 = 0x5a31;
 const ZFS_IOC_LOG_HISTORY: u64 = 0x5a3f;
 
 const MAXPATHLEN: usize = 4096;
@@ -1113,6 +1115,38 @@ impl ZfsHandle {
         let mut zc = ZfsCmd::new();
         self.write_ioctl(ZFS_IOC_LOG_HISTORY, "log history", &mut zc, Some(&innvl))?;
         Ok(())
+    }
+
+    /**
+    Place a permanent user hold `tag` on `snapshot` (ZFS_IOC_HOLD); a held
+    snapshot can't be destroyed until released. `pool` is the snapshot's pool.
+    The input nvlist is `{holds: {snapshot: tag}}` (no `cleanup_fd`, so the hold
+    is permanent rather than tied to a process). Returns the per-element errors
+    nvlist (empty on success).
+    */
+    pub fn hold(&self, pool: &str, snapshot: &str, tag: &str) -> Result<NvList> {
+        let mut holds = NvList::new();
+        holds.add_str(snapshot, tag);
+        let mut args = NvList::new();
+        args.add_nvlist("holds", holds);
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.write_ioctl(ZFS_IOC_HOLD, "hold", &mut zc, Some(&args))
+    }
+
+    /**
+    Release the user hold `tag` from `snapshot` (ZFS_IOC_RELEASE). The input
+    nvlist is keyed by snapshot → a set (boolean flags) of tags to release —
+    here just `{snapshot: {tag}}`. Returns the per-element errors nvlist.
+    */
+    pub fn release(&self, pool: &str, snapshot: &str, tag: &str) -> Result<NvList> {
+        let mut tags = NvList::new();
+        tags.add_bool_flag(tag);
+        let mut holds = NvList::new();
+        holds.add_nvlist(snapshot, tags);
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.write_ioctl(ZFS_IOC_RELEASE, "release", &mut zc, Some(&holds))
     }
 
     /* ---------------------------- pool maintenance ----------------------- */
