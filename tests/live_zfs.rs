@@ -302,6 +302,36 @@ fn error_log_ioctls_abi() {
     }
 }
 
+/*
+Snapshot space estimates: SPACE_WRITTEN (legacy, result in zc fields) and
+SPACE_SNAPS (new-style, innvl firstsnap → outnvl used/compressed/uncompressed).
+Both are reads, so they run unprivileged; exercised against the first pool root
+that has snapshots (sorted by creation txg so the SPACE_SNAPS range is valid).
+*/
+#[test]
+fn space_estimate_ioctls() {
+    let Some(zfs) = handle() else { return };
+    for pair in zfs.pool_configs().expect("pool configs").iter() {
+        let mut snaps = zfs.snapshots(&pair.name).unwrap_or_default();
+        snaps.sort_by_key(|s| s.stats.creation_txg);
+        let Some(first) = snaps.first() else { continue };
+        // written@first for the live pool root — a valid pair, must succeed
+        let w = zfs
+            .space_written(&pair.name, &first.name)
+            .expect("ZFS_IOC_SPACE_WRITTEN on a (dataset, snapshot) pair");
+        eprintln!("{}: written since {} = {} bytes", pair.name, first.name, w.used);
+        if snaps.len() >= 2 {
+            let last = &snaps[snaps.len() - 1].name;
+            let s = zfs
+                .space_snaps(last, &first.name)
+                .expect("ZFS_IOC_SPACE_SNAPS on a snapshot range");
+            eprintln!("{}: destroying {}..{} frees {} bytes", pair.name, first.name, last, s.used);
+        }
+        return; // one pool with snapshots proves both layouts
+    }
+    eprintln!("no pool-root snapshots to exercise the space estimates against");
+}
+
 /* ------------------------------ write path ------------------------------- */
 
 /**

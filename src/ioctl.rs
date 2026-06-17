@@ -38,6 +38,8 @@ const ZFS_IOC_ERROR_LOG: u64 = 0x5a20;
 const ZFS_IOC_DSOBJ_TO_DSNAME: u64 = 0x5a24;
 const ZFS_IOC_OBJ_TO_PATH: u64 = 0x5a25;
 const ZFS_IOC_OBJ_TO_STATS: u64 = 0x5a38;
+const ZFS_IOC_SPACE_WRITTEN: u64 = 0x5a39;
+const ZFS_IOC_SPACE_SNAPS: u64 = 0x5a3a;
 const ZFS_IOC_DATASET_LIST_NEXT: u64 = 0x5a14;
 const ZFS_IOC_SNAPSHOT_LIST_NEXT: u64 = 0x5a15;
 const ZFS_IOC_POOL_GET_PROPS: u64 = 0x5a27;
@@ -437,6 +439,15 @@ impl From<&ZfsStat> for ZStat {
     fn from(s: &ZfsStat) -> Self {
         ZStat { generation: s.zs_gen, mode: s.zs_mode, links: s.zs_links, ctime: s.zs_ctime[0] }
     }
+}
+
+/// A space figure with its compressed/uncompressed breakdown, as the
+/// SPACE_WRITTEN / SPACE_SNAPS ioctls report it.
+#[derive(Debug, Clone, Copy)]
+pub struct SpaceUsage {
+    pub used: u64,
+    pub compressed: u64,
+    pub uncompressed: u64,
 }
 
 /// A dataset or snapshot returned by the LIST_NEXT iterators.
@@ -863,6 +874,49 @@ impl ZfsHandle {
             err,
         })?;
         Ok((cstr_field(&zc.zc_value), (&zc.zc_stat).into()))
+    }
+
+    /**
+    Space written to `dataset` since `earlier` — the `written@earlier` value
+    (ZFS_IOC_SPACE_WRITTEN). `earlier` is a snapshot (or a `#bookmark`); `dataset`
+    is the later dataset/snapshot. Legacy ioctl: the result comes back in the
+    `zc_cookie` (used) / `zc_objset_type` (compressed) / `zc_perm_action`
+    (uncompressed) fields.
+    */
+    pub fn space_written(&self, dataset: &str, earlier: &str) -> Result<SpaceUsage> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset);
+        zc.set_value(earlier);
+        self.ioctl(ZFS_IOC_SPACE_WRITTEN, &mut zc).map_err(|err| ZfsError::Ioctl {
+            ioc: ZFS_IOC_SPACE_WRITTEN,
+            name: dataset.to_string(),
+            err,
+        })?;
+        Ok(SpaceUsage {
+            used: zc.zc_cookie,
+            compressed: zc.zc_objset_type,
+            uncompressed: zc.zc_perm_action,
+        })
+    }
+
+    /**
+    Space that would be freed by destroying the snapshot range `firstsnap` ..
+    `lastsnap` (ZFS_IOC_SPACE_SNAPS) — the `zfs destroy -nv first%last` estimate.
+    Both must be snapshots of the same dataset. New-style: `firstsnap` goes in
+    the input nvlist, the `{used, compressed, uncompressed}` result comes back as
+    the output nvlist.
+    */
+    pub fn space_snaps(&self, lastsnap: &str, firstsnap: &str) -> Result<SpaceUsage> {
+        let mut innvl = NvList::new();
+        innvl.add_str("firstsnap", firstsnap);
+        let mut zc = ZfsCmd::new();
+        zc.set_name(lastsnap);
+        let out = self.ioctl_nv_in(ZFS_IOC_SPACE_SNAPS, &mut zc, Some(&innvl))?;
+        Ok(SpaceUsage {
+            used: out.get_u64("used").unwrap_or(0),
+            compressed: out.get_u64("compressed").unwrap_or(0),
+            uncompressed: out.get_u64("uncompressed").unwrap_or(0),
+        })
     }
 
     /// Stats and properties for one dataset (ZFS_IOC_OBJSET_STATS).
