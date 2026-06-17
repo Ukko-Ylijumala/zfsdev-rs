@@ -19,7 +19,7 @@ Whether a given write is permitted for the calling uid is decided by the
 kernel (root, or a matching `zfs allow` delegation).
 */
 
-use super::nvlist::{NvError, NvList};
+use super::nvlist::{NvData, NvError, NvList};
 use super::props::VdevProp;
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
@@ -71,6 +71,8 @@ zc_nvlist_src).
 */
 const ZFS_IOC_POOL_SCAN: u64 = 0x5a07;
 const ZFS_IOC_VDEV_SET_STATE: u64 = 0x5a0d;
+const ZFS_IOC_VDEV_ATTACH: u64 = 0x5a0e;
+const ZFS_IOC_VDEV_DETACH: u64 = 0x5a0f;
 const ZFS_IOC_CLEAR: u64 = 0x5a21;
 const ZFS_IOC_POOL_INITIALIZE: u64 = 0x5a4f;
 const ZFS_IOC_POOL_TRIM: u64 = 0x5a50;
@@ -154,6 +156,22 @@ pub fn resolve_who(spec: &str) -> std::result::Result<DelegWho, String> {
         resolve_id(name, true).map(DelegWho::Group).ok_or_else(|| format!("no such group '{name}'"))
     } else {
         resolve_id(name, false).map(DelegWho::User).ok_or_else(|| format!("no such user '{name}'"))
+    }
+}
+
+/// The ZFS vdev `type` for a path: `disk` for a block device, `file` for a
+/// regular file (what VDEV_ATTACH's device nvlist needs).
+fn device_vtype(path: &str) -> Result<&'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    let ft = std::fs::metadata(path)
+        .map_err(|e| ZfsError::Op(format!("attach: cannot stat {path}: {e}")))?
+        .file_type();
+    if ft.is_block_device() {
+        Ok("disk")
+    } else if ft.is_file() {
+        Ok("file")
+    } else {
+        Err(ZfsError::Op(format!("attach: {path} is not a block device or file")))
     }
 }
 
@@ -1223,6 +1241,54 @@ impl ZfsHandle {
     }
 
     /* ---------------------------- pool maintenance ----------------------- */
+
+    /**
+    Detach the vdev `guid` from its mirror (ZFS_IOC_VDEV_DETACH) — `zpool
+    detach`. No nvlist; the kernel refuses if it isn't a redundant child / would
+    drop the last replica.
+    */
+    pub fn vdev_detach(&self, pool: &str, guid: u64) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        zc.zc_guid = guid;
+        self.ioctl(ZFS_IOC_VDEV_DETACH, &mut zc)
+            .map_err(|err| ZfsError::Op(format!("detach vdev: {err}{}", errno_hint(&err))))?;
+        Ok(())
+    }
+
+    /**
+    Attach the device at `new_path` to the existing vdev `guid`
+    (ZFS_IOC_VDEV_ATTACH): forms/extends a mirror, or *replaces* the existing
+    device when `replacing` is set (`zpool replace`). The new device is given as
+    a `{type:root, children:[{type, path, whole_disk:0}]}` nvlist in
+    `zc_nvlist_conf` (note: `_conf`, not `_src`); `zc_cookie` = replacing,
+    `zc_simple` = 0 (resilver, not sequential rebuild).
+
+    Unlike `zpool attach`, this does NOT partition/label a whole disk first —
+    `new_path` is used as-is, so pass a partition, a file, or a raw disk you
+    accept being used whole.
+    */
+    pub fn vdev_attach(&self, pool: &str, guid: u64, new_path: &str, replacing: bool) -> Result<()> {
+        let mut dev = NvList::new();
+        dev.add_str("type", device_vtype(new_path)?);
+        dev.add_str("path", new_path);
+        dev.add_u64("whole_disk", 0);
+        let mut root = NvList::new();
+        root.add_str("type", "root");
+        root.push("children", NvData::ListArray(vec![dev]));
+        let conf = root.pack();
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        zc.zc_guid = guid;
+        zc.zc_cookie = u64::from(replacing);
+        zc.zc_nvlist_conf = conf.as_ptr() as u64;
+        zc.zc_nvlist_conf_size = conf.len() as u64;
+        let op = if replacing { "replace vdev" } else { "attach vdev" };
+        // `conf` outlives the ioctl (dropped at fn end)
+        self.ioctl(ZFS_IOC_VDEV_ATTACH, &mut zc)
+            .map_err(|err| ZfsError::Op(format!("{op}: {err}{}", errno_hint(&err))))?;
+        Ok(())
+    }
 
     /**
     Control a pool scan (ZFS_IOC_POOL_SCAN). `func` is a `pool_scan_func_t`

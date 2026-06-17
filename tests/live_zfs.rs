@@ -393,6 +393,18 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
         .vdev_set_state(NOPE_POOL, 0xdead, false)
         .expect_err("offline in bogus pool must fail");
     assert!(off.to_string().starts_with("offline vdev:"), "unmapped: {off}");
+
+    let det = zfs.vdev_detach(NOPE_POOL, 0xdead).expect_err("detach in bogus pool must fail");
+    assert!(det.to_string().starts_with("detach vdev:"), "unmapped: {det}");
+
+    // attach stats the new device first; a temp file proves the conf-nvlist path
+    let tmp = std::env::temp_dir().join("zfs-browser-attach-canary");
+    std::fs::write(&tmp, b"x").expect("write temp device file");
+    let att = zfs
+        .vdev_attach(NOPE_POOL, 0xdead, tmp.to_str().unwrap(), false)
+        .expect_err("attach in bogus pool must fail");
+    assert!(att.to_string().starts_with("attach vdev:"), "unmapped: {att}");
+    let _ = std::fs::remove_file(&tmp);
     eprintln!("pool-maintenance canaries all failed cleanly at pool lookup");
 }
 
