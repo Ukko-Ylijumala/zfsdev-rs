@@ -388,6 +388,11 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
         .pool_initialize(NOPE_POOL, &[0xdead], 0)
         .expect_err("initialize of bogus pool must fail");
     assert!(init.to_string().starts_with("initialize:"), "unmapped: {init}");
+
+    let off = zfs
+        .vdev_set_state(NOPE_POOL, 0xdead, false)
+        .expect_err("offline in bogus pool must fail");
+    assert!(off.to_string().starts_with("offline vdev:"), "unmapped: {off}");
     eprintln!("pool-maintenance canaries all failed cleanly at pool lookup");
 }
 

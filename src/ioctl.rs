@@ -70,6 +70,7 @@ DESTROY_SNAPS and CREATE are "new"-style (parameters as a packed nvlist in
 zc_nvlist_src).
 */
 const ZFS_IOC_POOL_SCAN: u64 = 0x5a07;
+const ZFS_IOC_VDEV_SET_STATE: u64 = 0x5a0d;
 const ZFS_IOC_CLEAR: u64 = 0x5a21;
 const ZFS_IOC_POOL_INITIALIZE: u64 = 0x5a4f;
 const ZFS_IOC_POOL_TRIM: u64 = 0x5a50;
@@ -1201,6 +1202,24 @@ impl ZfsHandle {
         let mut zc = ZfsCmd::new();
         zc.set_name(pool);
         self.write_ioctl(ZFS_IOC_RELEASE, "release", &mut zc, Some(&holds))
+    }
+
+    /**
+    Bring a vdev online (`online` = true) or take it offline (false) by guid
+    (ZFS_IOC_VDEV_SET_STATE). `zc_cookie` is the target `vdev_state_t`
+    (`VDEV_STATE_ONLINE` = HEALTHY = 7, `VDEV_STATE_OFFLINE` = 2); `zc_obj` = 0
+    means no expand / a permanent (not temporary) offline. The kernel refuses an
+    offline that would leave the pool without a valid replica.
+    */
+    pub fn vdev_set_state(&self, pool: &str, guid: u64, online: bool) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        zc.zc_guid = guid;
+        zc.zc_cookie = if online { 7 } else { 2 };
+        zc.zc_obj = 0;
+        let op = if online { "online vdev" } else { "offline vdev" };
+        self.write_ioctl(ZFS_IOC_VDEV_SET_STATE, op, &mut zc, None)?;
+        Ok(())
     }
 
     /* ---------------------------- pool maintenance ----------------------- */
