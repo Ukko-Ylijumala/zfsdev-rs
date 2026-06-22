@@ -72,6 +72,10 @@ zc_nvlist_src).
 */
 const ZFS_IOC_POOL_SCAN: u64 = 0x5a07;
 const ZFS_IOC_VDEV_SET_STATE: u64 = 0x5a0d;
+/// `zc_obj` flag for VDEV_SET_STATE online: re-read the device size and grow the
+/// vdev into it (`zpool online -e`). The other flags (CHECKREMOVE 0x1, UNSPARE
+/// 0x2, FORCEFAULT 0x4) we don't use.
+const ZFS_ONLINE_EXPAND: u64 = 0x8;
 const ZFS_IOC_VDEV_ATTACH: u64 = 0x5a0e;
 const ZFS_IOC_VDEV_DETACH: u64 = 0x5a0f;
 const ZFS_IOC_CLEAR: u64 = 0x5a21;
@@ -1226,16 +1230,18 @@ impl ZfsHandle {
     /**
     Bring a vdev online (`online` = true) or take it offline (false) by guid
     (ZFS_IOC_VDEV_SET_STATE). `zc_cookie` is the target `vdev_state_t`
-    (`VDEV_STATE_ONLINE` = HEALTHY = 7, `VDEV_STATE_OFFLINE` = 2); `zc_obj` = 0
-    means no expand / a permanent (not temporary) offline. The kernel refuses an
-    offline that would leave the pool without a valid replica.
+    (`VDEV_STATE_ONLINE` = HEALTHY = 7, `VDEV_STATE_OFFLINE` = 2); `zc_obj`
+    carries the online flags — `ZFS_ONLINE_EXPAND` (0x8) when `expand` makes the
+    vdev grow into a now-larger device (`zpool online -e`), else 0 (no expand /
+    a permanent, not temporary, offline). The kernel refuses an offline that
+    would leave the pool without a valid replica.
     */
-    pub fn vdev_set_state(&self, pool: &str, guid: u64, online: bool) -> Result<()> {
+    pub fn vdev_set_state(&self, pool: &str, guid: u64, online: bool, expand: bool) -> Result<()> {
         let mut zc = ZfsCmd::new();
         zc.set_name(pool);
         zc.zc_guid = guid;
         zc.zc_cookie = if online { 7 } else { 2 };
-        zc.zc_obj = 0;
+        zc.zc_obj = if expand { ZFS_ONLINE_EXPAND } else { 0 };
         let op = if online { "online vdev" } else { "offline vdev" };
         self.write_ioctl(ZFS_IOC_VDEV_SET_STATE, op, &mut zc, None)?;
         Ok(())

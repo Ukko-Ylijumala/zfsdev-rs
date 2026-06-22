@@ -390,9 +390,15 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
     assert!(init.to_string().starts_with("initialize:"), "unmapped: {init}");
 
     let off = zfs
-        .vdev_set_state(NOPE_POOL, 0xdead, false)
+        .vdev_set_state(NOPE_POOL, 0xdead, false, false)
         .expect_err("offline in bogus pool must fail");
     assert!(off.to_string().starts_with("offline vdev:"), "unmapped: {off}");
+
+    // online + expand (zpool online -e) — same ioctl, EXPAND flag in zc_obj
+    let exp = zfs
+        .vdev_set_state(NOPE_POOL, 0xdead, true, true)
+        .expect_err("online -e in bogus pool must fail");
+    assert!(exp.to_string().starts_with("online vdev:"), "unmapped: {exp}");
 
     let det = zfs.vdev_detach(NOPE_POOL, 0xdead).expect_err("detach in bogus pool must fail");
     assert!(det.to_string().starts_with("detach vdev:"), "unmapped: {det}");
