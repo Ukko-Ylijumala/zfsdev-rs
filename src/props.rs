@@ -528,6 +528,108 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
     }
 }
 
+/**
+Always-read-only informational properties (pool and dataset) that aren't
+modelled as [`ZfsProp`] — purely a membership set for [`is_editable`], so a
+plain `EnumString` is enough. The computed props (used/available/…) live in
+`ZfsProp`; these are the identity/state fields that would otherwise fall
+through to "editable string".
+*/
+#[derive(EnumString)]
+#[strum(serialize_all = "snake_case")]
+enum ReadOnlyProp {
+    Guid,
+    #[strum(serialize = "createtxg")]
+    CreateTxg,
+    #[strum(serialize = "objsetid")]
+    ObjsetId,
+    Type,
+    Capacity,
+    Health,
+    #[strum(serialize = "dedupratio")]
+    DedupRatio,
+    #[strum(serialize = "expandsize")]
+    ExpandSize,
+    LoadGuid,
+    Name,
+    Origin,
+    Version,
+}
+
+/**
+Whether a dataset/pool property can be set (vs. a computed/read-only one).
+Unknown names — `mountpoint`, `comment`, `module:user` props — are editable
+strings. The read-only set mirrors the rejection arm in [`parse_prop_value`]
+(a test cross-checks the two).
+*/
+pub fn is_editable(name: &str) -> bool {
+    use ZfsProp as P;
+    /*
+    always-read-only informational props that aren't modelled as `ZfsProp`
+    (pool and dataset alike); without this they'd fall through to "editable
+    string". Genuinely settable string props (mountpoint, sharenfs, user
+    props) are deliberately *not* in [`ReadOnlyProp`] — unknown defaults to
+    editable.
+    */
+    if ReadOnlyProp::from_str(name).is_ok() {
+        return false;
+    }
+    match ZfsProp::from_str(name) {
+        Ok(p) => !matches!(
+            p,
+            P::Used
+                | P::Available
+                | P::Referenced
+                | P::UsedBySnapshots
+                | P::UsedByDataset
+                | P::UsedByChildren
+                | P::UsedByRefReservation
+                | P::Written
+                | P::LogicalUsed
+                | P::LogicalReferenced
+                | P::Size
+                | P::Free
+                | P::Allocated
+                | P::Freeing
+                | P::Leaked
+                | P::Checkpoint
+                | P::BcloneUsed
+                | P::BcloneSaved
+                | P::Creation
+                | P::CompressRatio
+                | P::RefCompressRatio
+                | P::BcloneRatio
+                | P::Fragmentation
+                | P::Mounted
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Whether a *vdev* property can be set — the small settable subset (the rest
+/// are computed stats). See `vdev_prop_init` in module/zcommon/zpool_prop.c.
+pub fn vdev_prop_editable(name: &str) -> bool {
+    matches!(
+        name,
+        "comment" | "failfast" | "checksum_n" | "checksum_t" | "io_n" | "io_t" | "slow_io_n"
+            | "slow_io_t"
+    )
+}
+
+/// Parse a user-entered *vdev* property value into typed [`NvData`] for
+/// VDEV_SET_PROPS. Read-only vdev props are rejected; the kernel re-validates.
+pub fn parse_vdev_prop_value(name: &str, input: &str) -> Result<NvData, String> {
+    let input = input.trim();
+    match name {
+        "comment" => Ok(NvData::Str(input.to_string())),
+        "failfast" => parse_bool(input).map(NvData::Uint64),
+        "checksum_n" | "checksum_t" | "io_n" | "io_t" | "slow_io_n" | "slow_io_t" => {
+            input.parse::<u64>().map(NvData::Uint64).map_err(|_| format!("expected a number for '{name}'"))
+        }
+        _ => Err(format!("'{name}' is a read-only vdev property")),
+    }
+}
+
 /// "none"/"unlimited"/empty all mean "unset" for size and limit properties.
 fn none_like(s: &str) -> bool {
     matches!(s.to_lowercase().as_str(), "none" | "unlimited" | "")
@@ -628,6 +730,32 @@ mod tests {
         for omit in ["comment", "allocating", "checksum_n", "checksum_t", "io_n", "io_t"] {
             assert!(!names.contains(&omit.to_string()), "{omit} must not be requested");
         }
+    }
+
+    #[test]
+    fn editability_matches_parse() {
+        // read-only dataset props: not editable, and parse_prop_value rejects them
+        for ro in ["used", "available", "creation", "compressratio", "fragmentation", "mounted"] {
+            assert!(!is_editable(ro), "{ro} should be read-only");
+            assert!(parse_prop_value(ro, "0").is_err(), "{ro} should reject a set");
+        }
+        // informational props modelled as ReadOnlyProp (not ZfsProp)
+        for ro in ["guid", "createtxg", "objsetid", "capacity", "health", "load_guid"] {
+            assert!(!is_editable(ro), "{ro} should be read-only");
+        }
+        // editable ones, incl. unknown/user props (free-form strings)
+        for ed in ["compression", "atime", "quota", "mountpoint", "com.example:tag"] {
+            assert!(is_editable(ed), "{ed} should be editable");
+        }
+        // vdev props: only the settable subset
+        assert!(vdev_prop_editable("failfast"));
+        assert!(vdev_prop_editable("comment"));
+        assert!(!vdev_prop_editable("read_errors"));
+        assert!(!vdev_prop_editable("state"));
+        assert_eq!(parse_vdev_prop_value("failfast", "off").unwrap(), NvData::Uint64(0));
+        assert_eq!(parse_vdev_prop_value("io_n", "5").unwrap(), NvData::Uint64(5));
+        assert_eq!(parse_vdev_prop_value("comment", "spare").unwrap(), NvData::Str("spare".into()));
+        assert!(parse_vdev_prop_value("state", "x").is_err());
     }
 
     #[rustfmt::skip]

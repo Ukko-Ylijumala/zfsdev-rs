@@ -49,6 +49,7 @@ const ZFS_IOC_GET_HOLDS: u64 = 0x5a32;
 const ZFS_IOC_OBJSET_RECVD_PROPS: u64 = 0x5a33;
 const ZFS_IOC_GET_BOOKMARKS: u64 = 0x5a44;
 const ZFS_IOC_VDEV_GET_PROPS: u64 = 0x5a55;
+const ZFS_IOC_VDEV_SET_PROPS: u64 = 0x5a56;
 
 /*
 Linux event-stream ioctls (`zpool events`): ZFS_IOC_PLATFORM = ZFS_IOC_FIRST +
@@ -1238,6 +1239,23 @@ impl ZfsHandle {
         let op = if online { "online vdev" } else { "offline vdev" };
         self.write_ioctl(ZFS_IOC_VDEV_SET_STATE, op, &mut zc, None)?;
         Ok(())
+    }
+
+    /**
+    Set one vdev property (ZFS_IOC_VDEV_SET_PROPS, OpenZFS 2.2+). The input
+    nvlist names the target vdev by guid (`vdevprops_set_vdev`) and the props to
+    set (`vdevprops_set_props`, name → typed value). Returns the kernel's
+    per-element errors nvlist (empty on success).
+    */
+    pub fn vdev_set_props(&self, pool: &str, guid: u64, prop: &str, value: &NvData) -> Result<NvList> {
+        let mut set = NvList::new();
+        set.push(prop, value.clone());
+        let mut innvl = NvList::new();
+        innvl.add_u64("vdevprops_set_vdev", guid);
+        innvl.add_nvlist("vdevprops_set_props", set);
+        let mut zc = ZfsCmd::new();
+        zc.set_name(pool);
+        self.write_ioctl(ZFS_IOC_VDEV_SET_PROPS, "set vdev property", &mut zc, Some(&innvl))
     }
 
     /* ---------------------------- pool maintenance ----------------------- */

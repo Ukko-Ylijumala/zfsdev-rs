@@ -405,6 +405,11 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
         .expect_err("attach in bogus pool must fail");
     assert!(att.to_string().starts_with("attach vdev:"), "unmapped: {att}");
     let _ = std::fs::remove_file(&tmp);
+
+    let setp = zfs
+        .vdev_set_props(NOPE_POOL, 0xdead, "failfast", &zfs_browser::zfs::nvlist::NvData::Uint64(0))
+        .expect_err("set vdev prop in bogus pool must fail");
+    assert!(setp.to_string().starts_with("set vdev property:"), "unmapped: {setp}");
     eprintln!("pool-maintenance canaries all failed cleanly at pool lookup");
 }
 
