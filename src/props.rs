@@ -644,7 +644,7 @@ fn parse_bool(s: &str) -> Result<u64, String> {
 }
 
 /// Parse a byte size like `128K`, `1.5G`, `4096` (1024-based, optional 'B').
-fn parse_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
     let lower = s.trim().to_lowercase();
     let split = lower
         .find(|c: char| !c.is_ascii_digit() && c != '.')
