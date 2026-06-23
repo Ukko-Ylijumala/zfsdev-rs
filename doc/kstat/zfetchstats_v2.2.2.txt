@@ -1,0 +1,7 @@
+7 1 0x01 5 1360 10718979263 5672333565506182
+name                            type data
+hits                            4    39555568
+misses                          4    575229070
+max_streams                     4    533426230
+io_issued                       4    249572
+io_active                       4    0
