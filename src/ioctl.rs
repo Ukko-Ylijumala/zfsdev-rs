@@ -111,6 +111,9 @@ pub enum ZfsError {
     /// A mutating operation failed; message already carries an errno hint.
     #[error("{0}")]
     Op(String),
+    /// A name/value (often modal input) exceeds the fixed `zfs_cmd_t` field.
+    #[error("{field} too long: {len} bytes (max {max})")]
+    NameTooLong { field: &'static str, len: usize, max: usize },
 }
 
 type Result<T> = std::result::Result<T, ZfsError>;
@@ -368,20 +371,37 @@ impl ZfsCmd {
         unsafe { Box::new(std::mem::zeroed()) }
     }
 
-    fn set_name(&mut self, name: &str) {
+    /**
+    Set `zc_name` (the primary pool/dataset name). The field is a fixed
+    `MAXPATHLEN`-byte buffer; an oversized name (e.g. unbounded modal input)
+    returns an error rather than panicking — the kernel would reject it
+    anyway, and silently truncating could redirect a write to a *different*
+    existing dataset.
+    */
+    fn set_name(&mut self, name: &str) -> Result<()> {
         let bytes = name.as_bytes();
-        assert!(bytes.len() < MAXPATHLEN, "dataset name too long");
+        if bytes.len() >= MAXPATHLEN {
+            return Err(ZfsError::NameTooLong { field: "name", len: bytes.len(), max: MAXPATHLEN });
+        }
         self.zc_name[..bytes.len()].copy_from_slice(bytes);
         self.zc_name[bytes.len()] = 0;
+        Ok(())
     }
 
     /// Set `zc_value` (the secondary name field: rename target, inherited
     /// property name, …). It is `MAXPATHLEN * 2` bytes wide.
-    fn set_value(&mut self, value: &str) {
+    fn set_value(&mut self, value: &str) -> Result<()> {
         let bytes = value.as_bytes();
-        assert!(bytes.len() < MAXPATHLEN * 2, "value too long");
+        if bytes.len() >= MAXPATHLEN * 2 {
+            return Err(ZfsError::NameTooLong {
+                field: "value",
+                len: bytes.len(),
+                max: MAXPATHLEN * 2,
+            });
+        }
         self.zc_value[..bytes.len()].copy_from_slice(bytes);
         self.zc_value[bytes.len()] = 0;
+        Ok(())
     }
 
     fn name(&self) -> String {
@@ -559,14 +579,14 @@ impl ZfsHandle {
     /// (ZFS_IOC_POOL_STATS).
     pub fn pool_stats(&self, pool: &str) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.ioctl_nv(ZFS_IOC_POOL_STATS, &mut zc)
     }
 
     /// Pool properties (ZFS_IOC_POOL_GET_PROPS).
     pub fn pool_props(&self, pool: &str) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.ioctl_nv(ZFS_IOC_POOL_GET_PROPS, &mut zc)
     }
 
@@ -591,7 +611,7 @@ impl ZfsHandle {
         let mut offset = 0u64;
         loop {
             let mut zc = ZfsCmd::new();
-            zc.set_name(pool);
+            zc.set_name(pool)?;
             zc.zc_history = buf.as_mut_ptr() as u64;
             zc.zc_history_len = buf.len() as u64;
             zc.zc_history_offset = offset;
@@ -622,7 +642,7 @@ impl ZfsHandle {
     */
     pub fn get_fsacl(&self, dataset: &str) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         self.ioctl_nv(ZFS_IOC_GET_FSACL, &mut zc)
     }
 
@@ -634,7 +654,7 @@ impl ZfsHandle {
     */
     pub fn objset_zplprops(&self, dataset: &str) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         self.ioctl_nv(ZFS_IOC_OBJSET_ZPLPROPS, &mut zc)
     }
 
@@ -647,7 +667,7 @@ impl ZfsHandle {
     */
     pub fn objset_recvd_props(&self, dataset: &str) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         self.ioctl_nv(ZFS_IOC_OBJSET_RECVD_PROPS, &mut zc)
     }
 
@@ -658,7 +678,7 @@ impl ZfsHandle {
     */
     pub fn get_holds(&self, snapshot: &str) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(snapshot);
+        zc.set_name(snapshot)?;
         self.ioctl_nv(ZFS_IOC_GET_HOLDS, &mut zc)
     }
 
@@ -683,7 +703,7 @@ impl ZfsHandle {
         innvl.add_u64("vdevprops_get_vdev", guid);
         innvl.add_nvlist("vdevprops_get_props", want);
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.ioctl_nv_in(ZFS_IOC_VDEV_GET_PROPS, &mut zc, Some(&innvl))
     }
 
@@ -699,7 +719,7 @@ impl ZfsHandle {
             innvl.add_bool_flag(p);
         }
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         self.ioctl_nv_in(ZFS_IOC_GET_BOOKMARKS, &mut zc, Some(&innvl))
     }
 
@@ -720,7 +740,7 @@ impl ZfsHandle {
         let mut cookie = 0u64;
         loop {
             let mut zc = ZfsCmd::new();
-            zc.set_name(dataset);
+            zc.set_name(dataset)?;
             zc.zc_objset_type = prop_type;
             zc.zc_cookie = cookie;
             zc.zc_nvlist_dst = buf.as_mut_ptr() as u64;
@@ -826,7 +846,7 @@ impl ZfsHandle {
         loop {
             let mut buf = vec![0u8; cap as usize * ENT];
             let mut zc = ZfsCmd::new();
-            zc.set_name(pool);
+            zc.set_name(pool)?;
             zc.zc_nvlist_dst = buf.as_mut_ptr() as u64;
             zc.zc_nvlist_dst_size = cap;
             match self.ioctl(ZFS_IOC_ERROR_LOG, &mut zc) {
@@ -860,7 +880,7 @@ impl ZfsHandle {
     /// (ZFS_IOC_DSOBJ_TO_DSNAME). Used to name error-log bookmarks.
     pub fn dsobj_to_dsname(&self, pool: &str, dsobj: u64) -> Result<String> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         zc.zc_obj = dsobj;
         self.ioctl(ZFS_IOC_DSOBJ_TO_DSNAME, &mut zc).map_err(|err| ZfsError::Ioctl {
             ioc: ZFS_IOC_DSOBJ_TO_DSNAME,
@@ -876,7 +896,7 @@ impl ZfsHandle {
     */
     pub fn obj_to_path(&self, dataset: &str, obj: u64) -> Result<String> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         zc.zc_obj = obj;
         self.ioctl(ZFS_IOC_OBJ_TO_PATH, &mut zc).map_err(|err| ZfsError::Ioctl {
             ioc: ZFS_IOC_OBJ_TO_PATH,
@@ -890,7 +910,7 @@ impl ZfsHandle {
     /// ZPL-only restriction as [`Self::obj_to_path`].
     pub fn obj_to_stats(&self, dataset: &str, obj: u64) -> Result<(String, ZStat)> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         zc.zc_obj = obj;
         self.ioctl(ZFS_IOC_OBJ_TO_STATS, &mut zc).map_err(|err| ZfsError::Ioctl {
             ioc: ZFS_IOC_OBJ_TO_STATS,
@@ -909,8 +929,8 @@ impl ZfsHandle {
     */
     pub fn space_written(&self, dataset: &str, earlier: &str) -> Result<SpaceUsage> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
-        zc.set_value(earlier);
+        zc.set_name(dataset)?;
+        zc.set_value(earlier)?;
         self.ioctl(ZFS_IOC_SPACE_WRITTEN, &mut zc).map_err(|err| ZfsError::Ioctl {
             ioc: ZFS_IOC_SPACE_WRITTEN,
             name: dataset.to_string(),
@@ -934,7 +954,7 @@ impl ZfsHandle {
         let mut innvl = NvList::new();
         innvl.add_str("firstsnap", firstsnap);
         let mut zc = ZfsCmd::new();
-        zc.set_name(lastsnap);
+        zc.set_name(lastsnap)?;
         let out = self.ioctl_nv_in(ZFS_IOC_SPACE_SNAPS, &mut zc, Some(&innvl))?;
         Ok(SpaceUsage {
             used: out.get_u64("used").unwrap_or(0),
@@ -946,7 +966,7 @@ impl ZfsHandle {
     /// Stats and properties for one dataset (ZFS_IOC_OBJSET_STATS).
     pub fn objset_stats(&self, dataset: &str) -> Result<(ObjsetStats, NvList)> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         let props = self.ioctl_nv(ZFS_IOC_OBJSET_STATS, &mut zc)?;
         Ok(((&zc.zc_objset_stats).into(), props))
     }
@@ -966,7 +986,7 @@ impl ZfsHandle {
         let mut cookie = 0u64;
         loop {
             let mut zc = ZfsCmd::new();
-            zc.set_name(parent);
+            zc.set_name(parent)?;
             zc.zc_cookie = cookie;
             match self.ioctl_nv(ioc, &mut zc) {
                 Ok(props) => {
@@ -1043,14 +1063,14 @@ impl ZfsHandle {
     */
     pub fn set_prop(&self, dataset: &str, props: &NvList) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         self.write_ioctl(ZFS_IOC_SET_PROP, "set property", &mut zc, Some(props))
     }
 
     /// Set pool properties (ZFS_IOC_POOL_SET_PROPS).
     pub fn pool_set_props(&self, pool: &str, props: &NvList) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_POOL_SET_PROPS, "set pool property", &mut zc, Some(props))
     }
 
@@ -1058,8 +1078,8 @@ impl ZfsHandle {
     /// `received` reverts to the received value rather than clearing it.
     pub fn inherit_prop(&self, dataset: &str, prop: &str, received: bool) -> Result<()> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
-        zc.set_value(prop);
+        zc.set_name(dataset)?;
+        zc.set_value(prop)?;
         zc.zc_cookie = received as u64;
         self.write_ioctl(ZFS_IOC_INHERIT_PROP, "inherit property", &mut zc, None)?;
         Ok(())
@@ -1082,7 +1102,7 @@ impl ZfsHandle {
             innvl.add_nvlist("props", p.clone());
         }
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_SNAPSHOT, "create snapshot", &mut zc, Some(&innvl))
     }
 
@@ -1102,7 +1122,7 @@ impl ZfsHandle {
             innvl.add_bool_flag("defer");
         }
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_DESTROY_SNAPS, "destroy snapshots", &mut zc, Some(&innvl))
     }
 
@@ -1119,7 +1139,7 @@ impl ZfsHandle {
             innvl.add_nvlist("props", p.clone());
         }
         let mut zc = ZfsCmd::new();
-        zc.set_name(name);
+        zc.set_name(name)?;
         self.write_ioctl(ZFS_IOC_CREATE, "create dataset", &mut zc, Some(&innvl))?;
         Ok(())
     }
@@ -1131,7 +1151,7 @@ impl ZfsHandle {
     */
     pub fn destroy(&self, name: &str, defer: bool) -> Result<()> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(name);
+        zc.set_name(name)?;
         zc.zc_defer_destroy = defer as u32;
         self.write_ioctl(ZFS_IOC_DESTROY, "destroy dataset", &mut zc, None)?;
         Ok(())
@@ -1141,8 +1161,8 @@ impl ZfsHandle {
     /// snapshots of descendants (only meaningful when renaming a snapshot).
     pub fn rename(&self, from: &str, to: &str, recursive: bool) -> Result<()> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(from);
-        zc.set_value(to);
+        zc.set_name(from)?;
+        zc.set_value(to)?;
         zc.zc_cookie = recursive as u64;
         self.write_ioctl(ZFS_IOC_RENAME, "rename dataset", &mut zc, None)?;
         Ok(())
@@ -1171,7 +1191,7 @@ impl ZfsHandle {
             fsacl.add_nvlist(deleg_whokey(who, inherit), permnv);
         }
         let mut zc = ZfsCmd::new();
-        zc.set_name(dataset);
+        zc.set_name(dataset)?;
         zc.zc_perm_action = unset as u64; // 0 = allow, 1 = unallow
         let op = if unset { "unallow" } else { "allow" };
         self.write_ioctl(ZFS_IOC_SET_FSACL, op, &mut zc, Some(&fsacl))?;
@@ -1208,7 +1228,7 @@ impl ZfsHandle {
         let mut args = NvList::new();
         args.add_nvlist("holds", holds);
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_HOLD, "hold", &mut zc, Some(&args))
     }
 
@@ -1223,7 +1243,7 @@ impl ZfsHandle {
         let mut holds = NvList::new();
         holds.add_nvlist(snapshot, tags);
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_RELEASE, "release", &mut zc, Some(&holds))
     }
 
@@ -1238,7 +1258,7 @@ impl ZfsHandle {
     */
     pub fn vdev_set_state(&self, pool: &str, guid: u64, online: bool, expand: bool) -> Result<()> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         zc.zc_guid = guid;
         zc.zc_cookie = if online { 7 } else { 2 };
         zc.zc_obj = if expand { ZFS_ONLINE_EXPAND } else { 0 };
@@ -1260,7 +1280,7 @@ impl ZfsHandle {
         innvl.add_u64("vdevprops_set_vdev", guid);
         innvl.add_nvlist("vdevprops_set_props", set);
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_VDEV_SET_PROPS, "set vdev property", &mut zc, Some(&innvl))
     }
 
@@ -1273,7 +1293,7 @@ impl ZfsHandle {
     */
     pub fn vdev_detach(&self, pool: &str, guid: u64) -> Result<()> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         zc.zc_guid = guid;
         self.ioctl(ZFS_IOC_VDEV_DETACH, &mut zc)
             .map_err(|err| ZfsError::Op(format!("detach vdev: {err}{}", errno_hint(&err))))?;
@@ -1302,7 +1322,7 @@ impl ZfsHandle {
         root.push("children", NvData::ListArray(vec![dev]));
         let conf = root.pack();
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         zc.zc_guid = guid;
         zc.zc_cookie = u64::from(replacing);
         zc.zc_nvlist_conf = conf.as_ptr() as u64;
@@ -1323,7 +1343,7 @@ impl ZfsHandle {
     */
     pub fn pool_scan(&self, pool: &str, func: u64, pause: bool) -> Result<()> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         zc.zc_cookie = func;
         zc.zc_flags = u32::from(pause); // POOL_SCRUB_PAUSE = 1, else NORMAL
         self.write_ioctl(ZFS_IOC_POOL_SCAN, "scrub", &mut zc, None)?;
@@ -1338,7 +1358,7 @@ impl ZfsHandle {
     */
     pub fn clear_errors(&self, pool: &str, guid: u64) -> Result<()> {
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         zc.zc_guid = guid;
         zc.zc_cookie = 1; // ZPOOL_NO_REWIND
         self.write_ioctl(ZFS_IOC_CLEAR, "clear errors", &mut zc, None)?;
@@ -1369,7 +1389,7 @@ impl ZfsHandle {
         innvl.add_u64("trim_command", cmd);
         innvl.add_nvlist("trim_vdevs", Self::vdev_guid_nvlist(guids));
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_POOL_TRIM, "trim", &mut zc, Some(&innvl))?;
         Ok(())
     }
@@ -1384,7 +1404,7 @@ impl ZfsHandle {
         innvl.add_u64("initialize_command", cmd);
         innvl.add_nvlist("initialize_vdevs", Self::vdev_guid_nvlist(guids));
         let mut zc = ZfsCmd::new();
-        zc.set_name(pool);
+        zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_POOL_INITIALIZE, "initialize", &mut zc, Some(&innvl))?;
         Ok(())
     }

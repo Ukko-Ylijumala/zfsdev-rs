@@ -56,6 +56,12 @@ pub enum NvError {
     BadPairSize { at: usize, size: i64 },
     #[error("invalid nvpair name (name_sz {0})")]
     BadName(i16),
+    #[error("nvpair array element count {0} is negative")]
+    BadArrayCount(i64),
+    #[error("xdr array count {count} disagrees with declared nelem {nelem}")]
+    ArrayCountMismatch { count: usize, nelem: usize },
+    #[error("nvpair size arithmetic overflowed (element count {0})")]
+    Overflow(usize),
     #[error("string value not NUL-terminated in pair '{0}'")]
     BadString(String),
     #[rustfmt::skip]
@@ -362,15 +368,25 @@ fn decode_pairs(cur: &mut Cursor, depth: usize) -> Result<Vec<NvPair>> {
         let value_elem = i32::from_le_bytes(blob[8..12].try_into().unwrap());
         let dtype = i32::from_le_bytes(blob[12..16].try_into().unwrap());
 
-        if name_sz < 1 || NVPAIR_HDR_SIZE + name_sz as usize > blob.len() {
+        // the name is `name_sz` bytes including a trailing NUL; require it
+        // to fit and to actually be NUL-terminated.
+        if name_sz < 1
+            || NVPAIR_HDR_SIZE + name_sz as usize > blob.len()
+            || blob[NVPAIR_HDR_SIZE + name_sz as usize - 1] != 0
+        {
             return Err(NvError::BadName(name_sz));
         }
         let name_bytes = &blob[NVPAIR_HDR_SIZE..NVPAIR_HDR_SIZE + name_sz as usize - 1];
         let name = String::from_utf8_lossy(name_bytes).into_owned();
 
+        // nvp_value_elem is a count; negative is malformed (was silently
+        // coerced to 0, hiding corruption).
+        if value_elem < 0 {
+            return Err(NvError::BadArrayCount(value_elem as i64));
+        }
         let val_off = align8(NVPAIR_HDR_SIZE + name_sz as usize);
         let value = blob.get(val_off..).unwrap_or(&[]);
-        let nelem = value_elem.max(0) as usize;
+        let nelem = value_elem as usize;
 
         let data = decode_value(cur, &name, dtype, nelem, value, depth)?;
         pairs.push(NvPair { name, data });
@@ -395,7 +411,7 @@ fn decode_value(
         })
     };
     let scalar_array = |elem_sz: usize| -> Result<Vec<&[u8]>> {
-        let raw = need(nelem * elem_sz)?;
+        let raw = need(nelem.checked_mul(elem_sz).ok_or(NvError::Overflow(nelem))?)?;
         Ok(raw.chunks_exact(elem_sz).collect())
     };
 
@@ -462,7 +478,8 @@ fn decode_value(
         ),
         DT_STRING_ARRAY => {
             // nelem pointer placeholders, then packed NUL-terminated strings
-            let mut rest = need(nelem * 8).map(|_| &value[nelem * 8..])?;
+            let placeholders = nelem.checked_mul(8).ok_or(NvError::Overflow(nelem))?;
+            let mut rest = need(placeholders).map(|_| &value[placeholders..])?;
             let mut strs = Vec::with_capacity(nelem);
             for _ in 0..nelem {
                 let (s, consumed) = read_cstr(rest, name)?;
@@ -485,7 +502,8 @@ fn decode_value(
         DT_NVLIST_ARRAY => {
             // nelem pointer placeholders, then nelem nvlist_t struct copies;
             // each child's pair stream follows in order.
-            let hdrs = need(nelem * 8 + nelem * NVLIST_STRUCT_SIZE)?;
+            let total = nelem.checked_mul(8 + NVLIST_STRUCT_SIZE).ok_or(NvError::Overflow(nelem))?;
+            let hdrs = need(total)?;
             let mut lists = Vec::with_capacity(nelem);
             for i in 0..nelem {
                 let off = nelem * 8 + i * NVLIST_STRUCT_SIZE;
@@ -675,8 +693,22 @@ fn decode_xdr_list(cur: &mut Cursor, depth: usize) -> Result<NvList> {
         }
         let name = cur.read_xdr_string()?;
         let dtype = cur.read_i32_be()?;
-        let nelem = cur.read_i32_be()?.max(0) as usize;
-        let data = decode_xdr_value(cur, dtype, nelem, pair_start, encode_sz, depth)?;
+        let nelem = cur.read_i32_be()?;
+        if nelem < 0 {
+            return Err(NvError::BadArrayCount(nelem as i64));
+        }
+        let data = decode_xdr_value(cur, dtype, nelem as usize, pair_start, encode_sz, depth)?;
+        /*
+        Each nvpair is self-describing via encode_sz; a known value's decode
+        must land within it. Reject an overrun and skip any trailing pad so
+        the next pair starts at the right offset — previously unenforced for
+        known types, so a malformed value could desync the following pairs.
+        */
+        let pair_end = pair_start + encode_sz as usize;
+        if cur.pos > pair_end {
+            return Err(NvError::BadPairSize { at: pair_start, size: encode_sz as i64 });
+        }
+        cur.pos = pair_end;
         pairs.push(NvPair { name, data });
     }
 }
@@ -689,18 +721,22 @@ fn decode_xdr_value(
     encode_sz: i32,
     depth: usize,
 ) -> Result<NvData> {
-    // xdr_array repeats the element count on the wire; read and cross-check
+    /*
+    xdr_array repeats the element count on the wire; it is authoritative
+    for stream framing and must agree with the declared nelem (count > nelem
+    would under-read and desync the following pairs; count < nelem would
+    silently drop elements). Require equality, then bound it.
+    */
     fn array_count(cur: &mut Cursor, nelem: usize, elem_sz: usize) -> Result<usize> {
         let count = cur.read_u32_be()? as usize;
-        let n = count.min(nelem);
-        if n * elem_sz > cur.remaining() {
-            return Err(NvError::Truncated {
-                at: cur.pos,
-                need: n * elem_sz,
-                have: cur.remaining(),
-            });
+        if count != nelem {
+            return Err(NvError::ArrayCountMismatch { count, nelem });
         }
-        Ok(n)
+        let need = count.checked_mul(elem_sz).ok_or(NvError::Overflow(count))?;
+        if need > cur.remaining() {
+            return Err(NvError::Truncated { at: cur.pos, need, have: cur.remaining() });
+        }
+        Ok(count)
     }
 
     Ok(match dtype {
@@ -1052,6 +1088,26 @@ mod tests {
         assert!(NvList::unpack(&e.buf).is_err());
     }
 
+    #[test]
+    fn native_negative_nelem_rejected() {
+        let mut e = Enc::new();
+        e.pair("arr", DT_UINT64_ARRAY, -1, &[0u8; 8]);
+        e.end();
+        assert!(NvList::unpack(&e.buf).is_err());
+    }
+
+    #[test]
+    fn native_unterminated_name_rejected() {
+        let mut e = Enc::new();
+        e.pair("ab", DT_UINT64, 1, &0u64.to_le_bytes());
+        e.end();
+        assert!(NvList::unpack(&e.buf).is_ok());
+        // corrupt the name's trailing NUL: "ab\0" begins after the 12-byte
+        // stream header (encoding+version+nvflag) plus the 16-byte pair header
+        e.buf[12 + NVPAIR_HDR_SIZE + 2] = b'!';
+        assert!(NvList::unpack(&e.buf).is_err());
+    }
+
     /* ----------------------------- encode (pack) ------------------------- */
 
     /**
@@ -1252,6 +1308,20 @@ mod tests {
         let vdevs = l.get_list_array("vdevs").unwrap();
         assert_eq!(vdevs.len(), 2);
         assert_eq!(vdevs[1].get_u64("id"), Some(1));
+    }
+
+    #[test]
+    fn xdr_array_count_mismatch_rejected() {
+        // declare nelem = 2 but write a wire count of 3 — a contradiction
+        // that previously under-read (min) and desynced the stream
+        let mut e = XdrEnc::new();
+        let mut v = 3u32.to_be_bytes().to_vec();
+        for x in [1u64, 2, 3] {
+            v.extend_from_slice(&x.to_be_bytes());
+        }
+        e.pair("nums", DT_UINT64_ARRAY, 2, &v);
+        e.end();
+        assert!(NvList::unpack(&e.buf).is_err());
     }
 
     #[test]
