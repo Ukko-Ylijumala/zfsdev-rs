@@ -61,6 +61,23 @@ impl ZioCompress {
     }
 }
 
+/// bp_embedded_type (spa.h): how to read an embedded blkptr's payload. Only
+/// `Data` carries a decodable payload; `Redacted`/`Reserved` do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[strum(serialize_all = "lowercase")]
+#[repr(u8)]
+pub enum BpEmbeddedType {
+    Data = 0,
+    Reserved,
+    Redacted,
+}
+
+impl BpEmbeddedType {
+    pub fn name(v: u8) -> String {
+        name_or_unknown!(BpEmbeddedType, v)
+    }
+}
+
 /// zio_checksum (zio.h)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
 #[strum(serialize_all = "lowercase")]
