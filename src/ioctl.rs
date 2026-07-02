@@ -243,11 +243,18 @@ fn unpack_history(buf: &[u8], out: &mut Vec<NvList>) -> Result<usize> {
     let mut pos = 0;
     while pos + 8 <= buf.len() {
         let reclen = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
-        if reclen == 0 || pos + 8 + reclen > buf.len() {
-            break; // partial record at the buffer tail
+        /*
+        checked: a hostile on-disk record length near usize::MAX would wrap
+        the `pos + 8 + reclen` bounds test in release and panic the slice
+        (the history object's bytes come out of the pool verbatim)
+        */
+        match (pos + 8).checked_add(reclen) {
+            Some(end) if reclen > 0 && end <= buf.len() => {
+                out.push(NvList::unpack(&buf[pos + 8..end])?);
+                pos = end;
+            }
+            _ => break, // partial/corrupt record at the buffer tail
         }
-        out.push(NvList::unpack(&buf[pos + 8..pos + 8 + reclen])?);
-        pos += 8 + reclen;
     }
     Ok(pos)
 }
@@ -541,11 +548,19 @@ impl ZfsHandle {
     duration of the call(s).
     */
     fn ioctl_nv_in(&self, ioc: u64, zc: &mut ZfsCmd, innvl: Option<&NvList>) -> Result<NvList> {
-        let src = innvl.map(|nv| nv.pack());
+        let src = innvl.map(|nv| nv.pack()).transpose()?;
         if let Some(s) = &src {
             zc.zc_nvlist_src = s.as_ptr() as u64;
             zc.zc_nvlist_src_size = s.len() as u64;
         }
+        /*
+        The kernel can mutate its cursor fields *before* failing with ENOMEM:
+        LIST_NEXT advances zc_cookie and overwrites zc_name with the child's
+        full name even when put_nvlist can't fit the props. A retry must
+        replay the original inputs or it lists the wrong parent / skips
+        entries — libzfs's zfs_do_list_ioctl restores exactly these two.
+        */
+        let (orig_name, orig_cookie) = (zc.zc_name, zc.zc_cookie);
         let mut dst: Vec<u8> = vec![0; DST_INITIAL];
         loop {
             zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
@@ -560,6 +575,8 @@ impl ZfsHandle {
                     // kernel wrote the required size into zc_nvlist_dst_size
                     let need = zc.zc_nvlist_dst_size as usize;
                     dst.resize(need.max(dst.len() * 2), 0);
+                    zc.zc_name = orig_name;
+                    zc.zc_cookie = orig_cookie;
                 }
                 Err(err) => {
                     return Err(ZfsError::Ioctl { ioc, name: zc.name(), err });
@@ -1025,7 +1042,7 @@ impl ZfsHandle {
         innvl: Option<&NvList>,
     ) -> Result<NvList> {
         // The packed source must outlive the ioctl call(s); hold it here.
-        let src = innvl.map(|nv| nv.pack());
+        let src = innvl.map(|nv| nv.pack()).transpose()?;
         if let Some(s) = &src {
             zc.zc_nvlist_src = s.as_ptr() as u64;
             zc.zc_nvlist_src_size = s.len() as u64;
@@ -1134,7 +1151,14 @@ impl ZfsHandle {
     */
     pub fn create(&self, name: &str, objset_type: u64, props: Option<&NvList>) -> Result<()> {
         let mut innvl = NvList::new();
-        innvl.add_u64("type", objset_type);
+        /*
+        zfs_keys_create declares {"type", DATA_TYPE_INT32}, and the kernel
+        rejects a mismatched nvpair type (ZFS_ERR_IOC_ARG_BADTYPE) before
+        the handler runs — lzc_create likewise packs an int32. A uint64
+        here makes every create fail; the ABI canaries can't see it because
+        their nonexistent-pool ENOENT fires before input validation.
+        */
+        innvl.push("type", NvData::Int32(objset_type as i32));
         if let Some(p) = props {
             innvl.add_nvlist("props", p.clone());
         }
@@ -1320,7 +1344,7 @@ impl ZfsHandle {
         let mut root = NvList::new();
         root.add_str("type", "root");
         root.push("children", NvData::ListArray(vec![dev]));
-        let conf = root.pack();
+        let conf = root.pack()?;
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
         zc.zc_guid = guid;
@@ -1441,11 +1465,24 @@ mod tests {
         assert!(resolve_who("bogus:thing").is_err());
     }
 
+    /**
+    A hostile record length near u64::MAX must not wrap the bounds test
+    (release) or panic the addition (debug) — the length prefix comes out
+    of the pool's on-disk history object verbatim.
+    */
+    #[test]
+    fn history_hostile_record_length_is_not_a_panic() {
+        let mut out = Vec::new();
+        let consumed = unpack_history(&u64::MAX.to_le_bytes(), &mut out).unwrap();
+        assert_eq!(consumed, 0);
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn history_records_unpack_with_trailing_partial() {
         // frame = [u64 LE len][native-packed nvlist]
         fn frame(buf: &mut Vec<u8>, nv: &NvList) {
-            let packed = nv.pack();
+            let packed = nv.pack().unwrap();
             buf.extend_from_slice(&(packed.len() as u64).to_le_bytes());
             buf.extend_from_slice(&packed);
         }

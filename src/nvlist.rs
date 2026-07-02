@@ -69,6 +69,10 @@ pub enum NvError {
     ValueOverflow { name: String, need: usize, have: usize },
     #[error("nvlist nesting deeper than {MAX_DEPTH}")]
     TooDeep,
+    #[error("cannot encode '{0}': name/value size exceeds the wire format's field width")]
+    TooBigToPack(String),
+    #[error("cannot encode '{0}': embedded NUL in name or string value")]
+    EmbeddedNul(String),
 }
 
 type Result<T> = std::result::Result<T, NvError>;
@@ -251,7 +255,13 @@ impl NvList {
     }
 
     pub fn get(&self, name: &str) -> Option<&NvData> {
-        self.pairs.iter().find(|p| p.name == name).map(|p| &p.data)
+        /*
+        Duplicate names resolve to the LAST occurrence, matching the kernel:
+        an NV_UNIQUE_NAME decode unlinks the earlier duplicate
+        (nvt_add_nvpair, nvpair.c), so a hostile config carrying two `guid`
+        pairs must be read the way the kernel would import it.
+        */
+        self.pairs.iter().rfind(|p| p.name == name).map(|p| &p.data)
     }
 
     pub fn get_u64(&self, name: &str) -> Option<u64> {
@@ -335,13 +345,20 @@ impl NvList {
     Pack into the native little-endian wire format consumed by the
     `/dev/zfs` ioctls (the inverse of [`NvList::unpack`]'s native path).
     Native is the only encoding the kernel accepts on input.
+
+    Errors on names/string values with interior NULs and on sizes that would
+    truncate the i16/i32 wire fields — the kernel would otherwise silently
+    misread (or wholesale reject) the stream. Note that `Double` and
+    `Unknown` pairs, while packable, are rejected by the *kernel* decoder
+    (DATA_TYPE_DOUBLE is compiled out under _KERNEL; unknown types EFAULT),
+    so strip them from lists destined for write ioctls.
     */
-    pub fn pack(&self) -> Vec<u8> {
+    pub fn pack(&self) -> Result<Vec<u8>> {
         let mut out = vec![0u8, 1, 0, 0]; // NV_ENCODE_NATIVE, little-endian
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.nvflag.to_le_bytes());
-        encode_pairs(&mut out, &self.pairs);
-        out
+        encode_pairs(&mut out, &self.pairs)?;
+        Ok(out)
     }
 }
 
@@ -538,27 +555,44 @@ fn read_cstr(buf: &[u8], pair_name: &str) -> Result<(String, usize)> {
 
 /// Encode a pair sequence and its 4-byte zero terminator (used for the root
 /// list and for every embedded child stream).
-fn encode_pairs(out: &mut Vec<u8>, pairs: &[NvPair]) {
+fn encode_pairs(out: &mut Vec<u8>, pairs: &[NvPair]) -> Result<()> {
     for p in pairs {
-        encode_pair(out, &p.name, &p.data);
+        encode_pair(out, &p.name, &p.data)?;
     }
     out.extend_from_slice(&0i32.to_le_bytes()); // terminator
+    Ok(())
 }
 
 /// Encode one nvpair blob, then — for embedded nvlists — its child pair
 /// stream, which the kernel format places immediately after the parent blob.
-fn encode_pair(out: &mut Vec<u8>, name: &str, data: &NvData) {
+fn encode_pair(out: &mut Vec<u8>, name: &str, data: &NvData) -> Result<()> {
+    /*
+    The wire format is NUL-delimited: an interior NUL makes the kernel's
+    decoder see a shorter string (silently changing the value — its
+    validator recomputes strlen and the align classes can still agree) or
+    reject the whole list. Refuse to encode one.
+    */
+    let has_nul = |s: &str| s.as_bytes().contains(&0);
+    let value_nul = match data {
+        NvData::Str(s) => has_nul(s),
+        NvData::StrArray(v) => v.iter().any(|s| has_nul(s)),
+        _ => false,
+    };
+    if has_nul(name) || value_nul {
+        return Err(NvError::EmbeddedNul(name.to_string()));
+    }
     let (dtype, nelem, value) = encode_value(data);
-    write_pair(out, name, dtype, nelem, &value);
+    write_pair(out, name, dtype, nelem, &value)?;
     match data {
-        NvData::List(l) => encode_pairs(out, &l.pairs),
+        NvData::List(l) => encode_pairs(out, &l.pairs)?,
         NvData::ListArray(a) => {
             for l in a {
-                encode_pairs(out, &l.pairs);
+                encode_pairs(out, &l.pairs)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /**
@@ -644,10 +678,18 @@ Write one nvpair blob: header, NUL-terminated name, then the value padded
 to the `NV_ALIGN` boundary. `nvp_size = NV_ALIGN(16 + name_sz) +
 NV_ALIGN(value_sz)` per `NVP_SIZE_CALC`.
 */
-fn write_pair(out: &mut Vec<u8>, name: &str, dtype: i32, nelem: usize, value: &[u8]) {
+fn write_pair(out: &mut Vec<u8>, name: &str, dtype: i32, nelem: usize, value: &[u8]) -> Result<()> {
     let name_sz = name.len() + 1;
     let val_off = align8(NVPAIR_HDR_SIZE + name_sz);
     let size = val_off + align8(value.len());
+    /*
+    nvp_name_sz is i16, nvp_size and nvp_value_elem i32: an oversized name
+    or value must error here, not wrap on the cast — a wrapped nvp_size can
+    turn small-positive and desync the kernel's framing of the whole stream.
+    */
+    if name_sz > i16::MAX as usize || size > i32::MAX as usize || nelem > i32::MAX as usize {
+        return Err(NvError::TooBigToPack(name.to_string()));
+    }
     out.extend_from_slice(&(size as i32).to_le_bytes());
     out.extend_from_slice(&(name_sz as i16).to_le_bytes());
     out.extend_from_slice(&0i16.to_le_bytes()); // nvp_reserve
@@ -658,6 +700,7 @@ fn write_pair(out: &mut Vec<u8>, name: &str, dtype: i32, nelem: usize, value: &[
     out.resize(out.len() + (val_off - NVPAIR_HDR_SIZE - name_sz), 0); // name padding
     out.extend_from_slice(value);
     out.resize(out.len() + (align8(value.len()) - value.len()), 0); // value padding
+    Ok(())
 }
 
 /* ------------------------------ XDR decoding ----------------------------- */
@@ -851,6 +894,16 @@ fn decode_xdr_value(
         _ => {
             // skip to the end of the pair using its encoded size
             let end = pair_start + encode_sz as usize;
+            /*
+            the name may already have overrun the declared pair size —
+            rewinding the cursor to `end` would re-parse consumed bytes and
+            silently accept a self-contradictory pair the known-type path
+            rejects (the `cur.pos > pair_end` check in decode_xdr_list runs
+            after this arm has already moved the cursor)
+            */
+            if cur.pos > end {
+                return Err(NvError::BadPairSize { at: pair_start, size: encode_sz as i64 });
+            }
             let raw = cur.buf.get(cur.pos..end).unwrap_or(&[]).to_vec();
             cur.pos = end.min(cur.buf.len());
             NvData::Unknown { dtype, raw }
@@ -1130,7 +1183,7 @@ mod tests {
             .add_bool_flag("flag")
             .add_boolean("ok", true);
 
-        assert_eq!(l.pack(), e.buf);
+        assert_eq!(l.pack().unwrap(), e.buf);
     }
 
     /// pack → unpack is the identity for every value variant writes can use.
@@ -1162,7 +1215,7 @@ mod tests {
             .add_nvlist("child", child)
             .push("vdevs", NvData::ListArray(vec![grandchild_a, grandchild_b]));
 
-        let packed = l.pack();
+        let packed = l.pack().unwrap();
         let back = NvList::unpack(&packed).unwrap();
         assert_eq!(back, l);
     }
@@ -1170,7 +1223,7 @@ mod tests {
     #[test]
     fn pack_empty_round_trip() {
         let l = NvList::new();
-        let back = NvList::unpack(&l.pack()).unwrap();
+        let back = NvList::unpack(&l.pack().unwrap()).unwrap();
         assert_eq!(back, l);
         assert!(back.pairs.is_empty());
         assert_eq!(back.nvflag, NV_UNIQUE_NAME);
@@ -1182,9 +1235,46 @@ mod tests {
     fn pack_nested_empty_round_trip() {
         let mut l = NvList::new();
         l.add_nvlist("snaps", NvList::new());
-        let back = NvList::unpack(&l.pack()).unwrap();
+        let back = NvList::unpack(&l.pack().unwrap()).unwrap();
         assert_eq!(back, l);
         assert!(back.get_list("snaps").unwrap().pairs.is_empty());
+    }
+
+    /// Interior NULs would silently re-frame on the kernel side (its
+    /// validator recomputes strlen); pack must refuse them.
+    #[test]
+    fn pack_rejects_embedded_nul() {
+        let mut l = NvList::new();
+        l.add_str("prop", "a\0b");
+        assert!(matches!(l.pack(), Err(NvError::EmbeddedNul(_))));
+
+        let mut l2 = NvList::new();
+        l2.push("na\0me", NvData::Uint64(1));
+        assert!(matches!(l2.pack(), Err(NvError::EmbeddedNul(_))));
+
+        let mut l3 = NvList::new();
+        l3.add_str_array("strs", vec!["ok".into(), "b\0ad".into()]);
+        assert!(matches!(l3.pack(), Err(NvError::EmbeddedNul(_))));
+    }
+
+    /// An oversized name must error, not wrap the i16 nvp_name_sz cast.
+    #[test]
+    fn pack_rejects_oversized_name() {
+        let mut l = NvList::new();
+        l.push("x".repeat(40_000), NvData::Uint64(1));
+        assert!(matches!(l.pack(), Err(NvError::TooBigToPack(_))));
+    }
+
+    /// Duplicate names resolve to the LAST occurrence, like the kernel's
+    /// NV_UNIQUE_NAME decode (nvt_add_nvpair unlinks the earlier one).
+    #[test]
+    fn duplicate_names_resolve_to_last() {
+        let mut e = Enc::new();
+        e.pair("guid", DT_UINT64, 1, &1u64.to_le_bytes());
+        e.pair("guid", DT_UINT64, 1, &2u64.to_le_bytes());
+        e.end();
+        let l = NvList::unpack(&e.buf).unwrap();
+        assert_eq!(l.get_u64("guid"), Some(2));
     }
 
     /* ------------------------------- XDR tests --------------------------- */
