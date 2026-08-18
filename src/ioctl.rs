@@ -24,7 +24,7 @@ use super::props::VdevProp;
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use thiserror::Error;
 
 const ZFS_DEV: &str = "/dev/zfs";
@@ -93,6 +93,22 @@ const ZFS_IOC_DESTROY_SNAPS: u64 = 0x5a3b;
 const ZFS_IOC_HOLD: u64 = 0x5a30;
 const ZFS_IOC_RELEASE: u64 = 0x5a31;
 const ZFS_IOC_LOG_HISTORY: u64 = 0x5a3f;
+
+/*
+Send/receive (replication). SEND_NEW and SEND_SPACE are new-style, keyed by
+the snapshot name; the *kernel* generates the whole stream into the fd the
+innvl names (lzc_send). RECV_NEW consumes a stream from an fd, keyed by the
+destination filesystem (or its parent when it doesn't exist yet).
+SEND_PROGRESS is legacy (zc fields), polled from a second handle while a
+send blocks. innvl contracts per zfs_keys_send_new / zfs_keys_recv_new in
+doc/reference/zfs_ioctl.c; the userspace side is doc/reference/libzfs_core.c.
+*/
+const ZFS_IOC_SEND_PROGRESS: u64 = 0x5a3e;
+const ZFS_IOC_SEND_NEW: u64 = 0x5a40;
+const ZFS_IOC_SEND_SPACE: u64 = 0x5a41;
+const ZFS_IOC_RECV_NEW: u64 = 0x5a46;
+/// `drr_magic` of a send stream's BEGIN record (doc/reference/zfs_ioctl.h).
+const DMU_BACKUP_MAGIC: u64 = 0x2F5BACBAC; // (spelled 0x2F5bacbac in the C header)
 
 const MAXPATHLEN: usize = 4096;
 const MAXNAMELEN: usize = 256;
@@ -292,6 +308,155 @@ struct DrrBegin {
     drr_toguid: u64,
     drr_fromguid: u64,
     drr_toname: [u8; MAXNAMELEN],
+}
+
+/*
+sizeof(dmu_replay_record_t): u32 drr_type + u32 drr_payloadlen + the record
+union, whose largest member is struct drr_begin (dominated by toname[256]).
+The receive path reads exactly one such record off the stream front and
+passes it to RECV_NEW verbatim.
+*/
+pub const DRR_RECORD_SIZE: usize = 8 + size_of::<DrrBegin>();
+const _: () = assert!(size_of::<DrrBegin>() == 304);
+const _: () = assert!(DRR_RECORD_SIZE == 312);
+
+/**
+The leading `dmu_replay_record` (DRR_BEGIN) of a send stream. Kept as the
+raw bytes because RECV_NEW wants the whole record verbatim (nvlist key
+`begin_record`); only the fields needed for validation and labeling are
+decoded. A byteswapped magic means the stream was written by an
+opposite-endian host — the kernel handles that, so it's accepted and the
+numeric accessors swap accordingly.
+*/
+pub struct BeginRecord {
+    bytes: [u8; DRR_RECORD_SIZE],
+    swapped: bool,
+}
+
+/// Compact debug form — the raw 312 bytes are noise; show the decoded identity.
+impl std::fmt::Debug for BeginRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BeginRecord")
+            .field("to_name", &self.to_name())
+            .field("to_guid", &self.to_guid())
+            .field("from_guid", &self.from_guid())
+            .field("payload_len", &self.payload_len())
+            .field("swapped", &self.swapped)
+            .finish()
+    }
+}
+
+impl BeginRecord {
+    /**
+    Validate `bytes` as a stream-leading BEGIN record. The union places
+    `drr_begin` at offset 8 (after `drr_type`/`drr_payloadlen`), so the
+    magic sits at byte 8; `DRR_BEGIN` is record type 0.
+    */
+    pub fn parse(bytes: &[u8]) -> Result<BeginRecord> {
+        let Ok(fixed) = <[u8; DRR_RECORD_SIZE]>::try_from(bytes) else {
+            return Err(ZfsError::Op(format!(
+                "send stream header: {} bytes, expected {DRR_RECORD_SIZE}",
+                bytes.len()
+            )));
+        };
+        let magic = u64::from_le_bytes(fixed[8..16].try_into().unwrap());
+        let swapped = match magic {
+            DMU_BACKUP_MAGIC => false,
+            m if m == DMU_BACKUP_MAGIC.swap_bytes() => true,
+            m => {
+                return Err(ZfsError::Op(format!(
+                    "not a zfs send stream (magic {m:#x}, expected {DMU_BACKUP_MAGIC:#x})"
+                )));
+            }
+        };
+        let rec = BeginRecord { bytes: fixed, swapped };
+        if rec.u32_at(0) != 0 {
+            return Err(ZfsError::Op(format!(
+                "send stream does not start with a BEGIN record (type {})",
+                rec.u32_at(0)
+            )));
+        }
+        Ok(rec)
+    }
+
+    /// The verbatim record, for RECV_NEW's `begin_record`.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn u32_at(&self, off: usize) -> u32 {
+        let v = u32::from_le_bytes(self.bytes[off..off + 4].try_into().unwrap());
+        if self.swapped { v.swap_bytes() } else { v }
+    }
+
+    fn u64_at(&self, off: usize) -> u64 {
+        let v = u64::from_le_bytes(self.bytes[off..off + 8].try_into().unwrap());
+        if self.swapped { v.swap_bytes() } else { v }
+    }
+
+    /// Bytes of nvlist payload following this record in the stream (the
+    /// kernel consumes it from the fd; nonzero for raw/props-bearing sends).
+    pub fn payload_len(&self) -> u32 {
+        self.u32_at(4)
+    }
+
+    /*
+    drr_begin field offsets within the record (union at byte 8): magic 0,
+    versioninfo 8, creation_time 16, type 24 (u32), flags 28 (u32),
+    toguid 32, fromguid 40, toname 48 — see the vendored zfs_ioctl.h.
+    */
+
+    /// GUID of the snapshot this stream creates.
+    pub fn to_guid(&self) -> u64 {
+        self.u64_at(8 + 32)
+    }
+
+    /// GUID of the incremental base snapshot (0 for a full stream).
+    pub fn from_guid(&self) -> u64 {
+        self.u64_at(8 + 40)
+    }
+
+    /// The sender-side `pool/ds@snap` name recorded in the stream.
+    pub fn to_name(&self) -> String {
+        let name = &self.bytes[8 + 48..];
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        String::from_utf8_lossy(&name[..end]).into_owned()
+    }
+}
+
+/// Stream-content options for [`ZfsHandle::send_new`] / `send_space` (the
+/// kernel innvl flags). `raw` sends an encrypted dataset as ciphertext (no
+/// loaded keys needed; the destination stays encrypted).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SendFlags {
+    pub large_block: bool,
+    pub embed: bool,
+    pub compress: bool,
+    pub raw: bool,
+}
+
+impl SendFlags {
+    fn fill(&self, innvl: &mut NvList) {
+        for (on, key) in [
+            (self.large_block, "largeblockok"),
+            (self.embed, "embedok"),
+            (self.compress, "compressok"),
+            (self.raw, "rawok"),
+        ] {
+            if on {
+                innvl.add_bool_flag(key);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+/// Outcome of a successful [`ZfsHandle::recv_new`]: stream bytes consumed
+/// plus the kernel's property-error report (empty on full success).
+pub struct RecvResult {
+    pub read_bytes: u64,
+    pub error_flags: u64,
+    pub errors: NvList,
 }
 
 #[repr(C)]
@@ -980,6 +1145,126 @@ impl ZfsHandle {
         })
     }
 
+    /* --------------------- send / receive (replication) ------------------- */
+
+    /**
+    Estimated size of the stream [`Self::send_new`] would produce for
+    `snapshot` (ZFS_IOC_SEND_SPACE — the `zfs send -nv` number). `from` is
+    the incremental base snapshot; None estimates a full stream. Pass the
+    same `flags` the real send will use, they change the stream size.
+    */
+    pub fn send_space(&self, snapshot: &str, from: Option<&str>, flags: SendFlags) -> Result<u64> {
+        let mut innvl = NvList::new();
+        if let Some(f) = from {
+            innvl.add_str("from", f);
+        }
+        flags.fill(&mut innvl);
+        let mut zc = ZfsCmd::new();
+        zc.set_name(snapshot)?;
+        let out = self.ioctl_nv_in(ZFS_IOC_SEND_SPACE, &mut zc, Some(&innvl))?;
+        Ok(out.get_u64("space").unwrap_or(0))
+    }
+
+    /**
+    Generate the send stream for `snapshot` and write it into `fd`
+    (ZFS_IOC_SEND_NEW = `lzc_send`): the *kernel* produces every stream
+    record straight into the descriptor — a pipe feeding a local
+    [`Self::recv_new`], an ssh stdin, a file. `from` names the incremental
+    base snapshot (None = full stream).
+
+    BLOCKS until the whole stream is written — run it on a dedicated
+    thread with its own handle, never the worker. Closing the read side of
+    the pipe fails the call with EPIPE, which is the cancellation
+    mechanism; [`Self::send_progress`] polls bytes-written from a second
+    handle meanwhile.
+    */
+    pub fn send_new(&self, snapshot: &str, fd: RawFd, from: Option<&str>, flags: SendFlags) -> Result<()> {
+        let mut innvl = NvList::new();
+        innvl.add_i32("fd", fd);
+        if let Some(f) = from {
+            innvl.add_str("fromsnap", f);
+        }
+        flags.fill(&mut innvl);
+        let mut zc = ZfsCmd::new();
+        zc.set_name(snapshot)?;
+        self.write_ioctl(ZFS_IOC_SEND_NEW, "send", &mut zc, Some(&innvl))?;
+        Ok(())
+    }
+
+    /**
+    Bytes written so far by an in-flight send of `snapshot` to `fd`
+    (ZFS_IOC_SEND_PROGRESS, legacy zc fields: the fd goes in `zc_cookie`,
+    the byte offset comes back in it). The kernel only reports streams
+    started by the calling process; a finished (or never-started) send is
+    ENOENT.
+    */
+    pub fn send_progress(&self, snapshot: &str, fd: RawFd) -> Result<u64> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(snapshot)?;
+        zc.zc_cookie = fd as u64;
+        self.ioctl(ZFS_IOC_SEND_PROGRESS, &mut zc)
+            .map_err(|err| ZfsError::Ioctl { ioc: ZFS_IOC_SEND_PROGRESS, name: zc.name(), err })?;
+        Ok(zc.zc_cookie)
+    }
+
+    /**
+    Receive a send stream into `snapname` (full `pool/ds@snap` destination;
+    ZFS_IOC_RECV_NEW = `lzc_receive`). The caller reads the stream's
+    leading BEGIN record off the fd ([`BeginRecord::parse`]) and hands it
+    in verbatim; the kernel consumes everything after it from `input_fd`
+    (any payload included). `zc_name` carries the containing filesystem —
+    or its parent when that filesystem doesn't exist yet, which is what
+    makes receive-into-a-new-dataset work (mirrors `recv_impl` in the
+    vendored libzfs_core.c). Blocks like [`Self::send_new`]; same
+    dedicated-thread and closed-pipe-cancel rules apply.
+
+    `resumable` keeps partial receive state on a torn stream (`zfs recv
+    -s`); `force` is the `-F` rollback, which the browser's planner keeps
+    off.
+    */
+    pub fn recv_new(
+        &self,
+        snapname: &str,
+        begin: &BeginRecord,
+        input_fd: RawFd,
+        force: bool,
+        resumable: bool,
+    ) -> Result<RecvResult> {
+        let Some((fsname, _)) = snapname.split_once('@') else {
+            return Err(ZfsError::Op(format!("receive: '{snapname}' is not a snapshot name")));
+        };
+        let target = if self.objset_stats(fsname).is_ok() {
+            fsname
+        } else {
+            match fsname.rsplit_once('/') {
+                Some((parent, _)) => parent,
+                None => {
+                    return Err(ZfsError::Op(format!(
+                        "receive: pool '{fsname}' does not exist"
+                    )));
+                }
+            }
+        };
+        let mut innvl = NvList::new();
+        innvl.add_str("snapname", snapname);
+        innvl.add_byte_array("begin_record", begin.as_bytes().to_vec());
+        innvl.add_i32("input_fd", input_fd);
+        if force {
+            innvl.add_bool_flag("force");
+        }
+        if resumable {
+            innvl.add_bool_flag("resumable");
+        }
+        let mut zc = ZfsCmd::new();
+        zc.set_name(target)?;
+        let out = self.write_ioctl(ZFS_IOC_RECV_NEW, "receive", &mut zc, Some(&innvl))?;
+        Ok(RecvResult {
+            read_bytes: out.get_u64("read_bytes").unwrap_or(0),
+            error_flags: out.get_u64("error_flags").unwrap_or(0),
+            errors: out.get_list("errors").cloned().unwrap_or_default(),
+        })
+    }
+
     /// Stats and properties for one dataset (ZFS_IOC_OBJSET_STATS).
     pub fn objset_stats(&self, dataset: &str) -> Result<(ObjsetStats, NvList)> {
         let mut zc = ZfsCmd::new();
@@ -1439,6 +1724,61 @@ impl ZfsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A synthetic little-endian BEGIN record: type/payloadlen header, then
+    /// drr_begin at offset 8 (magic 0, toguid 32, fromguid 40, toname 48).
+    fn begin_bytes(magic: u64) -> Vec<u8> {
+        let mut b = vec![0u8; DRR_RECORD_SIZE];
+        b[0..4].copy_from_slice(&0u32.to_le_bytes()); // DRR_BEGIN
+        b[4..8].copy_from_slice(&64u32.to_le_bytes()); // payloadlen
+        b[8..16].copy_from_slice(&magic.to_le_bytes());
+        b[8 + 32..8 + 40].copy_from_slice(&0xdead_beefu64.to_le_bytes()); // toguid
+        b[8 + 40..8 + 48].copy_from_slice(&0x1234u64.to_le_bytes()); // fromguid
+        b[8 + 48..8 + 48 + 12].copy_from_slice(b"tank/ds@snap");
+        b
+    }
+
+    #[test]
+    fn begin_record_decodes_fields() {
+        let rec = BeginRecord::parse(&begin_bytes(DMU_BACKUP_MAGIC)).unwrap();
+        assert_eq!(rec.payload_len(), 64);
+        assert_eq!(rec.to_guid(), 0xdead_beef);
+        assert_eq!(rec.from_guid(), 0x1234);
+        assert_eq!(rec.to_name(), "tank/ds@snap");
+        // the verbatim bytes survive for RECV_NEW
+        assert_eq!(rec.as_bytes(), &begin_bytes(DMU_BACKUP_MAGIC)[..]);
+    }
+
+    #[test]
+    fn begin_record_accepts_byteswapped_stream() {
+        // an opposite-endian sender: every field byteswapped, magic included
+        let mut b = begin_bytes(DMU_BACKUP_MAGIC);
+        for range in [0..4usize, 4..8] {
+            b[range.clone()].reverse();
+        }
+        for off in [8, 8 + 32, 8 + 40] {
+            b[off..off + 8].reverse();
+        }
+        let rec = BeginRecord::parse(&b).unwrap();
+        assert_eq!(rec.payload_len(), 64);
+        assert_eq!(rec.to_guid(), 0xdead_beef);
+        assert_eq!(rec.to_name(), "tank/ds@snap"); // chars are not swapped
+    }
+
+    #[test]
+    fn begin_record_rejects_garbage() {
+        // wrong magic
+        let e = BeginRecord::parse(&begin_bytes(0x1122334455667788)).unwrap_err();
+        assert!(e.to_string().contains("not a zfs send stream"), "{e}");
+        // wrong leading record type (a WRITE record can't start a stream)
+        let mut b = begin_bytes(DMU_BACKUP_MAGIC);
+        b[0..4].copy_from_slice(&3u32.to_le_bytes());
+        let e = BeginRecord::parse(&b).unwrap_err();
+        assert!(e.to_string().contains("BEGIN"), "{e}");
+        // short buffer
+        let e = BeginRecord::parse(&[0u8; 16]).unwrap_err();
+        assert!(e.to_string().contains("16 bytes"), "{e}");
+    }
 
     #[test]
     fn whokey_format_matches_kernel() {

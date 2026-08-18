@@ -5,7 +5,8 @@
 //! Integration tests against the live /dev/zfs interface. They skip
 //! gracefully on machines without ZFS so CI stays green.
 
-use zfs_browser::zfs::ioctl::ZfsHandle;
+use std::os::fd::AsRawFd;
+use zfs_browser::zfs::ioctl::{BeginRecord, SendFlags, ZfsHandle};
 
 fn handle() -> Option<ZfsHandle> {
     if !std::path::Path::new("/dev/zfs").exists() {
@@ -342,6 +343,67 @@ writes — with zero side effects. A wrong struct size/number would surface
 as EFAULT/EINVAL or a panic, not the clean "no such pool" we expect.
 */
 const NOPE_POOL: &str = "zfsbrowser_nonexistent_pool_canary";
+
+#[test]
+fn send_recv_ioctls_abi() {
+    let Some(zfs) = handle() else { return };
+    /*
+    All four send/receive ioctls against a nonexistent pool. The errno
+    matters, not just the failure: the kernel validates the innvl key
+    *types* (zfs_keys_send_new / zfs_keys_recv_new) before resolving the
+    name, so a mistyped nvlist would surface as ZFS_ERR_IOC_ARG_BADTYPE
+    instead of the plain ENOENT asserted here — mistyped keys can't hide
+    behind the bogus name (the lesson from the CREATE int32 regression).
+    */
+    let snap = format!("{NOPE_POOL}/ds@canary");
+    let flags = SendFlags { large_block: true, embed: true, compress: true, raw: false };
+
+    let err = zfs
+        .send_space(&snap, Some("earlier"), flags)
+        .expect_err("send_space of bogus snapshot must fail");
+    eprintln!("send_space error (expected): {err}");
+    assert!(err.to_string().contains("No such"), "not ENOENT: {err}");
+
+    let sink = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+    let err = zfs
+        .send_new(&snap, sink.as_raw_fd(), None, flags)
+        .expect_err("send of bogus snapshot must fail");
+    eprintln!("send error (expected): {err}");
+    assert!(err.to_string().starts_with("send:"), "unmapped error: {err}");
+    assert!(err.to_string().contains("No such"), "not ENOENT: {err}");
+
+    let err = zfs
+        .send_progress(&snap, sink.as_raw_fd())
+        .expect_err("progress of bogus send must fail");
+    eprintln!("send_progress error (expected): {err}");
+
+    // a well-formed synthetic BEGIN record into a nonexistent pool: the key
+    // types and the byte-array framing are validated, the name is not found
+    let mut begin = vec![0u8; zfs_browser::zfs::ioctl::DRR_RECORD_SIZE];
+    begin[8..16].copy_from_slice(&0x2F5BACBACu64.to_le_bytes());
+    let begin = BeginRecord::parse(&begin).unwrap();
+    let src = std::fs::File::open("/dev/null").unwrap();
+    let err = zfs
+        .recv_new(&snap, &begin, src.as_raw_fd(), false, false)
+        .expect_err("receive into bogus pool must fail");
+    eprintln!("receive error (expected): {err}");
+    assert!(err.to_string().starts_with("receive:"), "unmapped error: {err}");
+    assert!(err.to_string().contains("No such"), "not ENOENT: {err}");
+
+    // happy path, root-free: SEND_SPACE is an unprivileged read, so a real
+    // snapshot (when the machine has one) proves the outnvl decode too
+    let configs = zfs.pool_configs().expect("pool configs");
+    for pair in configs.iter() {
+        let Ok(snaps) = zfs.snapshots(&pair.name) else { continue };
+        if let Some(s) = snaps.first() {
+            let space = zfs.send_space(&s.name, None, SendFlags::default()).expect("send_space");
+            eprintln!("send_space({}) = {space} bytes", s.name);
+            assert!(space > 0, "a full stream of {} can't be empty", s.name);
+            return;
+        }
+    }
+    eprintln!("no snapshot found for the send_space happy path");
+}
 
 #[test]
 fn destroy_nonexistent_is_a_clean_mapped_error() {

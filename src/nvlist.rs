@@ -333,6 +333,14 @@ impl NvList {
         self.push(name, NvData::BooleanFlag)
     }
 
+    pub fn add_i32(&mut self, name: impl Into<String>, v: i32) -> &mut Self {
+        self.push(name, NvData::Int32(v))
+    }
+
+    pub fn add_byte_array(&mut self, name: impl Into<String>, v: Vec<u8>) -> &mut Self {
+        self.push(name, NvData::ByteArray(v))
+    }
+
     pub fn add_nvlist(&mut self, name: impl Into<String>, v: NvList) -> &mut Self {
         self.push(name, NvData::List(v))
     }
