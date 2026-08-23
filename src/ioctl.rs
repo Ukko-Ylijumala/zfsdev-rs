@@ -199,36 +199,78 @@ fn device_vtype(path: &str) -> Result<&'static str> {
     }
 }
 
+/*
+The passwd/group lookups use the reentrant `_r` variants: the plain
+getpwnam/getpwuid/getgrnam/getgrgid family returns pointers into per-process
+static storage (POSIX MT-Unsafe), and these run on BOTH threads —
+`resolve_who` on the UI thread (the delegation modal) can race `name_for_id`
+on the worker (space-accounting rows). A torn result here could resolve a
+`zfs allow` to the wrong uid. Buffer grown on ERANGE for pathologically
+long entries.
+*/
+
 /// Look up a numeric uid (or gid) in the system database, returning its name.
 /// The inverse of [`resolve_id`]; used to label userused@/groupused@ rows.
 pub fn name_for_id(id: u64, group: bool) -> Option<String> {
     let id = u32::try_from(id).ok()?;
-    // SAFETY: getpwuid/getgrgid return a pointer into static storage (or null);
-    // we copy the name out immediately and don't retain the pointer.
-    unsafe {
-        let name = if group {
-            let gr = libc::getgrgid(id as libc::gid_t);
-            (!gr.is_null()).then(|| (*gr).gr_name)
+    let mut buf = vec![0i8; 4096];
+    loop {
+        let (rc, name_ptr, found) = if group {
+            let mut grp: libc::group = unsafe { std::mem::zeroed() };
+            let mut res: *mut libc::group = std::ptr::null_mut();
+            // SAFETY: all pointers reference live locals/buffer for the call.
+            let rc = unsafe {
+                libc::getgrgid_r(id, &mut grp, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut res)
+            };
+            (rc, grp.gr_name, !res.is_null())
         } else {
-            let pw = libc::getpwuid(id as libc::uid_t);
-            (!pw.is_null()).then(|| (*pw).pw_name)
+            let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut res: *mut libc::passwd = std::ptr::null_mut();
+            // SAFETY: as above.
+            let rc = unsafe {
+                libc::getpwuid_r(id, &mut pwd, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut res)
+            };
+            (rc, pwd.pw_name, !res.is_null())
         };
-        name.map(|p| CStr::from_ptr(p).to_string_lossy().into_owned())
+        match rc {
+            0 if found && !name_ptr.is_null() => {
+                // SAFETY: name_ptr points into `buf`, still alive here.
+                return Some(unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy().into_owned());
+            }
+            0 => return None, // no such id
+            libc::ERANGE if buf.len() < 1 << 20 => buf.resize(buf.len() * 2, 0),
+            _ => return None,
+        }
     }
 }
 
 /// Look up a user (or group) name in the system database, returning its id.
 fn resolve_id(name: &str, group: bool) -> Option<u64> {
     let cname = CString::new(name).ok()?;
-    // SAFETY: getpwnam/getgrnam return a pointer into static storage (or null);
-    // we read the id field immediately and don't retain the pointer.
-    unsafe {
-        if group {
-            let gr = libc::getgrnam(cname.as_ptr());
-            (!gr.is_null()).then(|| (*gr).gr_gid as u64)
+    let mut buf = vec![0i8; 4096];
+    loop {
+        let (rc, id, found) = if group {
+            let mut grp: libc::group = unsafe { std::mem::zeroed() };
+            let mut res: *mut libc::group = std::ptr::null_mut();
+            // SAFETY: all pointers reference live locals/buffer for the call.
+            let rc = unsafe {
+                libc::getgrnam_r(cname.as_ptr(), &mut grp, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut res)
+            };
+            (rc, grp.gr_gid as u64, !res.is_null())
         } else {
-            let pw = libc::getpwnam(cname.as_ptr());
-            (!pw.is_null()).then(|| (*pw).pw_uid as u64)
+            let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut res: *mut libc::passwd = std::ptr::null_mut();
+            // SAFETY: as above.
+            let rc = unsafe {
+                libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut res)
+            };
+            (rc, pwd.pw_uid as u64, !res.is_null())
+        };
+        match rc {
+            0 if found => return Some(id),
+            0 => return None, // no such name
+            libc::ERANGE if buf.len() < 1 << 20 => buf.resize(buf.len() * 2, 0),
+            _ => return None,
         }
     }
 }

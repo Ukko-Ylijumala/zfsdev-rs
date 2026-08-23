@@ -204,7 +204,9 @@ value_enum!(AclInherit {
 value_enum!(AclType { Off = 0, Posix, Nfsv4 });
 value_enum!(XattrMode {
     Off = 0,
-    #[strum(serialize = "on (dir)")]
+    // displays as "on (dir)"; the kernel accepts (and libzfs prints) both
+    // "on" and "dir" for value 1, so both parse
+    #[strum(to_string = "on (dir)", serialize = "on", serialize = "dir")]
     Dir,
     Sa,
 });
@@ -214,23 +216,38 @@ value_enum!(CacheMode { None = 0, Metadata, All });
 value_enum!(RedundantMetadata { All = 0, Most, Some, None });
 value_enum!(SnapVisibility { Hidden = 0, Visible });
 value_enum!(CaseSensitivity { Sensitive = 0, Insensitive, Mixed });
+/*
+The normalization values are the u8_textprep(9F) flag combinations the kernel
+stores (normalize_table in zfs_prop.c → U8_TEXTPREP_NF*): CANON_DECOMP 0x10,
+COMPAT_DECOMP 0x20, CANON_COMP 0x40. NOT a dense 0..n enum.
+*/
 value_enum!(Normalization {
     None = 0,
-    #[strum(serialize = "formC")]
-    FormC,
     #[strum(serialize = "formD")]
-    FormD,
-    #[strum(serialize = "formKC")]
-    FormKC,
+    FormD = 0x10,
     #[strum(serialize = "formKD")]
-    FormKD,
+    FormKD = 0x20,
+    #[strum(serialize = "formC")]
+    FormC = 0x50,
+    #[strum(serialize = "formKC")]
+    FormKC = 0x60,
 });
-value_enum!(VolMode { Default = 0, Full, Geom, Dev, None });
+// zfs_volmode_t: GEOM and FULL are the same value (1); `zfs get` prints "full"
+// (first table match), so Display does too and "geom" is a parse alias.
+value_enum!(VolMode {
+    Default = 0,
+    #[strum(to_string = "full", serialize = "geom")]
+    Full = 1,
+    Dev = 2,
+    None = 3,
+});
 value_enum!(FailMode { Wait = 0, Continue, Panic });
 value_enum!(KeyFormat { None = 0, Raw, Hex, Passphrase });
+// zio_encrypt: INHERIT=0, ON=1, OFF=2, then the suites 3..=8 (zfs.h).
 value_enum!(Encryption {
-    Off = 0,
+    Inherit = 0,
     On,
+    Off,
     #[strum(serialize = "aes-128-ccm")]
     Aes128Ccm,
     #[strum(serialize = "aes-192-ccm")]
@@ -291,14 +308,27 @@ impl_try_from_u64!(
 pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
     use ZfsProp as P;
     let s = match P::from_str(name).ok()? {
-        P::Compression => ZioCompress::name(u8::try_from(v).unwrap_or(u8::MAX)),
-        P::Checksum | P::Dedup => match v {
-            0 => "inherit".into(),
-            1 => "on".into(),
-            2 => "off".into(),
-            3 => "verify".into(), // dedup=verify
-            _ => ZioChecksum::name(u8::try_from(v).unwrap_or(u8::MAX)),
+        P::Compression => match u8::try_from(v) {
+            Ok(b) => ZioCompress::name(b),
+            Err(_) => format!("?{v}"),
         },
+        P::Checksum => match u8::try_from(v) {
+            Ok(b) => ZioChecksum::name(b),
+            Err(_) => format!("?{v}"),
+        },
+        /*
+        dedup stores a zio_checksum value with the ZIO_CHECKSUM_VERIFY bit
+        (1<<8) possibly set (dedup_table in zfs_prop.c): plain "verify" is
+        on|verify (257), the named algorithms render "sha256,verify" style.
+        */
+        P::Dedup => {
+            let base = ZioChecksum::name((v & 0xff) as u8);
+            match (v & 0x100 != 0, v & 0xff) {
+                (false, _) => base,
+                (true, 1) => "verify".into(),
+                (true, _) => format!("{base},verify"),
+            }
+        }
 
         P::Quota
         | P::Reservation
@@ -339,7 +369,14 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
         P::CompressRatio | P::RefCompressRatio | P::BcloneRatio => {
             format!("{}.{:02}x", v / 100, v % 100)
         }
-        P::Fragmentation => format!("{v}%"),
+        // u64::MAX = ZFS_FRAG_INVALID (no spacemap histogram) — zpool shows "-"
+        P::Fragmentation => {
+            if v == u64::MAX {
+                "-".into()
+            } else {
+                format!("{v}%")
+            }
+        }
 
         P::Atime
         | P::Relatime
@@ -380,6 +417,7 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
         P::Encryption => ev::<Encryption>(v)?,
         P::DnodeSize => match v {
             0 => "legacy (512)".into(),
+            1 => "auto".into(), // ZFS_DNSIZE_AUTO
             n => human_bytes(n),
         },
     };
@@ -495,10 +533,16 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
             }
         }
 
-        P::Compression => ZioCompress::from_str(input)
-            .or_else(|_| ZioCompress::from_str(&input.to_lowercase()))
-            .map(|c| NvData::Uint64(c as u64))
-            .map_err(|_| format!("unknown compression '{input}'")),
+        P::Compression => {
+            if input.eq_ignore_ascii_case("gzip") {
+                // bare "gzip" is the kernel's alias for gzip-6 (compress_table)
+                return u64v(ZioCompress::Gzip6 as u64);
+            }
+            ZioCompress::from_str(input)
+                .or_else(|_| ZioCompress::from_str(&input.to_lowercase()))
+                .map(|c| NvData::Uint64(c as u64))
+                .map_err(|_| format!("unknown compression '{input}'"))
+        }
         P::Checksum => parse_checksum(input).and_then(u64v),
         P::Dedup => parse_dedup(input).and_then(u64v),
 
@@ -521,6 +565,8 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
         P::DnodeSize => {
             if input.eq_ignore_ascii_case("legacy") {
                 u64v(0)
+            } else if input.eq_ignore_ascii_case("auto") {
+                u64v(1) // ZFS_DNSIZE_AUTO
             } else {
                 parse_size(input).and_then(u64v)
             }
@@ -682,13 +728,25 @@ fn parse_checksum(s: &str) -> Result<u64, String> {
     })
 }
 
+/**
+dedup values carry the `ZIO_CHECKSUM_VERIFY` bit (1<<8) on top of a
+zio_checksum: `verify` = on|verify (257), `sha256,verify` = 8|256, …
+(dedup_table in zfs_prop.c). `off,verify` isn't a valid combination.
+*/
 fn parse_dedup(s: &str) -> Result<u64, String> {
-    match s.to_lowercase().as_str() {
-        "on" => Ok(1),
-        "off" => Ok(2),
-        "verify" => Ok(3),
-        _ => parse_checksum(s),
-    }
+    let lower = s.to_lowercase();
+    let (base, verify) = match lower.strip_suffix(",verify") {
+        Some(b) => (b.trim(), true),
+        None if lower == "verify" => ("on", true),
+        None => (lower.as_str(), false),
+    };
+    let v = match base {
+        "on" => 1,
+        "off" if verify => return Err("dedup=off cannot take ',verify'".into()),
+        "off" => 2,
+        other => parse_checksum(other)?,
+    };
+    Ok(v | if verify { 0x100 } else { 0 })
 }
 
 /* ========================================================================= */
@@ -707,11 +765,31 @@ mod tests {
         assert_eq!(format_prop_value("atime", 0).unwrap(), "off (0)");
         assert_eq!(format_prop_value("recordsize", 131072).unwrap(), "128K (131072)");
         assert_eq!(format_prop_value("aclinherit", 4).unwrap(), "passthrough-x (4)");
-        assert_eq!(format_prop_value("normalization", 1).unwrap(), "formC (1)");
+        // normalization stores u8_textprep flags, not a dense enum
+        assert_eq!(format_prop_value("normalization", 0x10).unwrap(), "formD (16)");
+        assert_eq!(format_prop_value("normalization", 0x50).unwrap(), "formC (80)");
+        assert_eq!(format_prop_value("normalization", 0x60).unwrap(), "formKC (96)");
         assert_eq!(format_prop_value("special_small_blocks", 0).unwrap(), "none (0)");
         assert_eq!(format_prop_value("no_such_prop", 7), None);
         // out-of-range enum value falls back to raw display
         assert_eq!(format_prop_value("canmount", 9), None);
+        // volmode: GEOM==FULL==1 displays "full" like `zfs get`
+        assert_eq!(format_prop_value("volmode", 1).unwrap(), "full (1)");
+        assert_eq!(format_prop_value("volmode", 2).unwrap(), "dev (2)");
+        assert_eq!(format_prop_value("volmode", 3).unwrap(), "none (3)");
+        // encryption: zio_encrypt has INHERIT=0/ON/OFF then the suites 3..=8
+        assert_eq!(format_prop_value("encryption", 2).unwrap(), "off (2)");
+        assert_eq!(format_prop_value("encryption", 6).unwrap(), "aes-128-gcm (6)");
+        assert_eq!(format_prop_value("encryption", 8).unwrap(), "aes-256-gcm (8)");
+        // dedup carries the verify bit; checksum 3 is LABEL, not "verify"
+        assert_eq!(format_prop_value("dedup", 257).unwrap(), "verify (257)");
+        assert_eq!(format_prop_value("dedup", 8 | 256).unwrap(), "sha256,verify (264)");
+        assert_eq!(format_prop_value("dedup", 2).unwrap(), "off (2)");
+        assert_eq!(format_prop_value("checksum", 3).unwrap(), "label (3)");
+        // dnodesize auto and the fragmentation invalid sentinel
+        assert_eq!(format_prop_value("dnodesize", 1).unwrap(), "auto (1)");
+        assert_eq!(format_prop_value("fragmentation", u64::MAX).unwrap(),
+                   format!("- ({})", u64::MAX));
     }
 
     #[test]
@@ -769,10 +847,15 @@ mod tests {
         assert_eq!(parse_prop_value("compression", "lz4").unwrap(), Uint64(15));
         assert_eq!(parse_prop_value("compression", "zstd").unwrap(), Uint64(16));
         assert_eq!(parse_prop_value("compression", "off").unwrap(), Uint64(2));
-        // checksum / dedup explicit maps
+        // checksum / dedup explicit maps (dedup verify = the 1<<8 bit)
         assert_eq!(parse_prop_value("checksum", "sha256").unwrap(), Uint64(8));
         assert_eq!(parse_prop_value("checksum", "blake3").unwrap(), Uint64(14));
-        assert_eq!(parse_prop_value("dedup", "verify").unwrap(), Uint64(3));
+        assert_eq!(parse_prop_value("dedup", "verify").unwrap(), Uint64(257));
+        assert_eq!(parse_prop_value("dedup", "sha256,verify").unwrap(), Uint64(8 | 256));
+        assert_eq!(parse_prop_value("dedup", "edonr,verify").unwrap(), Uint64(13 | 256));
+        assert!(parse_prop_value("dedup", "off,verify").is_err());
+        // bare "gzip" is the gzip-6 alias
+        assert_eq!(parse_prop_value("compression", "gzip").unwrap(), Uint64(10));
         // sizes & limits
         assert_eq!(parse_prop_value("recordsize", "128K").unwrap(), Uint64(131072));
         assert_eq!(parse_prop_value("quota", "1G").unwrap(), Uint64(1 << 30));
@@ -781,7 +864,23 @@ mod tests {
         // value enums, including a mixed-case custom serialize
         assert_eq!(parse_prop_value("canmount", "noauto").unwrap(), Uint64(2));
         assert_eq!(parse_prop_value("sync", "always").unwrap(), Uint64(1));
-        assert_eq!(parse_prop_value("normalization", "formC").unwrap(), Uint64(1));
+        assert_eq!(parse_prop_value("normalization", "formC").unwrap(), Uint64(0x50));
+        assert_eq!(parse_prop_value("normalization", "formD").unwrap(), Uint64(0x10));
+        // volmode aliases: full and geom are the same kernel value
+        assert_eq!(parse_prop_value("volmode", "full").unwrap(), Uint64(1));
+        assert_eq!(parse_prop_value("volmode", "geom").unwrap(), Uint64(1));
+        assert_eq!(parse_prop_value("volmode", "dev").unwrap(), Uint64(2));
+        assert_eq!(parse_prop_value("volmode", "none").unwrap(), Uint64(3));
+        // xattr: "on" and "dir" both mean the directory implementation
+        assert_eq!(parse_prop_value("xattr", "on").unwrap(), Uint64(1));
+        assert_eq!(parse_prop_value("xattr", "dir").unwrap(), Uint64(1));
+        assert_eq!(parse_prop_value("xattr", "sa").unwrap(), Uint64(2));
+        // encryption suites at their zio_encrypt values
+        assert_eq!(parse_prop_value("encryption", "aes-256-gcm").unwrap(), Uint64(8));
+        assert_eq!(parse_prop_value("encryption", "off").unwrap(), Uint64(2));
+        // dnodesize auto
+        assert_eq!(parse_prop_value("dnodesize", "auto").unwrap(), Uint64(1));
+        assert_eq!(parse_prop_value("dnodesize", "legacy").unwrap(), Uint64(0));
         // string-valued and user properties
         assert_eq!(parse_prop_value("mountpoint", "/mnt/x").unwrap(), Str("/mnt/x".into()));
         assert_eq!(parse_prop_value("com.example:tag", "hi").unwrap(), Str("hi".into()));
