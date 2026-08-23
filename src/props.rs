@@ -106,6 +106,7 @@ enum ZfsProp {
     DnodeSize,
     FailMode,
     KeyFormat,
+    KeyStatus,
     Encryption,
 }
 
@@ -243,6 +244,8 @@ value_enum!(VolMode {
 });
 value_enum!(FailMode { Wait = 0, Continue, Panic });
 value_enum!(KeyFormat { None = 0, Raw, Hex, Passphrase });
+// zfs_keystatus_t: computed key state of an encrypted dataset (zfs.h).
+value_enum!(KeyStatus { None = 0, Unavailable, Available });
 // zio_encrypt: INHERIT=0, ON=1, OFF=2, then the suites 3..=8 (zfs.h).
 value_enum!(Encryption {
     Inherit = 0,
@@ -298,6 +301,7 @@ impl_try_from_u64!(
     VolMode,
     FailMode,
     KeyFormat,
+    KeyStatus,
     Encryption,
 );
 
@@ -428,6 +432,7 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
         P::VolMode => ev::<VolMode>(v)?,
         P::FailMode => ev::<FailMode>(v)?,
         P::KeyFormat => ev::<KeyFormat>(v)?,
+        P::KeyStatus => ev::<KeyStatus>(v)?,
         P::Encryption => ev::<Encryption>(v)?,
         P::DnodeSize => match v {
             0 => "legacy (512)".into(),
@@ -496,7 +501,8 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
         | P::RefCompressRatio
         | P::BcloneRatio
         | P::Fragmentation
-        | P::Mounted => Err(format!("'{name}' is a read-only property")),
+        | P::Mounted
+        | P::KeyStatus => Err(format!("'{name}' is a read-only property")),
 
         // booleans
         P::Atime
@@ -621,6 +627,18 @@ enum ReadOnlyProp {
     Name,
     Origin,
     Version,
+    /*
+    the encryption identity/derivation fields: not settable through SET_PROP
+    (encryptionroot is computed; the pbkdf2 pair only changes via CHANGE_KEY,
+    i.e. `zfs change-key`), so from the property editor's viewpoint they are
+    read-only.
+    */
+    #[strum(serialize = "encryptionroot")]
+    EncryptionRoot,
+    #[strum(serialize = "pbkdf2salt")]
+    Pbkdf2Salt,
+    #[strum(serialize = "pbkdf2iters")]
+    Pbkdf2Iters,
 }
 
 /**
@@ -668,6 +686,7 @@ pub fn is_editable(name: &str) -> bool {
                 | P::BcloneRatio
                 | P::Fragmentation
                 | P::Mounted
+                | P::KeyStatus
         ),
         Err(_) => true,
     }

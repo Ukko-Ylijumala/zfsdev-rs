@@ -341,6 +341,12 @@ impl NvList {
         self.push(name, NvData::ByteArray(v))
     }
 
+    /// DATA_TYPE_UINT8_ARRAY — distinct from BYTE_ARRAY on the wire, and what
+    /// the kernel's `nvlist_lookup_uint8_array` consumers (wkeydata) require.
+    pub fn add_uint8_array(&mut self, name: impl Into<String>, v: Vec<u8>) -> &mut Self {
+        self.push(name, NvData::Uint8Array(v))
+    }
+
     pub fn add_nvlist(&mut self, name: impl Into<String>, v: NvList) -> &mut Self {
         self.push(name, NvData::List(v))
     }

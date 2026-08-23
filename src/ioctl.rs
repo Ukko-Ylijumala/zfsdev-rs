@@ -92,6 +92,8 @@ const ZFS_IOC_INHERIT_PROP: u64 = 0x5a2b;
 const ZFS_IOC_DESTROY_SNAPS: u64 = 0x5a3b;
 const ZFS_IOC_HOLD: u64 = 0x5a30;
 const ZFS_IOC_RELEASE: u64 = 0x5a31;
+const ZFS_IOC_LOAD_KEY: u64 = 0x5a49;
+const ZFS_IOC_UNLOAD_KEY: u64 = 0x5a4a;
 const ZFS_IOC_LOG_HISTORY: u64 = 0x5a3f;
 
 /*
@@ -1607,6 +1609,40 @@ impl ZfsHandle {
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
         self.write_ioctl(ZFS_IOC_RELEASE, "release", &mut zc, Some(&holds))
+    }
+
+    /**
+    Load an encrypted dataset's wrapping key into the kernel keystore
+    (ZFS_IOC_LOAD_KEY; `zfs load-key`). `dataset` must be the *encryption
+    root*; `wkeydata` is the raw 32-byte wrapping key — passphrase → PBKDF2
+    derivation happens in userspace ([`crate::zfs::crypt`]), exactly like
+    libzfs; the kernel only verifies the bytes against the wrapped master
+    key's MAC (EACCES = wrong key, EEXIST = already loaded). The innvl wraps
+    the key as `{hidden_args: {wkeydata: uint8[]}}` (`lzc_load_key`); `noop`
+    verifies without keeping the key loaded (`zfs load-key -n`).
+    */
+    pub fn load_key(&self, dataset: &str, wkeydata: &[u8], noop: bool) -> Result<()> {
+        let mut hidden = NvList::new();
+        hidden.add_uint8_array("wkeydata", wkeydata.to_vec());
+        let mut innvl = NvList::new();
+        innvl.add_nvlist("hidden_args", hidden);
+        if noop {
+            innvl.add_bool_flag("noop");
+        }
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset)?;
+        self.write_ioctl(ZFS_IOC_LOAD_KEY, "load key", &mut zc, Some(&innvl))?;
+        Ok(())
+    }
+
+    /// Unload an encryption root's wrapping key from the kernel keystore
+    /// (ZFS_IOC_UNLOAD_KEY; `zfs unload-key`). Fails while the dataset (or a
+    /// descendant sharing the key) is mounted/busy — the kernel enforces it.
+    pub fn unload_key(&self, dataset: &str) -> Result<()> {
+        let mut zc = ZfsCmd::new();
+        zc.set_name(dataset)?;
+        self.write_ioctl(ZFS_IOC_UNLOAD_KEY, "unload key", &mut zc, None)?;
+        Ok(())
     }
 
     /**

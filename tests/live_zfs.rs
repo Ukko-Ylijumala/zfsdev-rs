@@ -507,3 +507,108 @@ fn get_fsacl_reads_delegations() {
         eprintln!("{}: {} delegation entr(y/ies)", pair.name, acl.pairs.len());
     }
 }
+
+#[test]
+fn load_unload_key_in_nonexistent_pool_is_a_clean_error() {
+    let Some(zfs) = handle() else { return };
+    /*
+    LOAD_KEY validates its innvl keys (zfs_keys_load_key: hidden_args as an
+    nvlist, optional noop flag) before resolving the dataset, so a mistyped
+    wkeydata wrapper would surface as ZFS_ERR_IOC_ARG_BADTYPE rather than
+    the clean lookup failure asserted here. UNLOAD_KEY has no innvl.
+    */
+    let ds = format!("{NOPE_POOL}/enc");
+    let wkey = [0u8; 32];
+    let load = zfs.load_key(&ds, &wkey, false).expect_err("load-key of bogus ds must fail");
+    assert!(load.to_string().starts_with("load key:"), "unmapped: {load}");
+    let noop = zfs.load_key(&ds, &wkey, true).expect_err("noop load-key of bogus ds must fail");
+    assert!(noop.to_string().starts_with("load key:"), "unmapped: {noop}");
+    let unload = zfs.unload_key(&ds).expect_err("unload-key of bogus ds must fail");
+    assert!(unload.to_string().starts_with("unload key:"), "unmapped: {unload}");
+    eprintln!("load/unload-key canaries failed cleanly");
+}
+
+/**
+End-to-end key management against the delegated playground `data/test`
+(mtanner holds `zfs allow` perms there): create a passphrase-encrypted
+child via the CLI (`-u` skips the mount, which delegation can't do),
+then drive UNLOAD_KEY / LOAD_KEY through our ioctls with the wrapping key
+derived by `crypt::derive_wrapping_key` from the dataset's own
+pbkdf2salt/pbkdf2iters — including the negative case (a wrong passphrase
+must be *rejected by the kernel's MAC check*, proving the kernel really
+verified our PBKDF2 output). Skips wherever the environment is absent.
+*/
+#[test]
+fn load_key_roundtrip_in_playground() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use zfs_browser::node::{prop_value_str, prop_value_u64};
+    use zfs_browser::zfs::crypt::derive_wrapping_key;
+    use zfs_browser::zfs::props::KeyFormat;
+
+    const PLAYGROUND: &str = "data/test";
+    const PASS: &str = "zfs-browser test passphrase";
+    let Some(zfs) = handle() else { return };
+    if zfs.objset_stats(PLAYGROUND).is_err() {
+        eprintln!("skipping: no {PLAYGROUND} playground on this machine");
+        return;
+    }
+    let ds = format!("{PLAYGROUND}/zb-enc-{}", std::process::id());
+    // encrypted create needs wkeydata via hidden_args, which our CREATE
+    // doesn't pass yet — use the CLI here (tests may; the app never does)
+    let mut child = Command::new("zfs")
+        .args(["create", "-u", "-o", "encryption=on", "-o", "keyformat=passphrase", &ds])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn zfs create");
+    child.stdin.take().unwrap().write_all(format!("{PASS}\n{PASS}\n").as_bytes()).ok();
+    let out = child.wait_with_output().expect("zfs create");
+    if !out.status.success() {
+        eprintln!(
+            "skipping: cannot create an encrypted dataset under {PLAYGROUND}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return;
+    }
+
+    let result = (|| -> Result<(), String> {
+        let keystatus = |zfs: &ZfsHandle| -> Result<u64, String> {
+            let (_, props) = zfs.objset_stats(&ds).map_err(|e| e.to_string())?;
+            prop_value_u64(&props, "keystatus").ok_or_else(|| "no keystatus prop".into())
+        };
+        let (_, props) = zfs.objset_stats(&ds).map_err(|e| e.to_string())?;
+        assert_eq!(keystatus(&zfs)?, 2, "fresh encrypted dataset must have its key loaded");
+        assert_eq!(prop_value_str(&props, "encryptionroot").as_deref(), Some(ds.as_str()));
+        let salt = prop_value_u64(&props, "pbkdf2salt").ok_or("no pbkdf2salt")?;
+        let iters = prop_value_u64(&props, "pbkdf2iters").ok_or("no pbkdf2iters")?;
+
+        if let Err(e) = zfs.unload_key(&ds) {
+            // delegation may lack load-key on some machines — skip, don't fail
+            eprintln!("skipping unload/load round: {e}");
+            return Ok(());
+        }
+        assert_eq!(keystatus(&zfs)?, 1, "keystatus must be unavailable after unload");
+
+        // the kernel must REJECT a key derived from the wrong passphrase —
+        // this proves it actually checked our PBKDF2 output against the
+        // wrapped master key's MAC, not just accepted 32 bytes
+        let wrong = derive_wrapping_key(KeyFormat::Passphrase, b"wrong passphrase", salt, iters)?;
+        let denied = zfs.load_key(&ds, &wrong, false);
+        assert!(denied.is_err(), "wrong passphrase must be rejected");
+        eprintln!("wrong-passphrase load rejected: {}", denied.unwrap_err());
+        assert_eq!(keystatus(&zfs)?, 1);
+
+        let right = derive_wrapping_key(KeyFormat::Passphrase, PASS.as_bytes(), salt, iters)?;
+        // noop first (zfs load-key -n): verifies without loading
+        zfs.load_key(&ds, &right, true).map_err(|e| format!("noop load: {e}"))?;
+        assert_eq!(keystatus(&zfs)?, 1, "noop load must not keep the key loaded");
+        zfs.load_key(&ds, &right, false).map_err(|e| format!("load: {e}"))?;
+        assert_eq!(keystatus(&zfs)?, 2, "keystatus must be available after load");
+        eprintln!("unload → wrong-key reject → noop verify → load: all good");
+        Ok(())
+    })();
+
+    let _ = zfs.destroy(&ds, false);
+    result.unwrap();
+}
