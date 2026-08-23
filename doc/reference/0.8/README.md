@@ -7,10 +7,12 @@ by Ubuntu 20.04, CentOS/EL7 zfsonlinux repos, etc.). Question: **what does
 ## Headers
 
 The `../2.1` set (`zfs_ioctl.h`, `dmu.h`, `zfs_stat.h`, `zfs.h`) plus
-`zfs_znode.h` — the latter for `znode_phys_t`/`zfs_acl_phys_t`, the
+three that are not about the ioctl ABI at all: `zfs_sa.h` (`znode_phys_t`
+and `ZFS_OLD_ZNODE_PHYS_SIZE`), `zfs_acl.h` (`zfs_acl_phys_t`,
+`ZFS_ACE_SPACE`) and `zfs_znode.h` (the ZPL flag/attr constants) — the
 **legacy pre-SA on-disk znode format** (ZPL version ≤ 4) that the 2.2
-headers no longer carry; it is the reference for the on-disk layer's
-legacy-znode decode, unrelated to the ioctl ABI.
+headers no longer carry. These are the reference for
+`ondisk/zpl.rs::ZnodeAttrs::decode_legacy` and the `--oldpool` fixture.
 
 ## `zfs_cmd_t`: 13736 bytes — safe with the 13744 mirror as-is
 
