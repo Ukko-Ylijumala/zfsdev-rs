@@ -61,6 +61,99 @@ impl ZioCompress {
     }
 }
 
+/**
+zio_zstd_levels (zio_compress.h): the level half of a zstd compression
+property value — the kernel stores `ZIO_COMPRESS_ZSTD | (level << 7)`
+(`ZIO_COMPLEVEL_ZSTD`, `SPA_COMPRESSBITS` = 7). Levels 1..=19 are their own
+ordinals; the negative "fast" levels occupy 103..=123. Serialized as the
+suffix after `zstd-` (`3`, `fast-10`, …); `fast` alone is the fast default
+(fast-1), matching the kernel's `zstd-fast` table entry.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr, EnumString)]
+#[repr(u8)]
+pub enum ZstdLevel {
+    #[strum(serialize = "1")]
+    L1 = 1,
+    #[strum(serialize = "2")]
+    L2,
+    #[strum(serialize = "3")]
+    L3,
+    #[strum(serialize = "4")]
+    L4,
+    #[strum(serialize = "5")]
+    L5,
+    #[strum(serialize = "6")]
+    L6,
+    #[strum(serialize = "7")]
+    L7,
+    #[strum(serialize = "8")]
+    L8,
+    #[strum(serialize = "9")]
+    L9,
+    #[strum(serialize = "10")]
+    L10,
+    #[strum(serialize = "11")]
+    L11,
+    #[strum(serialize = "12")]
+    L12,
+    #[strum(serialize = "13")]
+    L13,
+    #[strum(serialize = "14")]
+    L14,
+    #[strum(serialize = "15")]
+    L15,
+    #[strum(serialize = "16")]
+    L16,
+    #[strum(serialize = "17")]
+    L17,
+    #[strum(serialize = "18")]
+    L18,
+    #[strum(serialize = "19")]
+    L19,
+    #[strum(to_string = "fast-1", serialize = "fast")]
+    Fast1 = 103,
+    #[strum(serialize = "fast-2")]
+    Fast2,
+    #[strum(serialize = "fast-3")]
+    Fast3,
+    #[strum(serialize = "fast-4")]
+    Fast4,
+    #[strum(serialize = "fast-5")]
+    Fast5,
+    #[strum(serialize = "fast-6")]
+    Fast6,
+    #[strum(serialize = "fast-7")]
+    Fast7,
+    #[strum(serialize = "fast-8")]
+    Fast8,
+    #[strum(serialize = "fast-9")]
+    Fast9,
+    #[strum(serialize = "fast-10")]
+    Fast10,
+    #[strum(serialize = "fast-20")]
+    Fast20,
+    #[strum(serialize = "fast-30")]
+    Fast30,
+    #[strum(serialize = "fast-40")]
+    Fast40,
+    #[strum(serialize = "fast-50")]
+    Fast50,
+    #[strum(serialize = "fast-60")]
+    Fast60,
+    #[strum(serialize = "fast-70")]
+    Fast70,
+    #[strum(serialize = "fast-80")]
+    Fast80,
+    #[strum(serialize = "fast-90")]
+    Fast90,
+    #[strum(serialize = "fast-100")]
+    Fast100,
+    #[strum(serialize = "fast-500")]
+    Fast500,
+    #[strum(serialize = "fast-1000")]
+    Fast1000,
+}
+
 /// bp_embedded_type (spa.h): how to read an embedded blkptr's payload. Only
 /// `Data` carries a decodable payload; `Redacted`/`Reserved` do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]

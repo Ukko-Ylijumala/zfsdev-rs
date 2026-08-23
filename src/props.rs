@@ -12,7 +12,7 @@ props ZAPs alike; the names are the same in both worlds.
 */
 
 use crate::util::{fmt_unix_time, human_bytes};
-use crate::zfs::enums::{ZioChecksum, ZioCompress};
+use crate::zfs::enums::{ZioChecksum, ZioCompress, ZstdLevel};
 use crate::zfs::nvlist::NvData;
 use std::str::FromStr;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoEnumIterator};
@@ -308,9 +308,23 @@ impl_try_from_u64!(
 pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
     use ZfsProp as P;
     let s = match P::from_str(name).ok()? {
-        P::Compression => match u8::try_from(v) {
-            Ok(b) => ZioCompress::name(b),
-            Err(_) => format!("?{v}"),
+        /*
+        zstd carries its level in the property value above the algorithm
+        bits: `ZIO_COMPRESS_ZSTD | (zio_zstd_levels << SPA_COMPRESSBITS(7))`
+        — so `zstd-3` is stored as 400, not as an enum ordinal.
+        */
+        P::Compression => match (v & 0x7f, v >> 7) {
+            (_, 0) => match u8::try_from(v) {
+                Ok(b) => ZioCompress::name(b),
+                Err(_) => format!("?{v}"),
+            },
+            (base, level) if base == ZioCompress::Zstd as u64 => {
+                match u8::try_from(level).ok().and_then(ZstdLevel::from_repr) {
+                    Some(l) => format!("zstd-{l}"),
+                    None => format!("zstd-?{level}"),
+                }
+            }
+            _ => format!("?{v}"), // level bits on a level-less algorithm
         },
         P::Checksum => match u8::try_from(v) {
             Ok(b) => ZioChecksum::name(b),
@@ -534,12 +548,19 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
         }
 
         P::Compression => {
-            if input.eq_ignore_ascii_case("gzip") {
+            let lower = input.to_lowercase();
+            if lower == "gzip" {
                 // bare "gzip" is the kernel's alias for gzip-6 (compress_table)
                 return u64v(ZioCompress::Gzip6 as u64);
             }
+            // zstd-<level>: algorithm | (level << 7), see the display arm
+            if let Some(suffix) = lower.strip_prefix("zstd-") {
+                let level = ZstdLevel::from_str(suffix)
+                    .map_err(|_| format!("unknown zstd level '{suffix}'"))?;
+                return u64v(ZioCompress::Zstd as u64 | ((level as u64) << 7));
+            }
             ZioCompress::from_str(input)
-                .or_else(|_| ZioCompress::from_str(&input.to_lowercase()))
+                .or_else(|_| ZioCompress::from_str(&lower))
                 .map(|c| NvData::Uint64(c as u64))
                 .map_err(|_| format!("unknown compression '{input}'"))
         }
@@ -760,6 +781,9 @@ mod tests {
     fn known_mappings() {
         assert_eq!(format_prop_value("compression", 15).unwrap(), "lz4 (15)");
         assert_eq!(format_prop_value("compression", 16).unwrap(), "zstd (16)");
+        assert_eq!(format_prop_value("compression", 16 | (3 << 7)).unwrap(), "zstd-3 (400)");
+        assert_eq!(format_prop_value("compression", 16 | (112 << 7)).unwrap(),
+                   "zstd-fast-10 (14352)");
         assert_eq!(format_prop_value("checksum", 14).unwrap(), "blake3 (14)");
         assert_eq!(format_prop_value("xattr", 2).unwrap(), "sa (2)");
         assert_eq!(format_prop_value("atime", 0).unwrap(), "off (0)");
@@ -856,6 +880,12 @@ mod tests {
         assert!(parse_prop_value("dedup", "off,verify").is_err());
         // bare "gzip" is the gzip-6 alias
         assert_eq!(parse_prop_value("compression", "gzip").unwrap(), Uint64(10));
+        // zstd levels ride above the algorithm bits: 16 | (level << 7)
+        assert_eq!(parse_prop_value("compression", "zstd-3").unwrap(), Uint64(16 | (3 << 7)));
+        assert_eq!(parse_prop_value("compression", "zstd-19").unwrap(), Uint64(16 | (19 << 7)));
+        assert_eq!(parse_prop_value("compression", "zstd-fast-10").unwrap(), Uint64(16 | (112 << 7)));
+        assert_eq!(parse_prop_value("compression", "zstd-fast").unwrap(), Uint64(16 | (103 << 7)));
+        assert!(parse_prop_value("compression", "zstd-99").is_err());
         // sizes & limits
         assert_eq!(parse_prop_value("recordsize", "128K").unwrap(), Uint64(131072));
         assert_eq!(parse_prop_value("quota", "1G").unwrap(), Uint64(1 << 30));

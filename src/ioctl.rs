@@ -850,7 +850,18 @@ impl ZfsHandle {
             }
             let consumed = unpack_history(&buf[..bytes_read], &mut records)?;
             if consumed == 0 {
-                break; // a record larger than the buffer — avoid spinning
+                /*
+                A record larger than the whole buffer: grow and re-read the
+                same offset rather than silently truncating the history.
+                Real records are small; the cap keeps a corrupt on-disk
+                length from ballooning the allocation before the record is
+                dismissed as garbage.
+                */
+                if bytes_read == buf.len() && buf.len() < 16 * 1024 * 1024 {
+                    buf.resize(buf.len() * 2, 0);
+                    continue;
+                }
+                break; // short read or cap reached: corrupt trailing record
             }
             let leftover = (bytes_read - consumed) as u64;
             offset = zc.zc_history_offset.saturating_sub(leftover);
