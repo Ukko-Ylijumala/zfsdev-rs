@@ -467,6 +467,46 @@ impl DmuObjectType {
         }
         name_or_unknown!(DmuObjectType, v)
     }
+
+    /**
+    DMU_OT_IS_ENCRYPTED: whether level-0 blocks (and bonus buffers) of this
+    object type hold user data that native encryption encrypts, vs. metadata
+    that stays plaintext and is merely MAC-authenticated. Self-describing
+    DMU_OTN_* types (0x80 bit) carry it as the DMU_OT_ENCRYPTED flag (0x20);
+    legacy types mirror the `ot_encrypt` column of dmu.c's `dmu_ot` table.
+    Unknown legacy values report false (they'd be authenticated-only, which
+    fails safe: we never try to decrypt plaintext).
+    */
+    pub fn is_encrypted(v: u8) -> bool {
+        use DmuObjectType as T;
+        if v & 0x80 != 0 {
+            return v & 0x20 != 0;
+        }
+        matches!(
+            Self::from_repr(v),
+            Some(
+                T::IntentLog
+                    | T::Dnode
+                    | T::OldAcl
+                    | T::PlainFileContents
+                    | T::DirectoryContents
+                    | T::UnlinkedSet
+                    | T::Zvol
+                    | T::PlainOther
+                    | T::Uint64Other
+                    | T::Acl
+                    | T::Sysacl
+                    | T::Fuid
+                    | T::UsergroupUsed
+                    | T::UsergroupQuota
+                    | T::Sa
+                    | T::SaMasterNode
+                    | T::SaAttrRegistration
+                    | T::SaAttrLayouts
+                    | T::Dedup
+            )
+        )
+    }
 }
 
 /// pool_scan_func_t (zfs.h) - which maintenance scan is running.
