@@ -8,8 +8,15 @@ Direct `/dev/zfs` ioctl interface.
 Struct layouts mirror OpenZFS 2.2.2 (`doc/reference/zfs_ioctl.h`); the
 `zfs_cmd_t` ABI is not a committed stable interface across OpenZFS major
 versions, so layout changes must be tracked when supporting newer
-releases. Ioctl numbers (`0x5a00 + n`, `doc/reference/zfs.h`) live in the
-"legacy" range that has been stable since 2.0.
+releases. In practice the layout we mirror holds back to ZoL 0.7 (0.x is
+merely 8 bytes shorter, missing the *trailing* `zc_zoneid` — safe, since
+the kernel copies its own smaller sizeof in both directions); the per-era
+analyses live in `doc/reference/<version>/README.md`. The two pre-2.0
+decode differences (`dds_origin` offset, `pss_skipped` semantics) key off
+[`kernel_pre_2_0`], probed once from `/sys/module/zfs/version`. Ioctl
+numbers (`0x5a00 + n`, `doc/reference/zfs.h`) live in the "legacy" range
+that has been stable since at least 0.6.3 (2014), the platform range
+(`0x5a80`, events) included.
 
 Reads use the GET/LIST ioctls; the mutating ioctls (SET_PROP, CREATE,
 DESTROY, SNAPSHOT, …) are also defined. Write requests pass their
@@ -22,12 +29,14 @@ kernel (root, or a matching `zfs allow` delegation).
 use super::nvlist::{NvData, NvError, NvList};
 use super::props::VdevProp;
 use std::ffi::{CStr, CString};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::LazyLock;
 use thiserror::Error;
 
 const ZFS_DEV: &str = "/dev/zfs";
+const ZFS_MODULE_VERSION: &str = "/sys/module/zfs/version";
 
 const ZFS_IOC_POOL_CONFIGS: u64 = 0x5a04;
 const ZFS_IOC_POOL_STATS: u64 = 0x5a05;
@@ -631,6 +640,48 @@ fn cstr_field(buf: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/* ===== kernel module version probe ===== */
+
+/**
+The loaded ZFS module's release, from `/sys/module/zfs/version` (e.g.
+"2.2.2-0ubuntu9" or "0.8.6-1"). Only major.minor is kept — that is all the
+ABI-era decisions need. Read once per process; `None` when no module is
+loaded (e.g. pure `--device` runs, where nothing consults it either).
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl KernelVersion {
+    fn parse(s: &str) -> Option<KernelVersion> {
+        let mut parts = s.trim().split(['.', '-', '_']);
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        Some(KernelVersion { major, minor })
+    }
+}
+
+static KERNEL_VERSION: LazyLock<Option<KernelVersion>> =
+    LazyLock::new(|| fs::read_to_string(ZFS_MODULE_VERSION).ok().as_deref().and_then(KernelVersion::parse));
+
+/// The loaded module's version, if one could be probed.
+pub fn kernel_version() -> Option<KernelVersion> {
+    *KERNEL_VERSION
+}
+
+/**
+Is the loaded module a pre-2.0 ZoL release (0.6/0.7/0.8)? Gates the two
+kernel-decode differences of that era: `dmu_objset_stats_t` has no
+`dds_redacted` (so `dds_origin` sits one byte earlier), and
+`pool_scan_stat_t` slot 6 is `pss_to_process` rather than `pss_skipped`.
+An unprobeable version (no module) defaults to the modern layout.
+*/
+pub fn kernel_pre_2_0() -> bool {
+    KERNEL_VERSION.is_some_and(|v| v.major == 0)
+}
+
 /// Decoded `dmu_objset_stats_t` as filled in by OBJSET_STATS / LIST_NEXT.
 #[derive(Debug, Clone)]
 pub struct ObjsetStats {
@@ -645,18 +696,42 @@ pub struct ObjsetStats {
     pub origin: String,
 }
 
+impl DmuObjsetStatsRaw {
+    /**
+    Decode honoring the kernel's struct era. Pre-2.0 kernels have no
+    `dds_redacted` (added with redacted send), so they write `dds_origin`
+    one byte earlier — starting at the offset our `dds_redacted` field
+    mirrors (total size is unchanged: the tail padding absorbs the byte).
+    Decoding an 0.x fill with the 2.x layout would misread a clone's
+    origin's first character as `redacted` and truncate the origin, so on
+    pre-2.0 the origin is re-joined from that byte and redacted is false
+    (the feature does not exist there). See `doc/reference/0.8/README.md`.
+    */
+    fn decode(&self, pre_2_0: bool) -> ObjsetStats {
+        let (redacted, origin) = if pre_2_0 {
+            let mut buf = [0u8; MAXNAMELEN];
+            buf[0] = self.dds_redacted;
+            buf[1..].copy_from_slice(&self.dds_origin[..MAXNAMELEN - 1]);
+            (false, cstr_field(&buf))
+        } else {
+            (self.dds_redacted != 0, cstr_field(&self.dds_origin))
+        };
+        ObjsetStats {
+            num_clones: self.dds_num_clones,
+            creation_txg: self.dds_creation_txg,
+            guid: self.dds_guid,
+            objset_type: self.dds_type,
+            is_snapshot: self.dds_is_snapshot != 0,
+            inconsistent: self.dds_inconsistent != 0,
+            redacted,
+            origin,
+        }
+    }
+}
+
 impl From<&DmuObjsetStatsRaw> for ObjsetStats {
     fn from(raw: &DmuObjsetStatsRaw) -> Self {
-        ObjsetStats {
-            num_clones: raw.dds_num_clones,
-            creation_txg: raw.dds_creation_txg,
-            guid: raw.dds_guid,
-            objset_type: raw.dds_type,
-            is_snapshot: raw.dds_is_snapshot != 0,
-            inconsistent: raw.dds_inconsistent != 0,
-            redacted: raw.dds_redacted != 0,
-            origin: cstr_field(&raw.dds_origin),
-        }
+        raw.decode(kernel_pre_2_0())
     }
 }
 
@@ -1813,6 +1888,47 @@ impl ZfsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_version_parse() {
+        let v = |s| KernelVersion::parse(s);
+        assert_eq!(v("2.2.2-0ubuntu9.1"), Some(KernelVersion { major: 2, minor: 2 }));
+        assert_eq!(v("0.8.6-1\n"), Some(KernelVersion { major: 0, minor: 8 }));
+        assert_eq!(v("2.3.0-rc4"), Some(KernelVersion { major: 2, minor: 3 }));
+        assert_eq!(v("garbage"), None);
+        assert_eq!(v(""), None);
+    }
+
+    /**
+    A pre-2.0 kernel writes `dds_origin` one byte earlier (no
+    `dds_redacted`), i.e. its first character lands in our `dds_redacted`
+    mirror field. The pre-2.0 decode must re-join it; the modern decode
+    must be unaffected.
+    */
+    #[test]
+    fn objset_stats_origin_pre_2_0_shift() {
+        let mut raw = DmuObjsetStatsRaw {
+            dds_num_clones: 1,
+            dds_creation_txg: 42,
+            dds_guid: 7,
+            dds_type: 2,
+            dds_is_snapshot: 0,
+            dds_inconsistent: 0,
+            dds_redacted: b'p', // an 0.x kernel's origin[0]
+            dds_origin: [0; MAXNAMELEN],
+        };
+        raw.dds_origin[..11].copy_from_slice(b"ool/ds@snap");
+        let old = raw.decode(true);
+        assert_eq!(old.origin, "pool/ds@snap");
+        assert!(!old.redacted);
+        // same bytes read as a modern fill: redacted flag + origin verbatim
+        let new = raw.decode(false);
+        assert_eq!(new.origin, "ool/ds@snap");
+        assert!(new.redacted);
+        // a pre-2.0 fill with NO origin: first byte is the NUL terminator
+        raw.dds_redacted = 0;
+        assert_eq!(raw.decode(true).origin, "");
+    }
 
     /// A synthetic little-endian BEGIN record: type/payloadlen header, then
     /// drr_begin at offset 8 (magic 0, toguid 32, fromguid 40, toname 48).
