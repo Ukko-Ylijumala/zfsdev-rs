@@ -29,6 +29,7 @@ kernel (root, or a matching `zfs allow` delegation).
 use super::enums::PoolScanFunc;
 use super::nvlist::{NvData, NvError, NvList};
 use super::props::VdevProp;
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -843,6 +844,15 @@ pub struct DatasetEntry {
 
 pub struct ZfsHandle {
     file: File,
+    /**
+    Output-buffer size to start the next nvlist read with: the largest reply
+    this handle has needed (plus headroom). A pool with more than ~28 vdevs
+    returns a POOL_STATS config (≈8–9 KiB of `vdev_stats_ex` per vdev) past
+    `DST_INITIAL`, and every call then paid a full ENOMEM round trip — the
+    kernel generating the whole config twice — on each sampler tick and
+    heartbeat. Per handle, like the fd (handles aren't shared across threads).
+    */
+    dst_hint: Cell<usize>,
 }
 
 impl ZfsHandle {
@@ -852,7 +862,7 @@ impl ZfsHandle {
             .write(true)
             .open(ZFS_DEV)
             .map_err(ZfsError::Open)?;
-        Ok(ZfsHandle { file })
+        Ok(ZfsHandle { file, dst_hint: Cell::new(DST_INITIAL) })
     }
 
     fn ioctl(&self, ioc: u64, zc: &mut ZfsCmd) -> io::Result<()> {
@@ -893,7 +903,7 @@ impl ZfsHandle {
         entries — libzfs's zfs_do_list_ioctl restores exactly these two.
         */
         let (orig_name, orig_cookie) = (zc.zc_name, zc.zc_cookie);
-        let mut dst: Vec<u8> = vec![0; DST_INITIAL];
+        let mut dst: Vec<u8> = vec![0; self.dst_hint.get()];
         loop {
             zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
             zc.zc_nvlist_dst_size = dst.len() as u64;
@@ -901,6 +911,11 @@ impl ZfsHandle {
             match self.ioctl(ioc, zc) {
                 Ok(()) => {
                     let len = (zc.zc_nvlist_dst_size as usize).min(dst.len());
+                    // remember a big reply (+1/8 headroom for growth) so the
+                    // next one fits first time
+                    if len + len / 8 > self.dst_hint.get() {
+                        self.dst_hint.set(len + len / 8);
+                    }
                     return Ok(NvList::unpack(&dst[..len])?);
                 }
                 Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
