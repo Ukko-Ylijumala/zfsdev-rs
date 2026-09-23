@@ -25,21 +25,25 @@ userspace buffer is safe in both directions against a 13736-byte kernel:
 copy-in reads 8 bytes less, copy-out writes 8 bytes less and our (unused,
 zero-initialized) `zc_zoneid` just stays zero. **No versioned layout.**
 
-## The two real decode deltas (both pre-2.0-wide, shimmed in `ioctl.rs`)
+## The two real decode deltas
 
 1. **`dmu_objset_stats_t` has no `dds_redacted`** (2.0, redacted send), so
    `dds_origin` starts at byte offset 30 instead of 31 (total size stays
    288 — tail padding absorbs it). Decoding with the 2.x layout reads a
    clone's origin's first character as `redacted` and truncates the origin.
-2. **`pool_scan_stat_t` slot 6 is `pss_to_process`**, not `pss_skipped`
-   (repurposed in 2.0's scrub accounting). The 2.x denominator
-   `to_examine − skipped` collapses to ~0 on 0.8; pre-2.0 the denominator
-   is plain `pss_to_examine` (what 0.8's `zpool status` shows). Slots 13/14
-   (`pss_pass_issued`/`pss_issued`) exist — 0.8 is the release that
-   introduced issued-based scrub progress — so the rest of the math holds.
+2. **`pool_scan_stat_t` slot 6 is `pss_to_process`**, not `pss_skipped`.
+   This is NOT 0.8-specific: the vendored 2.0 and 2.1 headers still have
+   `pss_to_process` and the 15-word layout; 2.2 renamed slot 6 to
+   `pss_skipped` in the same change that appended the error-scrub fields
+   (22 words). The 2.2 denominator `to_examine − skipped` would misread it,
+   so pre-2.2 the denominator is plain `pss_to_examine` (what those
+   kernels' `zpool status` shows). Slots 13/14 (`pss_pass_issued`/
+   `pss_issued`) exist — 0.8 is the release that introduced issued-based
+   scrub progress — so the rest of the math holds.
 
-Both key off one runtime fact (kernel older than 2.0), probed once from
-`/sys/module/zfs/version`.
+Delta 1 keys off the kernel version (older than 2.0, probed once from
+`/sys/module/zfs/version`, shimmed in `ioctl.rs`); delta 2 keys off the
+`scan_stats` array length (`node.rs::scan_skipped`), which needs no probe.
 
 ## What was verified unchanged
 
