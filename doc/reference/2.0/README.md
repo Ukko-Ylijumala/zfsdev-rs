@@ -30,8 +30,9 @@ two that don't exist yet:
 - `pool_scan_stat_t` ends at field 14 (`pss_issued`) — the error-scrub
   fields (15..=21, `zpool scrub -e`) don't exist. `scan_stat_rows` reads
   via `.get()` with zero defaults and skips the error-scrub block.
-- `vdev_stat_t` ends at `vs_pspace`-minus-two: `vs_noalloc`/`vs_pspace` are
-  2.2 appends; everything we index is in the common prefix.
+- `vdev_stat_t` ends at `vs_physical_ashift` (45 words): `vs_pspace` is a
+  2.1 append (at 45) and 2.2 inserted `vs_noalloc` before it (pspace → 46);
+  both are decoded by array length, so a 2.0 kernel simply has neither.
 - `head_errlog` pools can't exist on 2.0 — the error-log viewer's legacy
   format is what a 2.0 kernel serves.
 - Props/enums newer than 2.0 return `EINVAL`/render `?N`, as designed.

@@ -50,9 +50,12 @@ Both key off one runtime fact (kernel older than 2.0), probed once from
   unassigned on 0.8 → clean kernel rejection (the documented pre-2.2
   degrade).
 - **`vdev_stat_t`**: the 0.8 field list is a strict prefix of 2.2's in
-  identical order (2.0/2.2 only *append* — rebuild, ashift trio, noalloc,
-  pspace). Trim/initialize state indices (30/39) are valid. Shorter array
-  → the `.get()` decodes degrade.
+  identical order up to `vs_physical_ashift` (2.0 appends rebuild + the
+  ashift trio, 2.1 appends `vs_pspace` at 45). 2.2 then *inserts*
+  `vs_noalloc` at 45, pushing pspace to 46 — NOT an append, so those two
+  are decoded by array length (`node.rs::VS_LEN_WITH_NOALLOC`).
+  Trim/initialize state indices (30/39) are valid. Shorter array → the
+  `.get()` decodes degrade.
 - **Strict innvl validation (`zfs_keys_*`, introduced in 0.8)**: every key
   we pass was checked against 0.8.6's `zfs_ioctl.c` tables — send_new
   (`fd fromsnap largeblockok embedok compressok rawok`), recv_new
