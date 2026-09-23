@@ -371,11 +371,19 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
             0 => "auto".into(),
             _ => return None,
         },
-        P::Quota
-        | P::Reservation
-        | P::Refquota
-        | P::Refreservation
-        | P::Used
+        // 0 = unset for the quota/reservation family only (zfs get: "none")
+        P::Quota | P::Reservation | P::Refquota | P::Refreservation => {
+            if v == 0 { "none".into() } else { human_bytes(v) }
+        }
+        // counts, not sizes; UINT64_MAX is the "none" default
+        P::FilesystemLimit | P::SnapshotLimit => {
+            if v == u64::MAX { "none".into() } else { v.to_string() }
+        }
+        // 0 is a real value here (no small blocks go special), shown as-is
+        P::SpecialSmallBlocks => {
+            if v == 0 { "0".into() } else { human_bytes(v) }
+        }
+        P::Used
         | P::Available
         | P::Referenced
         | P::UsedBySnapshots
@@ -388,9 +396,6 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
         | P::Written
         | P::LogicalUsed
         | P::LogicalReferenced
-        | P::SpecialSmallBlocks
-        | P::FilesystemLimit
-        | P::SnapshotLimit
         | P::Size
         | P::Free
         | P::Allocated
@@ -398,13 +403,7 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
         | P::Leaked
         | P::Checkpoint
         | P::BcloneUsed
-        | P::BcloneSaved => {
-            if v == 0 {
-                "none".into()
-            } else {
-                human_bytes(v)
-            }
-        }
+        | P::BcloneSaved => human_bytes(v), // a real 0B, as zfs get shows it
 
         P::Creation => fmt_unix_time(v),
         P::CompressRatio | P::RefCompressRatio | P::BcloneRatio => {
@@ -850,7 +849,11 @@ mod tests {
         assert_eq!(format_prop_value("normalization", 0x10).unwrap(), "formD (16)");
         assert_eq!(format_prop_value("normalization", 0x50).unwrap(), "formC (80)");
         assert_eq!(format_prop_value("normalization", 0x60).unwrap(), "formKC (96)");
-        assert_eq!(format_prop_value("special_small_blocks", 0).unwrap(), "none (0)");
+        assert_eq!(format_prop_value("special_small_blocks", 0).unwrap(), "0 (0)");
+        assert_eq!(format_prop_value("quota", 0).unwrap(), "none (0)");
+        assert_eq!(format_prop_value("written", 0).unwrap(), "0B (0)");
+        assert_eq!(format_prop_value("snapshot_limit", u64::MAX).unwrap(), format!("none ({})", u64::MAX));
+        assert_eq!(format_prop_value("filesystem_limit", 12).unwrap(), "12 (12)");
         assert_eq!(format_prop_value("no_such_prop", 7), None);
         // out-of-range enum value falls back to raw display
         assert_eq!(format_prop_value("canmount", 9), None);
