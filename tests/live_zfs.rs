@@ -128,6 +128,31 @@ fn datasets_and_snapshots_enumerate() {
     }
 }
 
+/// The zc_simple (fast-stat) snapshot listing agrees with the full one on
+/// everything its callers use: names, guids, creation txgs.
+#[test]
+fn snapshot_stats_match_full_listing() {
+    let Some(zfs) = handle() else { return };
+    let mut targets: Vec<String> =
+        zfs.pool_configs().expect("pool configs").iter().map(|p| p.name.clone()).collect();
+    if zfs.objset_stats("data/test").is_ok() {
+        targets.push("data/test".into()); // the delegated playground has a few
+    }
+    for name in &targets {
+        let key = |v: Vec<zfs_browser::zfs::ioctl::DatasetEntry>| {
+            let mut k: Vec<_> =
+                v.into_iter().map(|e| (e.name, e.stats.guid, e.stats.creation_txg)).collect();
+            k.sort();
+            k
+        };
+        let full = key(zfs.snapshots(name).expect("full listing"));
+        let fast = key(zfs.snapshot_stats(name).expect("fast listing"));
+        assert_eq!(fast, full, "{name}: fast snapshot stats differ");
+        assert!(fast.iter().all(|(_, g, _)| *g != 0));
+        eprintln!("{name}: {} snapshot(s) agree", fast.len());
+    }
+}
+
 #[test]
 fn on_disk_labels_match_ioctl_config() {
     use zfs_browser::zfs::ondisk::label::read_device_labels;

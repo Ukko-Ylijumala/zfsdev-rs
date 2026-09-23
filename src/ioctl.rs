@@ -1468,22 +1468,48 @@ impl ZfsHandle {
 
     /// Direct child datasets of `parent` (ZFS_IOC_DATASET_LIST_NEXT).
     pub fn datasets(&self, parent: &str) -> Result<Vec<DatasetEntry>> {
-        self.list_next(ZFS_IOC_DATASET_LIST_NEXT, parent)
+        self.list_next(ZFS_IOC_DATASET_LIST_NEXT, parent, false)
     }
 
-    /// Snapshots of `dataset` (ZFS_IOC_SNAPSHOT_LIST_NEXT).
+    /// Snapshots of `dataset` (ZFS_IOC_SNAPSHOT_LIST_NEXT), with all props.
     pub fn snapshots(&self, dataset: &str) -> Result<Vec<DatasetEntry>> {
-        self.list_next(ZFS_IOC_SNAPSHOT_LIST_NEXT, dataset)
+        self.list_next(ZFS_IOC_SNAPSHOT_LIST_NEXT, dataset, false)
     }
 
-    fn list_next(&self, ioc: u64, parent: &str) -> Result<Vec<DatasetEntry>> {
+    /**
+    Snapshots of `dataset` with just their fast stats (name, guid,
+    creation_txg, ... — `props` empty): SNAPSHOT_LIST_NEXT with `zc_simple`,
+    which fills `dsl_dataset_fast_stat` and skips opening each snapshot's
+    objset and gathering every property (what `zfs list -t snap -o name`
+    uses). Everything that only sorts/pairs snapshots wants this. Falls back
+    to the full listing if the kernel left a guid unset (simple mode's
+    fast-stat fill isn't vendored for pre-2.2 kernels, so don't trust it).
+    */
+    pub fn snapshot_stats(&self, dataset: &str) -> Result<Vec<DatasetEntry>> {
+        let fast = self.list_next(ZFS_IOC_SNAPSHOT_LIST_NEXT, dataset, true)?;
+        if fast.iter().any(|e| e.stats.guid == 0) {
+            return self.snapshots(dataset);
+        }
+        Ok(fast)
+    }
+
+    fn list_next(&self, ioc: u64, parent: &str, simple: bool) -> Result<Vec<DatasetEntry>> {
         let mut out = Vec::new();
         let mut cookie = 0u64;
         loop {
             let mut zc = ZfsCmd::new();
             zc.set_name(parent)?;
             zc.zc_cookie = cookie;
-            match self.ioctl_nv(ioc, &mut zc) {
+            let listed = if simple {
+                // no props nvlist comes back in simple mode: pass no dst buffer
+                zc.zc_simple = 1;
+                self.ioctl(ioc, &mut zc)
+                    .map(|()| NvList::default())
+                    .map_err(|err| ZfsError::Ioctl { ioc, name: zc.name(), err })
+            } else {
+                self.ioctl_nv(ioc, &mut zc)
+            };
+            match listed {
                 Ok(props) => {
                     cookie = zc.zc_cookie;
                     out.push(DatasetEntry {
