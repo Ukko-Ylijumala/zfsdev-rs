@@ -193,16 +193,30 @@ macro_rules! value_enum {
 }
 
 value_enum!(Canmount { Off = 0, On, NoAuto });
-value_enum!(AclMode { Discard = 0, GroupMask, Passthrough, Restricted });
+/*
+aclmode/aclinherit share the ZFS_ACL_* value space (zfs_acl.h: DISCARD 0,
+NOALLOW 1, GROUPMASK 2, PASSTHROUGH 3, RESTRICTED 4, PASSTHROUGH_X 5) and each
+table uses a sparse subset of it — NOT dense 0..n. The kernel only checks that
+an index maps to *some* name, so a wrong discriminant here silently sets a
+different ACL policy. Aliases per zfs_prop.c (`secure`, `noacl`, …).
+*/
+value_enum!(AclMode { Discard = 0, GroupMask = 2, Passthrough = 3, Restricted = 4 });
 value_enum!(AclInherit {
     Discard = 0,
-    NoAllow,
-    Restricted,
-    Passthrough,
+    NoAllow = 1,
+    Passthrough = 3,
+    #[strum(to_string = "restricted", serialize = "secure")]
+    Restricted = 4,
     #[strum(serialize = "passthrough-x")]
-    PassthroughX,
+    PassthroughX = 5,
 });
-value_enum!(AclType { Off = 0, Posix, Nfsv4 });
+value_enum!(AclType {
+    #[strum(to_string = "off", serialize = "disabled", serialize = "noacl")]
+    Off = 0,
+    #[strum(to_string = "posix", serialize = "posixacl")]
+    Posix = 1,
+    Nfsv4 = 2,
+});
 value_enum!(XattrMode {
     Off = 0,
     // displays as "on (dir)"; the kernel accepts (and libzfs prints) both
@@ -807,7 +821,11 @@ mod tests {
         assert_eq!(format_prop_value("xattr", 2).unwrap(), "sa (2)");
         assert_eq!(format_prop_value("atime", 0).unwrap(), "off (0)");
         assert_eq!(format_prop_value("recordsize", 131072).unwrap(), "128K (131072)");
-        assert_eq!(format_prop_value("aclinherit", 4).unwrap(), "passthrough-x (4)");
+        // ZFS_ACL_* values are sparse: restricted = 4 (the aclinherit default)
+        assert_eq!(format_prop_value("aclinherit", 4).unwrap(), "restricted (4)");
+        assert_eq!(format_prop_value("aclinherit", 5).unwrap(), "passthrough-x (5)");
+        assert_eq!(format_prop_value("aclmode", 3).unwrap(), "passthrough (3)");
+        assert_eq!(format_prop_value("aclmode", 1), None); // noallow isn't an aclmode
         // normalization stores u8_textprep flags, not a dense enum
         assert_eq!(format_prop_value("normalization", 0x10).unwrap(), "formD (16)");
         assert_eq!(format_prop_value("normalization", 0x50).unwrap(), "formC (80)");
@@ -924,6 +942,14 @@ mod tests {
         assert_eq!(parse_prop_value("xattr", "on").unwrap(), Uint64(1));
         assert_eq!(parse_prop_value("xattr", "dir").unwrap(), Uint64(1));
         assert_eq!(parse_prop_value("xattr", "sa").unwrap(), Uint64(2));
+        // ACL policies land on the sparse ZFS_ACL_* values, aliases included
+        assert_eq!(parse_prop_value("aclinherit", "passthrough-x").unwrap(), Uint64(5));
+        assert_eq!(parse_prop_value("aclinherit", "secure").unwrap(), Uint64(4));
+        assert_eq!(parse_prop_value("aclmode", "passthrough").unwrap(), Uint64(3));
+        assert_eq!(parse_prop_value("aclmode", "restricted").unwrap(), Uint64(4));
+        assert_eq!(parse_prop_value("aclmode", "groupmask").unwrap(), Uint64(2));
+        assert_eq!(parse_prop_value("acltype", "posixacl").unwrap(), Uint64(1));
+        assert_eq!(parse_prop_value("acltype", "noacl").unwrap(), Uint64(0));
         // encryption suites at their zio_encrypt values
         assert_eq!(parse_prop_value("encryption", "aes-256-gcm").unwrap(), Uint64(8));
         assert_eq!(parse_prop_value("encryption", "off").unwrap(), Uint64(2));
