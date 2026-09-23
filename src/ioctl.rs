@@ -182,17 +182,28 @@ fn collect_element_errors(nv: &NvList, out: &mut Vec<String>) {
     }
 }
 
-/// A human hint for the errnos write ioctls commonly return.
-fn errno_hint(err: &io::Error) -> &'static str {
-    match err.raw_os_error() {
-        Some(libc::EPERM) | Some(libc::EACCES) => {
+/**
+A human hint for the errnos write ioctls commonly return. `op` disambiguates
+the few errnos whose meaning depends on the operation: LOAD_KEY reports a
+wrong key/passphrase as EACCES (dsl_crypt.c: the unwrap MAC failed), which
+would otherwise read as a permission problem (that is EPERM), and a scrub
+start on a busy pool is EBUSY because a scan is already running.
+*/
+fn errno_hint(op: &str, err: &io::Error) -> &'static str {
+    match (op, err.raw_os_error()) {
+        ("load key", Some(libc::EACCES)) => " (wrong key or passphrase)",
+        ("scrub", Some(libc::EBUSY)) => " (a scrub or resilver is already running)",
+        (_, Some(libc::EPERM) | Some(libc::EACCES)) => {
             " (need root, or a `zfs allow` delegation for this operation)"
         }
-        Some(libc::EEXIST) => " (already exists)",
-        Some(libc::ENOENT) => " (no such pool/dataset)",
-        Some(libc::EBUSY) => " (busy — mounted, held, or has children)",
-        Some(libc::ENAMETOOLONG) => " (name too long)",
-        Some(libc::EINVAL) => " (invalid argument — bad name or property value?)",
+        (_, Some(libc::EEXIST)) => " (already exists)",
+        (_, Some(libc::ENOENT)) => " (no such pool/dataset)",
+        (_, Some(libc::EBUSY)) => " (busy — mounted, held, or has children)",
+        (_, Some(libc::ETXTBSY)) => {
+            " (destination modified since its latest snapshot — roll it back first)"
+        }
+        (_, Some(libc::ENAMETOOLONG)) => " (name too long)",
+        (_, Some(libc::EINVAL)) => " (invalid argument — bad name or property value?)",
         _ => "",
     }
 }
@@ -1534,7 +1545,7 @@ impl ZfsHandle {
                         .filter(|d| !d.is_empty())
                         .map(|d| format!(" — {d}"))
                         .unwrap_or_default();
-                    return Err(ZfsError::Op(format!("{op}: {err}{}{detail}", errno_hint(&err))));
+                    return Err(ZfsError::Op(format!("{op}: {err}{}{detail}", errno_hint(op, &err))));
                 }
             }
         }
@@ -1838,7 +1849,9 @@ impl ZfsHandle {
         zc.set_name(pool)?;
         zc.zc_guid = guid;
         self.ioctl(ZFS_IOC_VDEV_DETACH, &mut zc)
-            .map_err(|err| ZfsError::Op(format!("detach vdev: {err}{}", errno_hint(&err))))?;
+            .map_err(|err| {
+                ZfsError::Op(format!("detach vdev: {err}{}", errno_hint("detach vdev", &err)))
+            })?;
         Ok(())
     }
 
@@ -1872,7 +1885,7 @@ impl ZfsHandle {
         let op = if replacing { "replace vdev" } else { "attach vdev" };
         // `conf` outlives the ioctl (dropped at fn end)
         self.ioctl(ZFS_IOC_VDEV_ATTACH, &mut zc)
-            .map_err(|err| ZfsError::Op(format!("{op}: {err}{}", errno_hint(&err))))?;
+            .map_err(|err| ZfsError::Op(format!("{op}: {err}{}", errno_hint(op, &err))))?;
         Ok(())
     }
 
@@ -1898,7 +1911,7 @@ impl ZfsHandle {
         match self.ioctl(ZFS_IOC_POOL_SCAN, &mut zc) {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::ECANCELED) && scrub && !pause => Ok(()),
-            Err(err) => Err(ZfsError::Op(format!("scrub: {err}{}", errno_hint(&err)))),
+            Err(err) => Err(ZfsError::Op(format!("scrub: {err}{}", errno_hint("scrub", &err)))),
         }
     }
 
@@ -1967,6 +1980,15 @@ impl ZfsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EACCES from LOAD_KEY is a wrong key, not a permission problem.
+    #[test]
+    fn errno_hint_is_operation_aware() {
+        let e = |n| io::Error::from_raw_os_error(n);
+        assert_eq!(errno_hint("load key", &e(libc::EACCES)), " (wrong key or passphrase)");
+        assert!(errno_hint("create", &e(libc::EACCES)).contains("zfs allow"));
+        assert!(errno_hint("scrub", &e(libc::EBUSY)).contains("already running"));
+    }
 
     /// A failed write ioctl's outnvl names each failed element + its errno,
     /// flattening trim/initialize's nested per-vdev list, capped.
