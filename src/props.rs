@@ -50,6 +50,9 @@ enum ZfsProp {
     FilesystemLimit,
     #[strum(serialize = "snapshot_limit")]
     SnapshotLimit,
+    // small numbers the kernel wants as uint64 (a string is EINVAL)
+    Copies,
+    Ashift,
     Size,
     Free,
     Allocated,
@@ -362,6 +365,12 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
             }
         }
 
+        // plain small numbers: the raw value says it all (ashift 0 = auto)
+        P::Copies => return None,
+        P::Ashift => match v {
+            0 => "auto".into(),
+            _ => return None,
+        },
         P::Quota
         | P::Reservation
         | P::Refquota
@@ -566,6 +575,17 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
                     .and_then(u64v)
             }
         }
+
+        // index prop, copies_table "1".."3" (zfs_prop.c)
+        P::Copies => match input.parse::<u64>() {
+            Ok(n @ 1..=3) => u64v(n),
+            _ => Err(format!("invalid copies '{input}' (1, 2 or 3)")),
+        },
+        // pool: 0 = auto, else ASHIFT_MIN..=ASHIFT_MAX (spa_prop_validate)
+        P::Ashift => match input.parse::<u64>() {
+            Ok(n @ (0 | 9..=16)) => u64v(n),
+            _ => Err(format!("invalid ashift '{input}' (0 = auto, or 9..16)")),
+        },
 
         P::Compression => {
             let lower = input.to_lowercase();
@@ -950,6 +970,12 @@ mod tests {
         assert_eq!(parse_prop_value("aclmode", "groupmask").unwrap(), Uint64(2));
         assert_eq!(parse_prop_value("acltype", "posixacl").unwrap(), Uint64(1));
         assert_eq!(parse_prop_value("acltype", "noacl").unwrap(), Uint64(0));
+        // index/number props must go out as uint64 — a string is EINVAL
+        assert_eq!(parse_prop_value("copies", "2").unwrap(), Uint64(2));
+        assert!(parse_prop_value("copies", "4").is_err());
+        assert_eq!(parse_prop_value("ashift", "12").unwrap(), Uint64(12));
+        assert_eq!(parse_prop_value("ashift", "0").unwrap(), Uint64(0));
+        assert!(parse_prop_value("ashift", "8").is_err());
         // encryption suites at their zio_encrypt values
         assert_eq!(parse_prop_value("encryption", "aes-256-gcm").unwrap(), Uint64(8));
         assert_eq!(parse_prop_value("encryption", "off").unwrap(), Uint64(2));
