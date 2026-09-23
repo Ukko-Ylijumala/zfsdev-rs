@@ -222,6 +222,43 @@ impl PoolState {
     }
 }
 
+/**
+VDEV_TYPE_* (zfs.h) — the string `type` of every vdev_tree nvlist node.
+String-valued (no repr), parsed with `FromStr`; a type a newer kernel adds
+simply fails to parse.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
+#[strum(serialize_all = "lowercase")]
+pub enum VdevType {
+    Root,
+    Mirror,
+    Replacing,
+    Raidz,
+    Draid,
+    #[strum(serialize = "dspare")]
+    DraidSpare,
+    Disk,
+    File,
+    Missing,
+    Hole,
+    Spare,
+    Log,
+    L2cache,
+    Indirect,
+}
+
+impl VdevType {
+    /**
+    A leaf the kernel will trim/initialize: `vdev_op_leaf && vdev_is_concrete`
+    (spa_vdev_{trim,initialize}_impl). Holes, removed (indirect) and missing
+    vdevs aren't concrete, and a distributed spare is a virtual leaf backed by
+    the whole dRAID — it has no device of its own.
+    */
+    pub fn is_concrete_leaf(self) -> bool {
+        matches!(self, VdevType::Disk | VdevType::File)
+    }
+}
+
 /// vdev_state_t (zfs.h)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
 #[strum(serialize_all = "UPPERCASE")]
