@@ -769,9 +769,6 @@ pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(lower.len());
     let (num, suffix) = lower.split_at(split);
-    let base: f64 = num
-        .parse()
-        .map_err(|_| format!("invalid number in '{s}'"))?;
     let shift = match suffix.trim().trim_end_matches('b').trim() {
         "" => 0,
         "k" => 10,
@@ -782,7 +779,18 @@ pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
         "e" => 60,
         _ => return Err(format!("unknown size suffix in '{s}'")),
     };
-    Ok((base * (1u64 << shift) as f64) as u64)
+    let too_big = || format!("size '{s}' is too large");
+    // an integer stays exact (f64 loses bytes past 2^53); overflow is an error
+    if let Ok(n) = num.parse::<u64>() {
+        return n.checked_mul(1u64 << shift).ok_or_else(too_big);
+    }
+    let base: f64 = num.parse().map_err(|_| format!("invalid number in '{s}'"))?;
+    let v = base * (1u64 << shift) as f64;
+    // `as u64` would silently saturate an overflow to u64::MAX
+    if !(0.0..u64::MAX as f64).contains(&v) {
+        return Err(too_big());
+    }
+    Ok(v as u64)
 }
 
 /// checksum property values (ZIO_CHECKSUM_* in zfs.h), settable subset.
@@ -850,6 +858,11 @@ mod tests {
         assert_eq!(format_prop_value("normalization", 0x50).unwrap(), "formC (80)");
         assert_eq!(format_prop_value("normalization", 0x60).unwrap(), "formKC (96)");
         assert_eq!(format_prop_value("special_small_blocks", 0).unwrap(), "0 (0)");
+        // sizes: integers exact past 2^53, fractions fine, overflow refused
+        assert_eq!(parse_size("9007199254740993").unwrap(), 9_007_199_254_740_993);
+        assert_eq!(parse_size("1.5G").unwrap(), 3 << 29);
+        assert_eq!(parse_size("8K").unwrap(), 8192);
+        assert!(parse_size("20E").is_err() && parse_size("1e30").is_err());
         assert_eq!(format_prop_value("quota", 0).unwrap(), "none (0)");
         assert_eq!(format_prop_value("written", 0).unwrap(), "0B (0)");
         assert_eq!(format_prop_value("snapshot_limit", u64::MAX).unwrap(), format!("none ({})", u64::MAX));
