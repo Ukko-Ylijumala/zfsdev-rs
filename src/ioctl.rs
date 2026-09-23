@@ -721,11 +721,12 @@ pub fn kernel_version() -> Option<KernelVersion> {
 }
 
 /**
-Is the loaded module a pre-2.0 ZoL release (0.6/0.7/0.8)? Gates the two
-kernel-decode differences of that era: `dmu_objset_stats_t` has no
-`dds_redacted` (so `dds_origin` sits one byte earlier), and
-`pool_scan_stat_t` slot 6 is `pss_to_process` rather than `pss_skipped`.
-An unprobeable version (no module) defaults to the modern layout.
+Is the loaded module a pre-2.0 ZoL release (0.6/0.7/0.8)? Gates the
+kernel-decode difference of that era: `dmu_objset_stats_t` has no
+`dds_redacted` (so `dds_origin` sits one byte earlier). (The other
+version-dependent layouts — `vdev_stat_t` noalloc/pspace, `pool_scan_stat_t`
+slot 6 — are keyed off the arrays' lengths instead, in node.rs.) An
+unprobeable version (no module) defaults to the modern layout.
 */
 pub fn kernel_pre_2_0() -> bool {
     KERNEL_VERSION.is_some_and(|v| v.major == 0)
