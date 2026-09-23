@@ -146,6 +146,42 @@ pub enum ZfsError {
 
 type Result<T> = std::result::Result<T, ZfsError>;
 
+/// Per-element errors shown from a failed write ioctl's outnvl, at most.
+const MAX_ELEMENT_ERRORS: usize = 4;
+
+/**
+Render a failed write ioctl's per-element errors nvlist as
+`name: <errno text>; …` (capped at `MAX_ELEMENT_ERRORS`, with a "+N more"
+tail). Errno values arrive as int32/int64 (both appear); a nested nvlist
+(trim/initialize's `trim_vdevs` → guid → errno) is flattened one level.
+*/
+fn element_errors(nv: &NvList) -> String {
+    let mut items = Vec::new();
+    collect_element_errors(nv, &mut items);
+    let more = items.len().saturating_sub(MAX_ELEMENT_ERRORS);
+    items.truncate(MAX_ELEMENT_ERRORS);
+    if more > 0 {
+        items.push(format!("+{more} more"));
+    }
+    items.join("; ")
+}
+
+fn collect_element_errors(nv: &NvList, out: &mut Vec<String>) {
+    for p in &nv.pairs {
+        let errno = match &p.data {
+            NvData::Int32(e) => *e,
+            NvData::Int64(e) => *e as i32,
+            NvData::Uint64(e) => *e as i32,
+            NvData::List(sub) => {
+                collect_element_errors(sub, out);
+                continue;
+            }
+            _ => continue,
+        };
+        out.push(format!("{}: {}", p.name, io::Error::from_raw_os_error(errno)));
+    }
+}
+
 /// A human hint for the errnos write ioctls commonly return.
 fn errno_hint(err: &io::Error) -> &'static str {
     match err.raw_os_error() {
@@ -1482,7 +1518,23 @@ impl ZfsHandle {
                     dst.resize(need.max(dst.len() * 2), 0);
                 }
                 Err(err) => {
-                    return Err(ZfsError::Op(format!("{op}: {err}{}", errno_hint(&err))));
+                    /*
+                    New-style handlers fill the outnvl with per-element errors
+                    (snapshot/destroy_snaps/hold/release: name → errno; trim/
+                    initialize: guid → errno under a sub-list) and fail the
+                    whole ioctl when any element failed — the kernel still
+                    copies that outnvl back (zfsdev_ioctl_common put_nvlist's
+                    whenever a dst buffer was given), so say *which* failed.
+                    */
+                    let len = zc.zc_nvlist_dst_size as usize;
+                    let detail = (zc.zc_nvlist_dst_filled != 0 && len <= dst.len())
+                        .then(|| NvList::unpack(&dst[..len]).ok())
+                        .flatten()
+                        .map(|nv| element_errors(&nv))
+                        .filter(|d| !d.is_empty())
+                        .map(|d| format!(" — {d}"))
+                        .unwrap_or_default();
+                    return Err(ZfsError::Op(format!("{op}: {err}{}{detail}", errno_hint(&err))));
                 }
             }
         }
@@ -1915,6 +1967,27 @@ impl ZfsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed write ioctl's outnvl names each failed element + its errno,
+    /// flattening trim/initialize's nested per-vdev list, capped.
+    #[test]
+    fn element_errors_render_names_and_errnos() {
+        let mut nv = NvList::new();
+        nv.push("tank/a@s", NvData::Int32(libc::EBUSY));
+        let mut sub = NvList::new();
+        sub.push("1234", NvData::Int64(libc::EOPNOTSUPP as i64));
+        nv.push("trim_vdevs", NvData::List(sub));
+        let s = element_errors(&nv);
+        assert!(s.starts_with("tank/a@s: Device or resource busy"), "{s}");
+        assert!(s.contains("1234: Operation not supported"), "{s}");
+
+        let mut many = NvList::new();
+        for i in 0..6 {
+            many.push(format!("d@{i}"), NvData::Int32(libc::ENOENT));
+        }
+        assert!(element_errors(&many).ends_with("; +2 more"));
+        assert_eq!(element_errors(&NvList::new()), "");
+    }
 
     #[test]
     fn kernel_version_parse() {

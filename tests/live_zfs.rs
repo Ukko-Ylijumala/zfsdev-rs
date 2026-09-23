@@ -509,6 +509,40 @@ fn get_fsacl_reads_delegations() {
 }
 
 /**
+A failed new-style write names the element that failed: the kernel copies
+the per-element errors outnvl back even when the ioctl fails, and
+`write_ioctl` appends it to the error. Re-creating a snapshot that already
+exists in the delegated playground fails per-element with EEXIST inside the
+handler (dsl_dataset_snapshot_check) and changes nothing.
+*/
+#[test]
+fn failed_snapshot_names_the_failing_element() {
+    const PLAYGROUND: &str = "data/test";
+    let Some(zfs) = handle() else { return };
+    let Ok(snaps) = zfs.snapshots(PLAYGROUND) else {
+        eprintln!("skipping: no {PLAYGROUND} playground on this machine");
+        return;
+    };
+    let Some(existing) = snaps.first().map(|s| s.name.clone()) else {
+        eprintln!("skipping: {PLAYGROUND} has no snapshot to re-create");
+        return;
+    };
+    let pool = PLAYGROUND.split('/').next().unwrap();
+    match zfs.snapshot(pool, std::slice::from_ref(&existing), None) {
+        Err(e) => {
+            eprintln!("{e}");
+            let e = e.to_string();
+            if e.contains("Operation not permitted") {
+                eprintln!("skipping: no snapshot delegation on {PLAYGROUND}");
+                return;
+            }
+            assert!(e.contains(&format!("{existing}: File exists")), "element not named: {e}");
+        }
+        Ok(_) => panic!("re-creating existing {existing} must fail"),
+    }
+}
+
+/**
 `zfs unallow <who>` (revoke with no permission list) against a throwaway
 child of the delegated playground: grant ourselves `snapshot` locally on
 the child, revoke the whole who, and check the child's own delegations are
