@@ -26,6 +26,7 @@ Whether a given write is permitted for the calling uid is decided by the
 kernel (root, or a matching `zfs allow` delegation).
 */
 
+use super::enums::PoolScanFunc;
 use super::nvlist::{NvData, NvError, NvList};
 use super::props::VdevProp;
 use std::ffi::{CStr, CString};
@@ -1829,14 +1830,24 @@ impl ZfsHandle {
     pause of the current scan instead (resume = call again with `func` = scrub,
     `pause` = false). zc_cookie carries the func, zc_flags the
     `POOL_SCRUB_PAUSE` bit.
+
+    `dsl_scan` *resumes* a paused (error) scrub on a scrub-start and reports
+    that by returning ECANCELED — success, as libzfs `zpool_scan` treats it.
+    (libzfs also swallows ENOENT on a pause with no scan running; not here: an
+    ENOENT is indistinguishable from a missing pool, and the UI only offers
+    pause on a running scrub.)
     */
     pub fn pool_scan(&self, pool: &str, func: u64, pause: bool) -> Result<()> {
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
         zc.zc_cookie = func;
         zc.zc_flags = u32::from(pause); // POOL_SCRUB_PAUSE = 1, else NORMAL
-        self.write_ioctl(ZFS_IOC_POOL_SCAN, "scrub", &mut zc, None)?;
-        Ok(())
+        let scrub = func == PoolScanFunc::Scrub as u64 || func == PoolScanFunc::ErrorScrub as u64;
+        match self.ioctl(ZFS_IOC_POOL_SCAN, &mut zc) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ECANCELED) && scrub && !pause => Ok(()),
+            Err(err) => Err(ZfsError::Op(format!("scrub: {err}{}", errno_hint(&err)))),
+        }
     }
 
     /**
