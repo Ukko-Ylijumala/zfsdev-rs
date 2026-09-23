@@ -382,6 +382,33 @@ impl DirentType {
     }
 }
 
+/**
+dmu_object_byteswap_t (dmu.h): the byteswap class a self-describing
+DMU_OTN_* object type carries in its low 5 bits — also its name, as zdb
+prints it (`dmu_ot_byteswap[].ob_name`).
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[strum(serialize_all = "lowercase")]
+#[repr(u8)]
+pub enum DmuByteswap {
+    Uint8 = 0,
+    Uint16,
+    Uint32,
+    Uint64,
+    Zap,
+    Dnode,
+    Objset,
+    Znode,
+    OldAcl,
+    Acl,
+}
+
+/// DMU_OT_NEWTYPE: the self-describing DMU_OTN_* scheme (dmu.h).
+pub const DMU_OT_NEWTYPE: u8 = 0x80;
+const DMU_OT_METADATA: u8 = 0x40;
+const DMU_OT_ENCRYPTED: u8 = 0x20;
+const DMU_OT_BYTESWAP_MASK: u8 = 0x1f;
+
 /// dmu_object_type_t (dmu.h). Values with the 0x80 bit set are the
 /// self-describing DMU_OTN_* scheme; use [`DmuObjectType::name`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr, EnumString)]
@@ -498,9 +525,20 @@ pub enum DmuObjectType {
 }
 
 impl DmuObjectType {
+    /**
+    The type's name. A self-describing DMU_OTN_* type has no table entry: it
+    is named by its byteswap class plus its metadata/encrypted flags
+    (`zap metadata`, `uint64 encrypted data`), like zdb's `zdb_ot_name` —
+    e.g. every zapified DSL dir (`dmu_object_zapify`) is `zap metadata`.
+    */
     pub fn name(v: u8) -> String {
-        if v & 0x80 != 0 {
-            return "OTN (self-describing)".into();
+        if v & DMU_OT_NEWTYPE != 0 {
+            let Some(class) = DmuByteswap::from_repr(v & DMU_OT_BYTESWAP_MASK) else {
+                return format!("?{v}");
+            };
+            let enc = if v & DMU_OT_ENCRYPTED != 0 { " encrypted" } else { "" };
+            let md = if v & DMU_OT_METADATA != 0 { "metadata" } else { "data" };
+            return format!("{class}{enc} {md}");
         }
         name_or_unknown!(DmuObjectType, v)
     }
@@ -516,8 +554,8 @@ impl DmuObjectType {
     */
     pub fn is_encrypted(v: u8) -> bool {
         use DmuObjectType as T;
-        if v & 0x80 != 0 {
-            return v & 0x20 != 0;
+        if v & DMU_OT_NEWTYPE != 0 {
+            return v & DMU_OT_ENCRYPTED != 0;
         }
         matches!(
             Self::from_repr(v),
@@ -631,7 +669,11 @@ mod tests {
         assert_eq!(DirentType::name(8), "file");
         assert_eq!(DmuObjectType::name(11), "objset");
         assert_eq!(DmuObjectType::name(16), "DSL dataset");
-        assert_eq!(DmuObjectType::name(0x80), "OTN (self-describing)");
+        // DMU_OTN_*: byteswap class + flags (0xc4 = zapified DSL dir)
+        assert_eq!(DmuObjectType::name(0xc4), "zap metadata");
+        assert_eq!(DmuObjectType::name(0x83), "uint64 data");
+        assert_eq!(DmuObjectType::name(0xe4), "zap encrypted metadata");
+        assert_eq!(DmuObjectType::name(0x9f), "?159"); // no such byteswap class
     }
 
     #[test]
