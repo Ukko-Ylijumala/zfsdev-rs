@@ -508,6 +508,50 @@ fn get_fsacl_reads_delegations() {
     }
 }
 
+/**
+`zfs unallow <who>` (revoke with no permission list) against a throwaway
+child of the delegated playground: grant ourselves `snapshot` locally on
+the child, revoke the whole who, and check the child's own delegations are
+gone. The whole-who revoke must be encoded as a *non-nvlist* value — an
+empty perm nvlist fails `zfs_deleg_verify_nvlist` with EINVAL. Only the
+child's entries are touched (inherited playground perms live on the
+parent). Needs the `allow` delegation on the playground; skips otherwise.
+*/
+#[test]
+fn unallow_whole_who_in_playground() {
+    use zfs_browser::zfs::ioctl::DelegWho;
+
+    const PLAYGROUND: &str = "data/test";
+    let Some(zfs) = handle() else { return };
+    if zfs.objset_stats(PLAYGROUND).is_err() {
+        eprintln!("skipping: no {PLAYGROUND} playground on this machine");
+        return;
+    }
+    let ds = format!("{PLAYGROUND}/zb-deleg-{}", std::process::id());
+    // CREATE never mounts (that's libzfs, userspace) — fine under delegation
+    if let Err(e) = zfs.create(&ds, 2, None) {
+        eprintln!("skipping: cannot create {ds}: {e}");
+        return;
+    }
+    let me = DelegWho::User(unsafe { libc::getuid() } as u64);
+    let result = (|| -> Result<(), String> {
+        if let Err(e) = zfs.set_fsacl(&ds, &me, &["snapshot".into()], false) {
+            eprintln!("skipping: no `allow` delegation on {PLAYGROUND}: {e}");
+            return Ok(());
+        }
+        let n = zfs.get_fsacl(&ds).map_err(|e| e.to_string())?.pairs.len();
+        assert!(n > 0, "grant left no delegation entries on {ds}");
+        zfs.set_fsacl(&ds, &me, &[], true).map_err(|e| format!("unallow whole who: {e}"))?;
+        let acl = zfs.get_fsacl(&ds).map_err(|e| e.to_string())?;
+        assert!(acl.pairs.is_empty(), "whole-who unallow left entries: {acl:?}");
+        // an empty *grant* is refused client-side, never sent
+        assert!(zfs.set_fsacl(&ds, &me, &[], false).is_err());
+        Ok(())
+    })();
+    let _ = zfs.destroy(&ds, false);
+    result.unwrap();
+}
+
 #[test]
 fn load_unload_key_in_nonexistent_pool_is_a_clean_error() {
     let Some(zfs) = handle() else { return };

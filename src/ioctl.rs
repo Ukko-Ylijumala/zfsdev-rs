@@ -1613,6 +1613,14 @@ impl ZfsHandle {
     i.e. local + descendent. The fsacl nvlist is keyed by the per-inheritance
     "who" key, each mapping to an nvlist of permission-name → boolean flag.
     Permission names are validated by the kernel (a bad one is a clean EINVAL).
+
+    Revoking with no `perms` removes the who entirely (`zfs unallow <who>`):
+    that is encoded as a *non-nvlist* value (libzfs adds a boolean) —
+    `dsl_deleg_unset_sync` drops the whole who only when the value isn't an
+    nvlist, while an empty perm nvlist fails `zfs_deleg_verify_nvlist`
+    (EINVAL). Never for a grant: `dsl_deleg_can_allow` VERIFYs an nvlist
+    (a kernel assertion for an unprivileged caller), so an empty grant is
+    refused here instead.
     */
     pub fn set_fsacl(
         &self,
@@ -1621,13 +1629,21 @@ impl ZfsHandle {
         perms: &[String],
         unset: bool,
     ) -> Result<()> {
+        if perms.is_empty() && !unset {
+            return Err(ZfsError::Op("zfs allow: no permissions given".into()));
+        }
         let mut fsacl = NvList::new();
         for inherit in ['l', 'd'] {
+            let whokey = deleg_whokey(who, inherit);
+            if perms.is_empty() {
+                fsacl.add_bool_flag(whokey);
+                continue;
+            }
             let mut permnv = NvList::new();
             for p in perms {
                 permnv.add_bool_flag(p.clone());
             }
-            fsacl.add_nvlist(deleg_whokey(who, inherit), permnv);
+            fsacl.add_nvlist(whokey, permnv);
         }
         let mut zc = ZfsCmd::new();
         zc.set_name(dataset)?;
