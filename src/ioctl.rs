@@ -31,10 +31,12 @@ use super::nvlist::{NvData, NvError, NvList};
 use super::props::VdevProp;
 use std::cell::Cell;
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::LazyLock;
+use strum::Display;
 use thiserror::Error;
 
 const ZFS_DEV: &str = "/dev/zfs";
@@ -130,44 +132,135 @@ const MAXNAMELEN: usize = 256;
 const DST_INITIAL: usize = 256 * 1024;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ZfsError {
     #[error("cannot open {ZFS_DEV}: {0}")]
     Open(io::Error),
+    /// A read (GET/LIST) ioctl failed; `name` is the pool/dataset it targeted.
     #[error("zfs ioctl {ioc:#x} ({name}): {err}")]
     Ioctl { ioc: u64, name: String, err: io::Error },
+    /**
+    A mutating operation failed in the kernel. New-style ioctls also name the
+    elements that failed (snapshots, holds, vdevs, …) with their own errno;
+    Display adds a hint for the common errnos and the first few elements.
+    */
+    #[error("{op}: {err}{}{}", errno_hint(*.op, .err), elements_suffix(.elements))]
+    Write { op: WriteOp, err: io::Error, elements: Vec<ElementError> },
     #[error("decoding nvlist from kernel: {0}")]
     Nv(#[from] NvError),
-    /// A mutating operation failed; message already carries an errno hint.
+    /// Input rejected before it reached the kernel (a malformed send stream,
+    /// an unusable device path, …).
     #[error("{0}")]
-    Op(String),
+    Invalid(String),
     /// A name/value (often modal input) exceeds the fixed `zfs_cmd_t` field.
     #[error("{field} too long: {len} bytes (max {max})")]
     NameTooLong { field: &'static str, len: usize, max: usize },
 }
 
+impl ZfsError {
+    /// The OS error number, for failures the kernel (or opening the device)
+    /// reported: ENOENT for a missing pool, EPERM/EACCES for privilege, …
+    pub fn errno(&self) -> Option<i32> {
+        match self {
+            ZfsError::Open(err) | ZfsError::Ioctl { err, .. } | ZfsError::Write { err, .. } => {
+                err.raw_os_error()
+            }
+            _ => None,
+        }
+    }
+}
+
 type Result<T> = std::result::Result<T, ZfsError>;
 
-/// Per-element errors shown from a failed write ioctl's outnvl, at most.
+/// A mutating operation, as named in [`ZfsError::Write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[non_exhaustive]
+pub enum WriteOp {
+    #[strum(serialize = "set property")]
+    SetProp,
+    #[strum(serialize = "set pool property")]
+    PoolSetProps,
+    #[strum(serialize = "inherit property")]
+    InheritProp,
+    #[strum(serialize = "create snapshot")]
+    Snapshot,
+    #[strum(serialize = "destroy snapshots")]
+    DestroySnaps,
+    #[strum(serialize = "create dataset")]
+    Create,
+    #[strum(serialize = "destroy dataset")]
+    Destroy,
+    #[strum(serialize = "rename dataset")]
+    Rename,
+    #[strum(serialize = "allow")]
+    Allow,
+    #[strum(serialize = "unallow")]
+    Unallow,
+    #[strum(serialize = "log history")]
+    LogHistory,
+    #[strum(serialize = "hold")]
+    Hold,
+    #[strum(serialize = "release")]
+    Release,
+    #[strum(serialize = "load key")]
+    LoadKey,
+    #[strum(serialize = "unload key")]
+    UnloadKey,
+    #[strum(serialize = "online vdev")]
+    VdevOnline,
+    #[strum(serialize = "offline vdev")]
+    VdevOffline,
+    #[strum(serialize = "set vdev property")]
+    VdevSetProps,
+    #[strum(serialize = "detach vdev")]
+    VdevDetach,
+    #[strum(serialize = "attach vdev")]
+    VdevAttach,
+    #[strum(serialize = "replace vdev")]
+    VdevReplace,
+    #[strum(serialize = "scrub")]
+    Scrub,
+    #[strum(serialize = "clear errors")]
+    ClearErrors,
+    #[strum(serialize = "trim")]
+    Trim,
+    #[strum(serialize = "initialize")]
+    Initialize,
+    #[strum(serialize = "send")]
+    Send,
+    #[strum(serialize = "receive")]
+    Receive,
+}
+
+/// One element a new-style write ioctl reported as failed, with its errno.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementError {
+    /// The snapshot / hold / vdev guid / property the kernel keyed it by.
+    pub name: String,
+    pub errno: i32,
+}
+
+impl fmt::Display for ElementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.name, io::Error::from_raw_os_error(self.errno))
+    }
+}
+
+/// Per-element errors shown in a [`ZfsError::Write`] message, at most.
 const MAX_ELEMENT_ERRORS: usize = 4;
 
 /**
-Render a failed write ioctl's per-element errors nvlist as
-`name: <errno text>; …` (capped at `MAX_ELEMENT_ERRORS`, with a "+N more"
-tail). Errno values arrive as int32/int64 (both appear); a nested nvlist
-(trim/initialize's `trim_vdevs` → guid → errno) is flattened one level.
+The per-element errors in a failed write ioctl's outnvl. Errno values arrive
+as int32/int64 (both appear); a nested nvlist (trim/initialize's
+`trim_vdevs` → guid → errno) is flattened one level.
 */
-fn element_errors(nv: &NvList) -> String {
-    let mut items = Vec::new();
-    collect_element_errors(nv, &mut items);
-    let more = items.len().saturating_sub(MAX_ELEMENT_ERRORS);
-    items.truncate(MAX_ELEMENT_ERRORS);
-    if more > 0 {
-        items.push(format!("+{more} more"));
-    }
-    items.join("; ")
+fn element_errors(nv: &NvList) -> Vec<ElementError> {
+    let mut out = Vec::new();
+    collect_element_errors(nv, &mut out);
+    out
 }
 
-fn collect_element_errors(nv: &NvList, out: &mut Vec<String>) {
+fn collect_element_errors(nv: &NvList, out: &mut Vec<ElementError>) {
     for p in &nv.pairs {
         let errno = match &p.data {
             NvData::Int32(e) => *e,
@@ -179,8 +272,23 @@ fn collect_element_errors(nv: &NvList, out: &mut Vec<String>) {
             }
             _ => continue,
         };
-        out.push(format!("{}: {}", p.name, io::Error::from_raw_os_error(errno)));
+        out.push(ElementError { name: p.name.clone(), errno });
     }
+}
+
+/// ` — name: <errno text>; …` for a write error's message, capped at
+/// `MAX_ELEMENT_ERRORS` with a "+N more" tail; empty without elements.
+fn elements_suffix(elements: &[ElementError]) -> String {
+    if elements.is_empty() {
+        return String::new();
+    }
+    let mut items: Vec<String> =
+        elements.iter().take(MAX_ELEMENT_ERRORS).map(ElementError::to_string).collect();
+    let more = elements.len().saturating_sub(MAX_ELEMENT_ERRORS);
+    if more > 0 {
+        items.push(format!("+{more} more"));
+    }
+    format!(" — {}", items.join("; "))
 }
 
 /**
@@ -190,10 +298,10 @@ wrong key/passphrase as EACCES (dsl_crypt.c: the unwrap MAC failed), which
 would otherwise read as a permission problem (that is EPERM), and a scrub
 start on a busy pool is EBUSY because a scan is already running.
 */
-fn errno_hint(op: &str, err: &io::Error) -> &'static str {
+fn errno_hint(op: WriteOp, err: &io::Error) -> &'static str {
     match (op, err.raw_os_error()) {
-        ("load key", Some(libc::EACCES)) => " (wrong key or passphrase)",
-        ("scrub", Some(libc::EBUSY)) => " (a scrub or resilver is already running)",
+        (WriteOp::LoadKey, Some(libc::EACCES)) => " (wrong key or passphrase)",
+        (WriteOp::Scrub, Some(libc::EBUSY)) => " (a scrub or resilver is already running)",
         (_, Some(libc::EPERM) | Some(libc::EACCES)) => {
             " (need root, or a `zfs allow` delegation for this operation)"
         }
@@ -248,14 +356,14 @@ pub fn resolve_who(spec: &str) -> std::result::Result<DelegWho, String> {
 fn device_vtype(path: &str) -> Result<&'static str> {
     use std::os::unix::fs::FileTypeExt;
     let ft = std::fs::metadata(path)
-        .map_err(|e| ZfsError::Op(format!("attach: cannot stat {path}: {e}")))?
+        .map_err(|e| ZfsError::Invalid(format!("attach: cannot stat {path}: {e}")))?
         .file_type();
     if ft.is_block_device() {
         Ok("disk")
     } else if ft.is_file() {
         Ok("file")
     } else {
-        Err(ZfsError::Op(format!("attach: {path} is not a block device or file")))
+        Err(ZfsError::Invalid(format!("attach: {path} is not a block device or file")))
     }
 }
 
@@ -456,7 +564,7 @@ impl BeginRecord {
     */
     pub fn parse(bytes: &[u8]) -> Result<BeginRecord> {
         let Ok(fixed) = <[u8; DRR_RECORD_SIZE]>::try_from(bytes) else {
-            return Err(ZfsError::Op(format!(
+            return Err(ZfsError::Invalid(format!(
                 "send stream header: {} bytes, expected {DRR_RECORD_SIZE}",
                 bytes.len()
             )));
@@ -466,14 +574,14 @@ impl BeginRecord {
             DMU_BACKUP_MAGIC => false,
             m if m == DMU_BACKUP_MAGIC.swap_bytes() => true,
             m => {
-                return Err(ZfsError::Op(format!(
+                return Err(ZfsError::Invalid(format!(
                     "not a zfs send stream (magic {m:#x}, expected {DMU_BACKUP_MAGIC:#x})"
                 )));
             }
         };
         let rec = BeginRecord { bytes: fixed, swapped };
         if rec.u32_at(0) != 0 {
-            return Err(ZfsError::Op(format!(
+            return Err(ZfsError::Invalid(format!(
                 "send stream does not start with a BEGIN record (type {})",
                 rec.u32_at(0)
             )));
@@ -1381,7 +1489,7 @@ impl ZfsHandle {
         flags.fill(&mut innvl);
         let mut zc = ZfsCmd::new();
         zc.set_name(snapshot)?;
-        self.write_ioctl(ZFS_IOC_SEND_NEW, "send", &mut zc, Some(&innvl))?;
+        self.write_ioctl(ZFS_IOC_SEND_NEW, WriteOp::Send, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -1425,7 +1533,7 @@ impl ZfsHandle {
         resumable: bool,
     ) -> Result<RecvResult> {
         let Some((fsname, _)) = snapname.split_once('@') else {
-            return Err(ZfsError::Op(format!("receive: '{snapname}' is not a snapshot name")));
+            return Err(ZfsError::Invalid(format!("receive: '{snapname}' is not a snapshot name")));
         };
         let target = if self.objset_stats(fsname).is_ok() {
             fsname
@@ -1433,7 +1541,7 @@ impl ZfsHandle {
             match fsname.rsplit_once('/') {
                 Some((parent, _)) => parent,
                 None => {
-                    return Err(ZfsError::Op(format!(
+                    return Err(ZfsError::Invalid(format!(
                         "receive: pool '{fsname}' does not exist"
                     )));
                 }
@@ -1451,7 +1559,7 @@ impl ZfsHandle {
         }
         let mut zc = ZfsCmd::new();
         zc.set_name(target)?;
-        let out = self.write_ioctl(ZFS_IOC_RECV_NEW, "receive", &mut zc, Some(&innvl))?;
+        let out = self.write_ioctl(ZFS_IOC_RECV_NEW, WriteOp::Receive, &mut zc, Some(&innvl))?;
         Ok(RecvResult {
             read_bytes: out.get_u64("read_bytes").unwrap_or(0),
             error_flags: out.get_u64("error_flags").unwrap_or(0),
@@ -1535,14 +1643,13 @@ impl ZfsHandle {
     /**
     Issue a mutating ioctl. `innvl`, if present, is packed into
     `zc_nvlist_src`; the kernel's output/errors nvlist is read back from
-    `zc_nvlist_dst` (empty if it filled none). `op` names the operation for
-    error messages. Errors are returned as [`ZfsError::Op`] with an errno
-    hint already appended.
+    `zc_nvlist_dst` (empty if it filled none). `op` names the operation in
+    the [`ZfsError::Write`] a failure returns.
     */
     fn write_ioctl(
         &self,
         ioc: u64,
-        op: &str,
+        op: WriteOp,
         zc: &mut ZfsCmd,
         innvl: Option<&NvList>,
     ) -> Result<NvList> {
@@ -1580,14 +1687,12 @@ impl ZfsHandle {
                     whenever a dst buffer was given), so say *which* failed.
                     */
                     let len = zc.zc_nvlist_dst_size as usize;
-                    let detail = (zc.zc_nvlist_dst_filled != 0 && len <= dst.len())
+                    let elements = (zc.zc_nvlist_dst_filled != 0 && len <= dst.len())
                         .then(|| NvList::unpack(&dst[..len]).ok())
                         .flatten()
                         .map(|nv| element_errors(&nv))
-                        .filter(|d| !d.is_empty())
-                        .map(|d| format!(" — {d}"))
                         .unwrap_or_default();
-                    return Err(ZfsError::Op(format!("{op}: {err}{}{detail}", errno_hint(op, &err))));
+                    return Err(ZfsError::Write { op, err, elements });
                 }
             }
         }
@@ -1602,14 +1707,14 @@ impl ZfsHandle {
     pub fn set_prop(&self, dataset: &str, props: &NvList) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
         zc.set_name(dataset)?;
-        self.write_ioctl(ZFS_IOC_SET_PROP, "set property", &mut zc, Some(props))
+        self.write_ioctl(ZFS_IOC_SET_PROP, WriteOp::SetProp, &mut zc, Some(props))
     }
 
     /// Set pool properties (ZFS_IOC_POOL_SET_PROPS).
     pub fn pool_set_props(&self, pool: &str, props: &NvList) -> Result<NvList> {
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_POOL_SET_PROPS, "set pool property", &mut zc, Some(props))
+        self.write_ioctl(ZFS_IOC_POOL_SET_PROPS, WriteOp::PoolSetProps, &mut zc, Some(props))
     }
 
     /// Reset a property to its inherited value (ZFS_IOC_INHERIT_PROP).
@@ -1619,7 +1724,7 @@ impl ZfsHandle {
         zc.set_name(dataset)?;
         zc.set_value(prop)?;
         zc.zc_cookie = received as u64;
-        self.write_ioctl(ZFS_IOC_INHERIT_PROP, "inherit property", &mut zc, None)?;
+        self.write_ioctl(ZFS_IOC_INHERIT_PROP, WriteOp::InheritProp, &mut zc, None)?;
         Ok(())
     }
 
@@ -1641,7 +1746,7 @@ impl ZfsHandle {
         }
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_SNAPSHOT, "create snapshot", &mut zc, Some(&innvl))
+        self.write_ioctl(ZFS_IOC_SNAPSHOT, WriteOp::Snapshot, &mut zc, Some(&innvl))
     }
 
     /**
@@ -1661,7 +1766,7 @@ impl ZfsHandle {
         }
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_DESTROY_SNAPS, "destroy snapshots", &mut zc, Some(&innvl))
+        self.write_ioctl(ZFS_IOC_DESTROY_SNAPS, WriteOp::DestroySnaps, &mut zc, Some(&innvl))
     }
 
     /**
@@ -1685,7 +1790,7 @@ impl ZfsHandle {
         }
         let mut zc = ZfsCmd::new();
         zc.set_name(name)?;
-        self.write_ioctl(ZFS_IOC_CREATE, "create dataset", &mut zc, Some(&innvl))?;
+        self.write_ioctl(ZFS_IOC_CREATE, WriteOp::Create, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -1698,7 +1803,7 @@ impl ZfsHandle {
         let mut zc = ZfsCmd::new();
         zc.set_name(name)?;
         zc.zc_defer_destroy = defer as u32;
-        self.write_ioctl(ZFS_IOC_DESTROY, "destroy dataset", &mut zc, None)?;
+        self.write_ioctl(ZFS_IOC_DESTROY, WriteOp::Destroy, &mut zc, None)?;
         Ok(())
     }
 
@@ -1709,7 +1814,7 @@ impl ZfsHandle {
         zc.set_name(from)?;
         zc.set_value(to)?;
         zc.zc_cookie = recursive as u64;
-        self.write_ioctl(ZFS_IOC_RENAME, "rename dataset", &mut zc, None)?;
+        self.write_ioctl(ZFS_IOC_RENAME, WriteOp::Rename, &mut zc, None)?;
         Ok(())
     }
 
@@ -1736,7 +1841,7 @@ impl ZfsHandle {
         unset: bool,
     ) -> Result<()> {
         if perms.is_empty() && !unset {
-            return Err(ZfsError::Op("zfs allow: no permissions given".into()));
+            return Err(ZfsError::Invalid("zfs allow: no permissions given".into()));
         }
         let mut fsacl = NvList::new();
         for inherit in ['l', 'd'] {
@@ -1754,7 +1859,7 @@ impl ZfsHandle {
         let mut zc = ZfsCmd::new();
         zc.set_name(dataset)?;
         zc.zc_perm_action = unset as u64; // 0 = allow, 1 = unallow
-        let op = if unset { "unallow" } else { "allow" };
+        let op = if unset { WriteOp::Unallow } else { WriteOp::Allow };
         self.write_ioctl(ZFS_IOC_SET_FSACL, op, &mut zc, Some(&fsacl))?;
         Ok(())
     }
@@ -1772,7 +1877,7 @@ impl ZfsHandle {
         let mut innvl = NvList::new();
         innvl.add_str("message", message);
         let mut zc = ZfsCmd::new();
-        self.write_ioctl(ZFS_IOC_LOG_HISTORY, "log history", &mut zc, Some(&innvl))?;
+        self.write_ioctl(ZFS_IOC_LOG_HISTORY, WriteOp::LogHistory, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -1790,7 +1895,7 @@ impl ZfsHandle {
         args.add_nvlist("holds", holds);
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_HOLD, "hold", &mut zc, Some(&args))
+        self.write_ioctl(ZFS_IOC_HOLD, WriteOp::Hold, &mut zc, Some(&args))
     }
 
     /**
@@ -1805,7 +1910,7 @@ impl ZfsHandle {
         holds.add_nvlist(snapshot, tags);
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_RELEASE, "release", &mut zc, Some(&holds))
+        self.write_ioctl(ZFS_IOC_RELEASE, WriteOp::Release, &mut zc, Some(&holds))
     }
 
     /**
@@ -1828,7 +1933,7 @@ impl ZfsHandle {
         }
         let mut zc = ZfsCmd::new();
         zc.set_name(dataset)?;
-        self.write_ioctl(ZFS_IOC_LOAD_KEY, "load key", &mut zc, Some(&innvl))?;
+        self.write_ioctl(ZFS_IOC_LOAD_KEY, WriteOp::LoadKey, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -1838,7 +1943,7 @@ impl ZfsHandle {
     pub fn unload_key(&self, dataset: &str) -> Result<()> {
         let mut zc = ZfsCmd::new();
         zc.set_name(dataset)?;
-        self.write_ioctl(ZFS_IOC_UNLOAD_KEY, "unload key", &mut zc, None)?;
+        self.write_ioctl(ZFS_IOC_UNLOAD_KEY, WriteOp::UnloadKey, &mut zc, None)?;
         Ok(())
     }
 
@@ -1857,7 +1962,7 @@ impl ZfsHandle {
         zc.zc_guid = guid;
         zc.zc_cookie = if online { 7 } else { 2 };
         zc.zc_obj = if expand { ZFS_ONLINE_EXPAND } else { 0 };
-        let op = if online { "online vdev" } else { "offline vdev" };
+        let op = if online { WriteOp::VdevOnline } else { WriteOp::VdevOffline };
         self.write_ioctl(ZFS_IOC_VDEV_SET_STATE, op, &mut zc, None)?;
         Ok(())
     }
@@ -1876,7 +1981,7 @@ impl ZfsHandle {
         innvl.add_nvlist("vdevprops_set_props", set);
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_VDEV_SET_PROPS, "set vdev property", &mut zc, Some(&innvl))
+        self.write_ioctl(ZFS_IOC_VDEV_SET_PROPS, WriteOp::VdevSetProps, &mut zc, Some(&innvl))
     }
 
     /* ---------------------------- pool maintenance ----------------------- */
@@ -1891,9 +1996,7 @@ impl ZfsHandle {
         zc.set_name(pool)?;
         zc.zc_guid = guid;
         self.ioctl(ZFS_IOC_VDEV_DETACH, &mut zc)
-            .map_err(|err| {
-                ZfsError::Op(format!("detach vdev: {err}{}", errno_hint("detach vdev", &err)))
-            })?;
+            .map_err(|err| ZfsError::Write { op: WriteOp::VdevDetach, err, elements: Vec::new() })?;
         Ok(())
     }
 
@@ -1924,10 +2027,10 @@ impl ZfsHandle {
         zc.zc_cookie = u64::from(replacing);
         zc.zc_nvlist_conf = conf.as_ptr() as u64;
         zc.zc_nvlist_conf_size = conf.len() as u64;
-        let op = if replacing { "replace vdev" } else { "attach vdev" };
+        let op = if replacing { WriteOp::VdevReplace } else { WriteOp::VdevAttach };
         // `conf` outlives the ioctl (dropped at fn end)
         self.ioctl(ZFS_IOC_VDEV_ATTACH, &mut zc)
-            .map_err(|err| ZfsError::Op(format!("{op}: {err}{}", errno_hint(op, &err))))?;
+            .map_err(|err| ZfsError::Write { op, err, elements: Vec::new() })?;
         Ok(())
     }
 
@@ -1953,7 +2056,7 @@ impl ZfsHandle {
         match self.ioctl(ZFS_IOC_POOL_SCAN, &mut zc) {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::ECANCELED) && scrub && !pause => Ok(()),
-            Err(err) => Err(ZfsError::Op(format!("scrub: {err}{}", errno_hint("scrub", &err)))),
+            Err(err) => Err(ZfsError::Write { op: WriteOp::Scrub, err, elements: Vec::new() }),
         }
     }
 
@@ -1968,7 +2071,7 @@ impl ZfsHandle {
         zc.set_name(pool)?;
         zc.zc_guid = guid;
         zc.zc_cookie = 1; // ZPOOL_NO_REWIND
-        self.write_ioctl(ZFS_IOC_CLEAR, "clear errors", &mut zc, None)?;
+        self.write_ioctl(ZFS_IOC_CLEAR, WriteOp::ClearErrors, &mut zc, None)?;
         Ok(())
     }
 
@@ -1997,7 +2100,7 @@ impl ZfsHandle {
         innvl.add_nvlist("trim_vdevs", Self::vdev_guid_nvlist(guids));
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_POOL_TRIM, "trim", &mut zc, Some(&innvl))?;
+        self.write_ioctl(ZFS_IOC_POOL_TRIM, WriteOp::Trim, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -2012,7 +2115,7 @@ impl ZfsHandle {
         innvl.add_nvlist("initialize_vdevs", Self::vdev_guid_nvlist(guids));
         let mut zc = ZfsCmd::new();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_POOL_INITIALIZE, "initialize", &mut zc, Some(&innvl))?;
+        self.write_ioctl(ZFS_IOC_POOL_INITIALIZE, WriteOp::Initialize, &mut zc, Some(&innvl))?;
         Ok(())
     }
 }
@@ -2027,9 +2130,9 @@ mod tests {
     #[test]
     fn errno_hint_is_operation_aware() {
         let e = |n| io::Error::from_raw_os_error(n);
-        assert_eq!(errno_hint("load key", &e(libc::EACCES)), " (wrong key or passphrase)");
-        assert!(errno_hint("create", &e(libc::EACCES)).contains("zfs allow"));
-        assert!(errno_hint("scrub", &e(libc::EBUSY)).contains("already running"));
+        assert_eq!(errno_hint(WriteOp::LoadKey, &e(libc::EACCES)), " (wrong key or passphrase)");
+        assert!(errno_hint(WriteOp::Create, &e(libc::EACCES)).contains("zfs allow"));
+        assert!(errno_hint(WriteOp::Scrub, &e(libc::EBUSY)).contains("already running"));
     }
 
     /// A failed write ioctl's outnvl names each failed element + its errno,
@@ -2041,16 +2144,40 @@ mod tests {
         let mut sub = NvList::new();
         sub.push("1234", NvData::Int64(libc::EOPNOTSUPP as i64));
         nv.push("trim_vdevs", NvData::List(sub));
-        let s = element_errors(&nv);
-        assert!(s.starts_with("tank/a@s: Device or resource busy"), "{s}");
+        let elements = element_errors(&nv);
+        assert_eq!(elements, [
+            ElementError { name: "tank/a@s".into(), errno: libc::EBUSY },
+            ElementError { name: "1234".into(), errno: libc::EOPNOTSUPP },
+        ]);
+        let s = elements_suffix(&elements);
+        assert!(s.starts_with(" — tank/a@s: Device or resource busy"), "{s}");
         assert!(s.contains("1234: Operation not supported"), "{s}");
 
         let mut many = NvList::new();
         for i in 0..6 {
             many.push(format!("d@{i}"), NvData::Int32(libc::ENOENT));
         }
-        assert!(element_errors(&many).ends_with("; +2 more"));
-        assert_eq!(element_errors(&NvList::new()), "");
+        let many = element_errors(&many);
+        assert_eq!(many.len(), 6); // all kept; only the message is capped
+        assert!(elements_suffix(&many).ends_with("; +2 more"));
+        assert_eq!(elements_suffix(&element_errors(&NvList::new())), "");
+    }
+
+    /// A write failure keeps its errno and elements, and renders like the
+    /// old single-string message: `op: errno text (hint) — elements`.
+    #[test]
+    fn write_error_is_structured_and_renders_the_hint() {
+        let err = ZfsError::Write {
+            op: WriteOp::DestroySnaps,
+            err: io::Error::from_raw_os_error(libc::EBUSY),
+            elements: vec![ElementError { name: "tank/a@s".into(), errno: libc::EBUSY }],
+        };
+        assert_eq!(err.errno(), Some(libc::EBUSY));
+        let msg = err.to_string();
+        assert!(msg.starts_with("destroy snapshots: Device or resource busy"), "{msg}");
+        assert!(msg.contains("(busy — mounted, held, or has children)"), "{msg}");
+        assert!(msg.contains(" — tank/a@s: Device or resource busy"), "{msg}");
+        assert_eq!(ZfsError::Invalid("x".into()).errno(), None);
     }
 
     #[test]
