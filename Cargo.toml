@@ -13,8 +13,9 @@ edition = "2024"
 # let-chains (1.88), u64::is_multiple_of (1.87)
 rust-version = "1.88"
 # doc/ is vendored OpenZFS reference material under the CDDL (see
-# doc/reference/README.md) — never part of a packaged crate
-exclude = ["doc/"]
+# doc/reference/README.md) — never part of a packaged crate; fuzz/ is its own
+# workspace
+exclude = ["doc/", "fuzz/"]
 
 [features]
 default = ["kstat"]

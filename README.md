@@ -289,6 +289,23 @@ mutating path with no side effects, because a layout error would surface as
 EFAULT/EINVAL instead of a clean "no such pool". Tests that need a delegated
 scratch dataset skip when it is absent.
 
+### Fuzzing
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets in
+a workspace of their own (they need nightly and a C++ compiler; the crate
+itself needs neither):
+
+- `nvlist`: decodes arbitrary bytes, runs every decoder that reads a decoded
+  list (property entries and sources, the stat decoders and their derived
+  figures), and checks that whatever decodes re-packs to a fixed point.
+- `kstat`: the kstat text parsers, with the tx-assign histogram's window
+  arithmetic checked for consistency.
+
+```sh
+cargo run --example fuzz_seeds   # seed corpus, from this host's pools if any
+fuzz/run-all.sh 60               # every target for 60 s, no sanitizer
+```
+
 ## Reference material
 
 `doc/reference/` holds OpenZFS headers and sources vendored as the ground truth

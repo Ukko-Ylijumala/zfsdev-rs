@@ -141,6 +141,15 @@ Per-era analyses and headers live in `doc/reference/{0.6,0.7,0.8,2.0,2.1,2.3,2.4
   side effects. Round-trip tests need a delegated scratch dataset
   (`PLAYGROUND`) and skip without it. GET-style ioctls run unprivileged
   (`/dev/zfs` is world-rw); events, error log and history need root.
+- Fuzzing: `fuzz/` (cargo-fuzz, nightly + a C++ compiler, its own workspace
+  and excluded from the package) has `nvlist` (unpack, every list decoder,
+  pack fixed point) and `kstat` (the text parsers, histogram window
+  properties). Targets check a property where there is one, not just
+  no-panic. `cargo run --example fuzz_seeds` cuts a corpus (synthetic shapes,
+  this host's pool nvlists, `doc/kstat/`; gitignored, regenerate rather than
+  commit); `fuzz/run-all.sh [secs]` sweeps every target without a sanitizer.
+  A crash is fixed like any correctness finding: minimized, fixed, and pinned
+  by a unit test next to the fix.
 - Rust edition 2024, MSRV 1.88 (`rust-version` in Cargo.toml).
 
 ## Licensing
