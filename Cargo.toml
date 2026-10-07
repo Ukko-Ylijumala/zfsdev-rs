@@ -29,12 +29,16 @@ write = []
 # counters and the health word. No dependencies; reading the procfs files is
 # Linux-only.
 kstat = []
+# libzfs's wrapping-key derivation for native encryption (the `wrapkey`
+# module): PBKDF2-HMAC-SHA1 for a passphrase. Off by default, so a consumer
+# that never handles keys doesn't build the crypto crates.
+wrapkey = ["dep:pbkdf2", "dep:sha1"]
 
 [package.metadata.docs.rs]
 all-features = true
 
 [dependencies]
-sha1 = "0.10"
+sha1 = { version = "0.10", optional = true }
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
 
@@ -45,6 +49,7 @@ thiserror = "2"
 version = "0.12"
 default-features = false
 features = ["hmac"]
+optional = true
 
 # /dev/zfs (the ioctl module) is Linux-only; nothing else needs libc
 [target.'cfg(target_os = "linux")'.dependencies]

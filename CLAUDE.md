@@ -52,6 +52,9 @@ table, Linux-only), `wrapkey` (libzfs wrapping-key derivation).
   `write_ioctl` itself stays in the read build: SEND_NEW (a read) uses it for
   its structured error.
 - `kstat` (on by default): the `kstat` module.
+- `wrapkey` (off by default): the `wrapkey` module and its optional
+  `pbkdf2`/`sha1` dependencies, so read-only consumers don't build crypto.
+  Nothing else may depend on it (`load_key` takes raw key bytes).
 - `ioctl`, `mount`, the `libc` dependency and kstat's procfs readers are
   `cfg(target_os = "linux")`; the rest must stay portable. Check with
   `cargo +nightly check -Zbuild-std=std,panic_abort --target
@@ -133,8 +136,8 @@ Per-era analyses and headers live in `doc/reference/{0.6,0.7,0.8,2.0,2.1,2.3,2.4
 
 ## Build / test
 
-- `cargo build`, `cargo clippy --all-targets` (also with `--features write`
-  and `--no-default-features`), `cargo test` (and `--features write`), and
+- `cargo build`, `cargo clippy --all-targets` (also with `--all-features`
+  and `--no-default-features`), `cargo test` (and `--all-features`), and
   `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features`.
 - `tests/live_zfs.rs` exercises the real `/dev/zfs`, cross-checks against
   `zpool list`, and skips quietly without ZFS. It is the ABI canary: if

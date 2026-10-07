@@ -27,7 +27,7 @@ that needs ZFS data without that application can use it too.
 | `props`  | Property names, value enums and decoding. `prop_entry` reads a property from the nvlist an ioctl returns, unwrapping its `{value, source}` pair and decoding where the value comes from (`PropSource`, `zfs get`'s SOURCE column); `decode_prop_value` says what a stored number *means*; `parse_prop_value` turns user input into the typed value a set-property request needs. |
 | `kstat`  | The SPL kstats in `/proc/spl/kstat/zfs`: `arc_summary`'s data, with ARC hit ratios and prefetcher metrics derived from whichever counters the kernel exports; and per pool the txg history, the tx-assign delay histogram (the write throttle), each open dataset's I/O and ZIL counters, and the pool's health word, which the kernel serves without taking a lock; the pool list itself, read without a ZFS lock; the imports in progress (an import holds the lock every pool ioctl waits on) and the module's debug log. |
 | `mount`  | Which ZFS dataset a path lives on: `statfs` tells ZFS apart, the mount table names the dataset (bind mounts and snapshot automounts included), without a `/dev/zfs` call. |
-| `wrapkey` | libzfs's native-encryption wrapping-key derivation (PBKDF2 for a passphrase, hex and raw keys), the userspace half of `zfs load-key`. |
+| `wrapkey` | libzfs's native-encryption wrapping-key derivation (PBKDF2 for a passphrase, hex and raw keys), the userspace half of `zfs load-key`. Behind the `wrapkey` feature. |
 
 ## Installation
 
@@ -54,6 +54,7 @@ one exactly. Rust 1.88 or newer is required.
 | Feature | Default | Contents |
 |---------|---------|----------|
 | `kstat` | on  | The `kstat` module. It has no dependencies. |
+| `wrapkey` | off | The `wrapkey` module, with its PBKDF2 and SHA-1 dependencies. |
 | `write` | off | The mutating requests: set/inherit properties, snapshot, create, destroy, rename, `zfs allow`/`unallow`, holds, `zfs load-key`/`unload-key`, receive, pool history entries, and pool/vdev maintenance (scrub, clear, trim, initialize, online/offline, attach, detach, `zpool online -e`). |
 
 Without `write`, the crate cannot issue a request that changes pool, dataset
@@ -298,7 +299,8 @@ err, elements }`. `elements` lists the per-element errors the kernel reported
 returns the overall errno for matching.
 
 Loading an encryption key derives the wrapping key in userspace, exactly as
-libzfs does. The kernel only ever sees the derived 32 bytes:
+libzfs does (the `wrapkey` feature). The kernel only ever sees the derived
+32 bytes:
 
 ```rust
 use zfsdev::props::{KeyFormat, prop_u64};
@@ -323,7 +325,7 @@ EPIPE.
 
 ```sh
 cargo test                  # read-only build
-cargo test --features write # adds the write canaries
+cargo test --all-features   # adds the write canaries and wrapkey
 ```
 
 The unit tests need no ZFS. They include an ordinal check that every ioctl

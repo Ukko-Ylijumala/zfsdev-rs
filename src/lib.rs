@@ -29,8 +29,8 @@ scraping.
   procfs, with no ioctl involved.
 - [`mount`]: which ZFS dataset a path lives on, from `statfs` and the
   mount table.
-- [`wrapkey`]: libzfs's native-encryption wrapping-key derivation (the
-  userspace half of `zfs load-key`).
+- [`wrapkey`] (`wrapkey` feature): libzfs's native-encryption wrapping-key
+  derivation (the userspace half of `zfs load-key`).
 
 # Features and platforms
 
@@ -39,6 +39,8 @@ scraping.
   receive, and pool/vdev maintenance. Without it the crate cannot change
   pool, dataset or kernel state.
 - `kstat` (on by default) adds the [`kstat`] module.
+- `wrapkey` (off by default) adds the `wrapkey` module and with it the
+  PBKDF2 and SHA-1 dependencies.
 
 [`ioctl`] and [`mount`] are Linux-only, as are kstat's procfs readers: the
 request encoding and the event ioctls are those of OpenZFS's Linux port. The rest is portable;
@@ -74,4 +76,5 @@ pub mod nvlist;
 pub mod props;
 pub mod stats;
 pub mod vdev;
+#[cfg(feature = "wrapkey")]
 pub mod wrapkey;

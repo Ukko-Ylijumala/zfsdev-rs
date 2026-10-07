@@ -19,7 +19,9 @@ use zfsdev::ioctl::{BeginRecord, DatasetType};
 #[cfg(feature = "kstat")]
 use zfsdev::kstat::{self, PoolHealth, TxgState};
 use zfsdev::mount;
-use zfsdev::props::{PropSource, prop_entries, prop_entry, prop_str, prop_u64};
+#[cfg(all(feature = "write", feature = "wrapkey"))]
+use zfsdev::props::prop_str;
+use zfsdev::props::{PropSource, prop_entries, prop_entry, prop_u64};
 use zfsdev::stats::{HistogramId, VdevStatsEx};
 use zfsdev::vdev::{self, VdevEntry, VdevRole};
 
@@ -789,7 +791,7 @@ pbkdf2salt/pbkdf2iters — including the negative case (a wrong passphrase
 must be *rejected by the kernel's MAC check*, proving the kernel really
 verified our PBKDF2 output). Skips wherever the environment is absent.
 */
-#[cfg(feature = "write")]
+#[cfg(all(feature = "write", feature = "wrapkey"))]
 #[test]
 fn load_key_roundtrip_in_playground() {
     use std::io::Write;
