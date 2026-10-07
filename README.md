@@ -21,7 +21,7 @@ that needs ZFS data without that application can use it too.
 |----------|--------------|
 | `ioctl`  | `ZfsHandle` and its typed requests: pool configs, stats and properties; datasets, snapshots and bookmarks; holds and delegations; the kernel event feed; the permanent error log; space estimates; `zfs send` streams; pool history. With the `write` feature it also covers the mutations. |
 | `nvlist` | The codec for packed name-value lists. It decodes both the native and XDR encodings and encodes the native one. |
-| `stats`  | Decoders for the kernel's positional stat arrays: `vdev_stat_t`, `pool_scan_stat_t` (scrub, resilver, error scrub), sequential-rebuild stats, and `vdev_stats_ex` (queue depths, latency and request-size histograms). Each type has derived figures such as progress, pass rate and ETA, computed the way `zpool status` does. |
+| `stats`  | Decoders for the kernel's positional stat arrays: `vdev_stat_t`, `pool_scan_stat_t` (scrub, resilver, error scrub), sequential-rebuild stats, and `vdev_stats_ex` (queue depths, latency and request-size histograms). Each type has derived figures such as progress, pass rate and ETA, computed the way `zpool status` does; the histograms give the window between two reads and its quantiles. |
 | `enums`  | Typed mirrors of the C enums: pool, vdev and scan states, vdev types, objset types, compression and checksum algorithms, DMU object types. `Coded<E>` keeps the raw number alongside the typed value, so a value newer than the crate still shows as `?N` instead of being lost. |
 | `props`  | Property names, value enums and decoding. `prop_entry` reads a property from the nvlist an ioctl returns, unwrapping its `{value, source}` pair and decoding where the value comes from (`PropSource`, `zfs get`'s SOURCE column); `decode_prop_value` says what a stored number *means*; `parse_prop_value` turns user input into the typed value a set-property request needs. |
 | `kstat`  | The SPL kstats in `/proc/spl/kstat/zfs`: `arc_summary`'s data, with ARC hit ratios and prefetcher metrics derived from whichever counters the kernel exports; and per pool the txg history, the tx-assign delay histogram (the write throttle), each open dataset's I/O and ZIL counters, and the pool's health word, which the kernel serves without taking a lock; the pool list itself, read without a ZFS lock; the imports in progress (an import holds the lock every pool ioctl waits on) and the module's debug log. |
@@ -213,11 +213,22 @@ if let Some(sync) = txgs.iter().find(|t| t.state == TxgState::Syncing) {
 
 let waits = kstat::read_tx_assign("tank")?;
 println!("{} transactions waited over 100 ms", waits.longer_than(100_000_000));
+// a minute later: the throttle's p99 over that minute, as a bucket bound
+let window = kstat::read_tx_assign("tank")?.since(&waits);
+if let Some(p99) = window.quantile(0.99) {
+    println!("p99 tx-assign wait over the last minute: at most {p99} ns");
+}
 
 if let Some(home) = kstat::find_objset_kstat("tank/home")? {
     println!("{} writes, {} ZIL commits", home.stats.u("writes"), home.stats.u("zil_commit_count"));
 }
 ```
+
+The histograms count in power-of-two buckets, so a quantile is the bound of
+the bucket it falls in: within a factor of two. `stats::Histogram` (the
+`vdev_stats_ex` latency and request-size histograms) has the same `since`
+and `quantile`, and `VdevStatsEx::since` windows all of a vdev's histograms
+at once.
 
 None of these reads does pool I/O or takes a pool lock. `find_objset_kstat`
 scans the pool's objset kstats; to sample one dataset repeatedly, keep its
@@ -301,9 +312,10 @@ itself needs neither):
 
 - `nvlist`: decodes arbitrary bytes, runs every decoder that reads a decoded
   list (property entries and sources, the stat decoders and their derived
-  figures), and checks that whatever decodes re-packs to a fixed point.
+  figures, histogram windows and quantiles), and checks that whatever
+  decodes re-packs to a fixed point.
 - `kstat`: the kstat text parsers, with the tx-assign histogram's window
-  arithmetic checked for consistency.
+  arithmetic and quantiles checked for consistency.
 
 ```sh
 cargo run --example fuzz_seeds   # seed corpus, from this host's pools if any

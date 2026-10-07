@@ -48,6 +48,8 @@ ZoL 0.8 to OpenZFS 2.4. Reference dumps live in `doc/kstat/`.
 
 Counters are cumulative (since boot, import or mount): a rate (or a windowed
 hit ratio) is the delta between two timed reads, which is left to the caller.
+The tx-assign histogram does its own window ([`TxAssignHistogram::since`])
+and quantiles ([`TxAssignHistogram::quantile`]).
 */
 
 use std::collections::HashMap;
@@ -62,6 +64,7 @@ use std::path::PathBuf;
 use strum::{Display, EnumString};
 
 use crate::enums::{Coded, SpaLoadState};
+use crate::stats::{bucket_deltas, quantile_bucket};
 
 /// Where the SPL publishes the ZFS kstats; each imported pool has its own
 /// directory below it ([`pool_dir`]).
@@ -675,13 +678,20 @@ impl TxAssignHistogram {
     counted is new, and `self` comes back whole.
     */
     pub fn since(&self, earlier: &Self) -> Self {
-        let at = |h: &Self, i: usize| h.counts.get(i).copied().unwrap_or(0);
-        let len = self.counts.len().max(earlier.counts.len());
-        if (0..len).any(|i| at(self, i) < at(earlier, i)) {
-            return self.clone();
+        match bucket_deltas(&self.counts, &earlier.counts) {
+            Some(counts) => TxAssignHistogram { counts },
+            None => self.clone(),
         }
-        let counts = (0..self.counts.len()).map(|i| at(self, i) - at(earlier, i)).collect();
-        TxAssignHistogram { counts }
+    }
+
+    /**
+    The `q`-quantile wait (0 ≤ `q` ≤ 1; 0.99 for p99) as the upper bound of
+    the bucket holding it, ns: `q` of the waits took at most this long, and
+    the true quantile is over half of it. `None` when no wait was counted,
+    or for a `q` outside 0..=1.
+    */
+    pub fn quantile(&self, q: f64) -> Option<u64> {
+        quantile_bucket(&self.counts, q).map(Self::bucket_limit_ns)
     }
 }
 
@@ -1011,6 +1021,19 @@ mod tests {
         // a bucket going down (or one vanishing) means the counts were zeroed
         assert_eq!(h(&[1, 2]).since(&h(&[1, 3])), h(&[1, 2]));
         assert_eq!(h(&[4]).since(&h(&[4, 1])), h(&[4]));
+    }
+
+    #[test]
+    fn tx_assign_quantiles_are_bucket_bounds() {
+        let h = TxAssignHistogram::parse(TX_ASSIGN_22);
+        // 1150 waits, 36 of them in (2^30, 2^31]: p99 (rank 1139) lands there
+        assert_eq!(h.quantile(0.99), Some(1 << 31));
+        assert_eq!(h.quantile(1.0), Some(1 << 31));
+        // the fastest wait counted sits in bucket 14
+        assert_eq!(h.quantile(0.0), Some(1 << 14));
+        assert_eq!(h.quantile(1.5), None);
+        assert_eq!(h.quantile(f64::NAN), None);
+        assert_eq!(TxAssignHistogram::default().quantile(0.5), None);
     }
 
     #[test]

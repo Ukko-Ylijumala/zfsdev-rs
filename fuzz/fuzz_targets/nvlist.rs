@@ -5,7 +5,9 @@
 /*!
 `NvList::unpack` (native, and XDR as vdev labels carry it), then every decoder
 that reads a decoded list: the property entries and their sources, and the
-stat decoders with their derived figures, on each nested list and array.
+stat decoders with their derived figures, on each nested list and array
+(a histogram against itself is an empty window, and its quantiles never
+fall as `q` rises).
 Whatever decodes must survive our own encoder: `pack` either refuses cleanly
 or produces bytes that decode again and re-pack byte-identically (compared as
 bytes, not `PartialEq`, since a NaN double never equals itself).
@@ -21,6 +23,8 @@ use zfsdev::stats::{RebuildStats, ScanStats, VdevStats, VdevStatsEx};
 /// The `now`s the time-dependent figures are asked at: the epoch, a
 /// plausible present, and the far end.
 const NOWS: [u64; 3] = [0, 1_800_000_000, u64::MAX];
+/// The quantiles checked for order, ascending.
+const QUANTILES: [f64; 5] = [0.0, 0.5, 0.9, 0.99, 1.0];
 
 fn scan(s: &ScanStats) {
     let _ = (s.has_run(), s.is_active(), s.is_paused(), s.total(), s.progress());
@@ -42,7 +46,11 @@ fn stats_ex(x: &VdevStatsEx) {
     }
     for h in &x.histograms {
         let _ = (h.id(), h.count());
+        assert_eq!(h.since(h).count(), 0, "a window against itself");
+        let qs: Vec<Option<u64>> = QUANTILES.iter().map(|&q| h.quantile(q)).collect();
+        assert!(qs.is_sorted(), "a quantile fell as q rose");
     }
+    assert_eq!(x.since(x).histograms.iter().map(|h| h.count()).sum::<u64>(), 0);
 }
 
 fn walk(list: &NvList) {

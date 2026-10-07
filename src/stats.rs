@@ -19,15 +19,17 @@ line by line: `doc/reference/zfs.h` (2.2) and `doc/reference/{0.8,2.0,2.1,
 mid-array insert that the length alone can't tell apart).
 
 Derived figures that follow from the kernel fields alone (scan progress, pass
-rate, ETA — computed the way `zpool status` does) are methods; presentation is
-the caller's.
+rate, ETA — computed the way `zpool status` does; a histogram's window
+between two reads and its quantiles) are methods; presentation is the
+caller's.
 */
 
 use crate::enums::{
     CEnum, Coded, DslScanState, PoolScanFunc, VdevAux, VdevInitializeState, VdevRebuildState,
     VdevState, VdevTrimState,
 };
-use crate::nvlist::{NvData, NvList};
+use crate::nvlist::{NvData, NvList, NvPair};
+use std::collections::HashSet;
 use std::str::FromStr;
 use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 
@@ -118,6 +120,41 @@ fn fraction(part: u64, whole: u64) -> f64 {
 /// Seconds to finish `left` bytes at `rate` bytes/s; None at a standstill.
 fn eta(left: u64, rate: Option<u64>) -> Option<u64> {
     rate.filter(|&r| r > 0 && left > 0).map(|r| left / r)
+}
+
+/* --------------------------- cumulative histograms ------------------------ */
+
+/**
+The counts added between two reads of a cumulative histogram, bucket by
+bucket, or `None` when a bucket shrank: the histogram was reset in between
+(zeroed, or its vdev reopened), so `now` counts only new samples. Buckets
+missing from the shorter slice count as 0.
+*/
+pub(crate) fn bucket_deltas(now: &[u64], earlier: &[u64]) -> Option<Vec<u64>> {
+    let at = |h: &[u64], i: usize| h.get(i).copied().unwrap_or(0);
+    let len = now.len().max(earlier.len());
+    if (0..len).any(|i| at(now, i) < at(earlier, i)) {
+        return None;
+    }
+    Some(now.iter().enumerate().map(|(i, &c)| c - at(earlier, i)).collect())
+}
+
+/**
+The bucket holding the `q`-quantile (0 ≤ `q` ≤ 1) of the samples counted in
+`counts`: the first bucket by which `⌈q · total⌉` samples (at least one) have
+been counted. `None` for an empty histogram or a `q` outside 0..=1.
+*/
+pub(crate) fn quantile_bucket(counts: &[u64], q: f64) -> Option<usize> {
+    let total = counts.iter().fold(0u64, |acc, &c| acc.saturating_add(c));
+    if total == 0 || !(0.0..=1.0).contains(&q) {
+        return None;
+    }
+    let rank = ((q * total as f64).ceil() as u64).clamp(1, total);
+    let mut seen = 0u64;
+    counts.iter().position(|&c| {
+        seen = seen.saturating_add(c);
+        seen >= rank
+    })
 }
 
 /* ------------------------------ vdev_stat_t ------------------------------ */
@@ -678,7 +715,13 @@ impl HistogramKind {
     }
 }
 
-/// One cumulative (since vdev load) `vdev_stats_ex` histogram.
+/**
+One cumulative (since vdev load) `vdev_stats_ex` histogram. Bucket `i`
+counts values in `[2^i, 2^(i+1))` (`HISTO()` in zfs.h), except that bucket 0
+also takes 0 and the last bucket everything above its floor. For the
+distribution over an interval, take [`since`](Self::since) between two
+reads, then [`quantile`](Self::quantile) of that.
+*/
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Histogram {
@@ -702,6 +745,33 @@ impl Histogram {
     pub fn count(&self) -> u64 {
         self.buckets.iter().fold(0u64, |acc, &c| acc.saturating_add(c))
     }
+
+    /**
+    The samples counted since `earlier`, an older read of the same histogram,
+    bucket by bucket. A bucket smaller than before means the histogram was
+    reset in between (the vdev was reopened); then everything counted is
+    new, and `self` comes back whole.
+    */
+    pub fn since(&self, earlier: &Histogram) -> Histogram {
+        match bucket_deltas(&self.buckets, &earlier.buckets) {
+            Some(buckets) => Histogram { buckets, ..self.clone() },
+            None => self.clone(),
+        }
+    }
+
+    /**
+    The `q`-quantile (0 ≤ `q` ≤ 1; 0.99 for p99) as the upper bound of the
+    bucket holding it, ns or bytes: no more than `1 - q` of the samples were
+    this large, and the true quantile is at most a factor of two below it.
+    In the open-ended last bucket this is that bucket's floor instead, so a
+    quantile there reads "at least" (Prometheus's convention for its `+Inf`
+    bucket). `None` for an empty histogram or a `q` outside 0..=1.
+    */
+    pub fn quantile(&self, q: f64) -> Option<u64> {
+        let i = quantile_bucket(&self.buckets, q)?;
+        let last = i + 1 == self.buckets.len();
+        Some(Self::bucket_floor(if last { i } else { i + 1 }))
+    }
 }
 
 /**
@@ -724,8 +794,12 @@ impl VdevStatsEx {
         vdev.get_list(VDEV_STATS_EX_KEY).map(VdevStatsEx::decode)
     }
 
-    /// Decode the `vdev_stats_ex` nvlist itself. Arrays that aren't a known
-    /// histogram length are skipped.
+    /**
+    Decode the `vdev_stats_ex` nvlist itself. Arrays that aren't a known
+    histogram length are skipped. A name given twice counts once, as its
+    last pair, the way the kernel reads a list ([`NvList::get`]), so each
+    key names one histogram.
+    */
     pub fn decode(nv: &NvList) -> VdevStatsEx {
         let queues = IoClass::iter()
             .filter_map(|class| {
@@ -735,8 +809,12 @@ impl VdevStatsEx {
                 Some(QueueDepth { class, active, pending })
             })
             .collect();
-        let histograms = nv
-            .iter()
+        let pairs: Vec<&NvPair> = nv.iter().collect();
+        let mut seen = HashSet::new();
+        let mut last: Vec<&NvPair> = pairs.into_iter().rev().filter(|p| seen.insert(&p.name)).collect();
+        last.reverse();
+        let histograms = last
+            .into_iter()
             .filter_map(|p| match &p.data {
                 NvData::Uint64Array(buckets) => Some(Histogram {
                     key: p.name.clone(),
@@ -755,6 +833,24 @@ impl VdevStatsEx {
 
     pub fn histogram(&self, id: HistogramId) -> Option<&Histogram> {
         self.histograms.iter().find(|h| h.id() == Some(id))
+    }
+
+    /**
+    Each histogram's samples since `earlier`, an older read of the same
+    vdev's stats ([`Histogram::since`], matched by key; one `earlier` lacks
+    comes back whole). The queue depths are gauges, not counters, and stay
+    as read.
+    */
+    pub fn since(&self, earlier: &VdevStatsEx) -> VdevStatsEx {
+        let histograms = self
+            .histograms
+            .iter()
+            .map(|h| match earlier.histograms.iter().find(|e| e.key == h.key) {
+                Some(e) => h.since(e),
+                None => h.clone(),
+            })
+            .collect();
+        VdevStatsEx { queues: self.queues.clone(), histograms }
     }
 }
 
@@ -953,6 +1049,60 @@ mod tests {
         assert_eq!(ex.histograms[2].id(), None);
         assert_eq!((Histogram::bucket_floor(0), Histogram::bucket_floor(12)), (1, 4096));
         assert_eq!(Histogram::bucket_floor(64), u64::MAX);
+    }
+
+    fn latency(buckets: &[(usize, u64)]) -> Histogram {
+        let mut h = vec![0u64; VDEV_L_HISTO_BUCKETS];
+        buckets.iter().for_each(|&(i, c)| h[i] = c);
+        Histogram { key: "vdev_tot_w_lat_histo".into(), kind: HistogramKind::Latency, buckets: h }
+    }
+
+    #[test]
+    fn histogram_windows_and_quantiles() {
+        let before = latency(&[(10, 50), (20, 1)]);
+        let after = latency(&[(10, 150), (12, 99), (20, 2)]);
+        let window = after.since(&before);
+        assert_eq!(window, latency(&[(10, 100), (12, 99), (20, 1)]));
+        // 200 samples: the median is in [2^10, 2^11), p99 (rank 198) in [2^12, 2^13)
+        assert_eq!(window.quantile(0.5), Some(1 << 11));
+        assert_eq!(window.quantile(0.99), Some(1 << 13));
+        // the slowest one is in [2^20, 2^21)
+        assert_eq!(window.quantile(1.0), Some(1 << 21));
+        assert_eq!((window.quantile(-0.1), latency(&[]).quantile(0.5)), (None, None));
+        // a reopened vdev starts over: the later read is all new
+        assert_eq!(before.since(&after), before);
+        // the open-ended top bucket reports its floor: "at least 2^36 ns"
+        assert_eq!(latency(&[(36, 1)]).quantile(0.99), Some(1 << 36));
+    }
+
+    /// Fuzz find: a key given twice made `since` pair a histogram with its
+    /// twin. The last pair stands for the name, as in the kernel.
+    #[test]
+    fn stats_ex_duplicate_keys_count_once() {
+        let mut nv = NvList::new();
+        nv.push("vdev_tot_w_lat_histo", NvData::Uint64Array(latency(&[(3, 9)]).buckets));
+        nv.push("vdev_tot_r_lat_histo", NvData::Uint64Array(latency(&[(4, 1)]).buckets));
+        nv.push("vdev_tot_w_lat_histo", NvData::Uint64Array(latency(&[(5, 2)]).buckets));
+        // a later pair of another type hides the histogram altogether
+        nv.push("vdev_tot_r_lat_histo", NvData::Uint64(0));
+        let ex = VdevStatsEx::decode(&nv);
+        assert_eq!(ex.histograms, [latency(&[(5, 2)])]);
+        assert_eq!(ex.since(&ex).histograms[0].count(), 0);
+    }
+
+    #[test]
+    fn stats_ex_windows_by_key() {
+        let mut ex = VdevStatsEx::default();
+        ex.histograms.push(latency(&[(3, 4)]));
+        let mut later = ex.clone();
+        later.histograms[0].buckets[3] = 10;
+        later.histograms.push(Histogram { key: "vdev_new_histo".into(), ..latency(&[(1, 1)]) });
+        later.queues.push(QueueDepth { class: IoClass::SyncWrite, active: 1, pending: 2 });
+        let window = later.since(&ex);
+        assert_eq!(window.histograms[0], latency(&[(3, 6)]));
+        // a histogram the earlier read lacks is whole; queue depths stay as read
+        assert_eq!(window.histograms[1].count(), 1);
+        assert_eq!(window.queues, later.queues);
     }
 
     /// The config keys, through the nvlist accessors.

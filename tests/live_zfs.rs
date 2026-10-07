@@ -19,6 +19,7 @@ use zfsdev::kstat::{self, PoolHealth, TxgState};
 #[cfg(feature = "write")]
 use zfsdev::props::prop_str;
 use zfsdev::props::{PropSource, prop_entries, prop_entry, prop_u64};
+use zfsdev::stats::{HistogramId, VdevStatsEx};
 
 fn handle() -> Option<ZfsHandle> {
     if !std::path::Path::new("/dev/zfs").exists() {
@@ -90,6 +91,30 @@ fn pool_stats_has_vdev_tree() {
             kids.len(),
             kids[0].get_str("type").unwrap_or("?")
         );
+    }
+}
+
+/// Two real reads of each pool's root `vdev_stats_ex`: the window between
+/// them holds no more than the later read, and its quantiles are in order.
+#[test]
+fn vdev_histogram_windows_on_real_stats() {
+    let Some(zfs) = handle() else { return };
+    let stats_ex = |pool: &str| {
+        let stats = zfs.pool_stats(pool).expect("ZFS_IOC_POOL_STATS");
+        VdevStatsEx::from_vdev(stats.get_list("vdev_tree").expect("vdev_tree"))
+    };
+    for pair in zfs.pool_configs().expect("pool configs").iter() {
+        let Some(before) = stats_ex(&pair.name) else { continue };
+        let after = stats_ex(&pair.name).expect("stats_ex on the second read");
+        let window = after.since(&before);
+        for (w, a) in window.histograms.iter().zip(&after.histograms) {
+            assert!(w.count() <= a.count(), "{}: window over the whole", w.key);
+            let qs = [0.5, 0.99, 1.0].map(|q| a.quantile(q));
+            assert!(qs.is_sorted() && qs[0].is_some() == (a.count() > 0), "{}: {qs:?}", a.key);
+        }
+        if let Some(h) = after.histogram(HistogramId::TotalWriteLatency) {
+            eprintln!("{}: write latency p99 ≤ {:?} ns over {} writes", pair.name, h.quantile(0.99), h.count());
+        }
     }
 }
 

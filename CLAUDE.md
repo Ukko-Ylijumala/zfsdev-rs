@@ -144,8 +144,8 @@ Per-era analyses and headers live in `doc/reference/{0.6,0.7,0.8,2.0,2.1,2.3,2.4
   (`/dev/zfs` is world-rw); events, error log and history need root.
 - Fuzzing: `fuzz/` (cargo-fuzz, nightly + a C++ compiler, its own workspace
   and excluded from the package) has `nvlist` (unpack, every list decoder,
-  pack fixed point) and `kstat` (the text parsers, histogram window
-  properties). Targets check a property where there is one, not just
+  pack fixed point, histogram window and quantile order) and `kstat` (the
+  text parsers, histogram window and quantile properties). Targets check a property where there is one, not just
   no-panic. `cargo run --example fuzz_seeds` cuts a corpus (synthetic shapes,
   this host's pool nvlists, `doc/kstat/`; gitignored, regenerate rather than
   commit); `fuzz/run-all.sh [secs]` sweeps every target without a sanitizer.
