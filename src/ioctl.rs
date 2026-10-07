@@ -2233,7 +2233,7 @@ impl ZfsHandle {
     Load an encrypted dataset's wrapping key into the kernel keystore
     (ZFS_IOC_LOAD_KEY; `zfs load-key`). `dataset` must be the *encryption
     root*; `wkeydata` is the raw 32-byte wrapping key — passphrase → PBKDF2
-    derivation happens in userspace ([`crate::zfs::crypt`]), exactly like
+    derivation happens in userspace ([`super::wrapkey`]), exactly like
     libzfs; the kernel only verifies the bytes against the wrapped master
     key's MAC (EACCES = wrong key, EEXIST = already loaded). The innvl wraps
     the key as `{hidden_args: {wkeydata: uint8[]}}` (`lzc_load_key`); `noop`

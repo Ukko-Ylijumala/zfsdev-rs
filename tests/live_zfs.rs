@@ -641,7 +641,7 @@ End-to-end key management against the delegated playground `data/test`
 (mtanner holds `zfs allow` perms there): create a passphrase-encrypted
 child via the CLI (`-u` skips the mount, which delegation can't do),
 then drive UNLOAD_KEY / LOAD_KEY through our ioctls with the wrapping key
-derived by `crypt::derive_wrapping_key` from the dataset's own
+derived by `wrapkey::derive_wrapping_key` from the dataset's own
 pbkdf2salt/pbkdf2iters — including the negative case (a wrong passphrase
 must be *rejected by the kernel's MAC check*, proving the kernel really
 verified our PBKDF2 output). Skips wherever the environment is absent.
@@ -651,7 +651,7 @@ fn load_key_roundtrip_in_playground() {
     use std::io::Write;
     use std::process::{Command, Stdio};
     use zfs_browser::node::{prop_value_str, prop_value_u64};
-    use zfs_browser::zfs::crypt::derive_wrapping_key;
+    use zfs_browser::zfs::wrapkey::derive_wrapping_key;
     use zfs_browser::zfs::props::KeyFormat;
 
     const PLAYGROUND: &str = "data/test";
@@ -701,13 +701,16 @@ fn load_key_roundtrip_in_playground() {
         // the kernel must REJECT a key derived from the wrong passphrase —
         // this proves it actually checked our PBKDF2 output against the
         // wrapped master key's MAC, not just accepted 32 bytes
-        let wrong = derive_wrapping_key(KeyFormat::Passphrase, b"wrong passphrase", salt, iters)?;
+        let derive = |pass: &[u8]| {
+            derive_wrapping_key(KeyFormat::Passphrase, pass, salt, iters).map_err(|e| e.to_string())
+        };
+        let wrong = derive(b"wrong passphrase")?;
         let denied = zfs.load_key(&ds, &wrong, false);
         assert!(denied.is_err(), "wrong passphrase must be rejected");
         eprintln!("wrong-passphrase load rejected: {}", denied.unwrap_err());
         assert_eq!(keystatus(&zfs)?, 1);
 
-        let right = derive_wrapping_key(KeyFormat::Passphrase, PASS.as_bytes(), salt, iters)?;
+        let right = derive(PASS.as_bytes())?;
         // noop first (zfs load-key -n): verifies without loading
         zfs.load_key(&ds, &right, true).map_err(|e| format!("noop load: {e}"))?;
         assert_eq!(keystatus(&zfs)?, 1, "noop load must not keep the key loaded");
