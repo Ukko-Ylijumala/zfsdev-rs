@@ -21,9 +21,10 @@ scraping.
 - [`enums`], [`props`]: typed mirrors of the C enums and property values.
   [`enums::Coded`] keeps the raw number of a value newer than this crate.
 - [`kstat`]: the SPL kstats in `/proc/spl/kstat/zfs`: ARC metrics, the
-  imported pools listed without a ZFS lock, and per pool the txg history, the tx-assign delay histogram, the per-dataset I/O
-  counters and the lock-free health word. It is plain procfs, with no ioctl
-  involved.
+  imports in progress, the debug log, the imported pools listed without a
+  ZFS lock, and per pool the txg history, the tx-assign delay histogram, the
+  per-dataset I/O counters and the lock-free health word. It is plain
+  procfs, with no ioctl involved.
 - [`wrapkey`]: libzfs's native-encryption wrapping-key derivation (the
   userspace half of `zfs load-key`).
 

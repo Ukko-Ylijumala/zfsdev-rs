@@ -298,6 +298,27 @@ impl PoolState {
     }
 }
 
+/// spa_load_state_t (zfs.h) - what a pool load is doing: the `load_state`
+/// of the `import_progress` kstat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[strum(serialize_all = "lowercase")]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum SpaLoadState {
+    None = 0,
+    /// The normal open of an imported pool.
+    Open,
+    Import,
+    /// The `zpool import` device scan: a trial load, discarded afterwards.
+    #[strum(serialize = "tryimport")]
+    TryImport,
+    /// A recovery import (`zpool import -F`) rewinding to an older txg.
+    Recover,
+    /// The load failed.
+    Error,
+    Create,
+}
+
 /**
 VDEV_TYPE_* (zfs.h) — the string `type` of every vdev_tree nvlist node.
 String-valued (no repr), parsed with `FromStr`; a type a newer kernel adds
@@ -819,6 +840,7 @@ impl_cenum!(
     BpEmbeddedType,
     ZioChecksum,
     PoolState,
+    SpaLoadState,
     VdevState,
     VdevAux,
     ZpropSource,

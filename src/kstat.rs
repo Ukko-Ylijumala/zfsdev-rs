@@ -10,7 +10,9 @@ procfs files (and the readers here) exist on Linux only; the parsers are
 portable.
 
 Host-wide there are the ARC's `arcstats` (the `arc_summary` / `arcstat`
-data), the prefetcher's `zfetchstats` and the DMU's `dmu_tx` counters. Each
+data), the prefetcher's `zfetchstats`, the DMU's `dmu_tx` counters, the pool
+loads in progress (`import_progress`, [`ImportProgress`]) and the module's
+debug log (`dbgmsg`, [`DbgMsg`], root only). Each
 imported pool has a directory of its own, `/proc/spl/kstat/zfs/<pool>/`
 ([`pool_names`] lists them, the one pool list that needs no ZFS lock):
 
@@ -59,6 +61,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use strum::{Display, EnumString};
 
+use crate::enums::{Coded, SpaLoadState};
+
 /// Where the SPL publishes the ZFS kstats; each imported pool has its own
 /// directory below it ([`pool_dir`]).
 #[cfg(target_os = "linux")]
@@ -73,6 +77,12 @@ pub const ZFETCHSTATS_PATH: &str = "/proc/spl/kstat/zfs/zfetchstats";
 /// and the throttle events (`dmu_tx_dirty_throttle`, `dmu_tx_dirty_delay`, …).
 #[cfg(target_os = "linux")]
 pub const DMU_TX_PATH: &str = "/proc/spl/kstat/zfs/dmu_tx";
+/// The pool loads (imports) in progress ([`ImportProgress`]).
+#[cfg(target_os = "linux")]
+pub const IMPORT_PROGRESS_PATH: &str = "/proc/spl/kstat/zfs/import_progress";
+/// The ZFS debug log ([`DbgMsg`]); readable by root only.
+#[cfg(target_os = "linux")]
+pub const DBGMSG_PATH: &str = "/proc/spl/kstat/zfs/dbgmsg";
 
 /// A dataset's kstat file in its pool's directory: the prefix, then the
 /// objset id in hex.
@@ -682,6 +692,116 @@ pub fn read_tx_assign(pool: &str) -> io::Result<TxAssignHistogram> {
     Ok(TxAssignHistogram::parse(&text))
 }
 
+/* ====================== pool loads and the debug log ===================== */
+
+/**
+A pool load in progress, from the host-wide `import_progress` table: a
+`zpool import` (or `zpool import -F` recovery, or a tryimport scan) while it
+runs. An import holds the pool namespace lock for its whole load, so while
+one runs every pool ioctl on the host waits for it; this table, which takes
+no ZFS lock, is where that shows. The format is unchanged from ZoL 0.8 to
+OpenZFS 2.3; 2.4 appends the `notes` column.
+*/
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImportProgress {
+    pub pool_guid: u64,
+    /// The pool's name, `None` until the load knows it.
+    pub pool: Option<String>,
+    pub load_state: Coded<SpaLoadState>,
+    /// How long the multihost (MMP) activity check waits, seconds: the
+    /// import watches that long for another host still writing the pool.
+    pub multihost_secs: u64,
+    /// The newest txg the load may use: lowered step by step as a recovery
+    /// import rewinds, `u64::MAX` when uncapped.
+    pub max_txg: u64,
+    /// What the load is doing, in the kernel's words (2.4 on).
+    pub notes: Option<String>,
+}
+
+/**
+Parse an `import_progress` table: a header line, then one row per load.
+Columns are found by their header names; `notes` is free text and runs to
+the end of the line. A `-` name or note is absent.
+*/
+pub fn parse_import_progress(text: &str) -> Vec<ImportProgress> {
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else { return Vec::new() };
+    let cols: HashMap<&str, usize> =
+        header.split_whitespace().enumerate().map(|(i, c)| (c, i)).collect();
+    let present = |s: &str| (s != "-").then(|| s.to_string());
+    lines
+        .filter_map(|line| {
+            let row: Vec<&str> = line.split_whitespace().collect();
+            let field = |name: &str| row.get(*cols.get(name)?).copied();
+            let num = |name: &str| field(name)?.parse::<u64>().ok();
+            let notes = cols
+                .get("notes")
+                .and_then(|&i| token_spans(line).nth(i))
+                .map(|(start, _)| line[start..].trim_end());
+            Some(ImportProgress {
+                pool_guid: num("pool_guid")?,
+                pool: present(field("pool_name")?),
+                load_state: Coded::new(num("load_state")?),
+                multihost_secs: num("multihost_secs")?,
+                max_txg: num("max_txg")?,
+                notes: notes.and_then(present),
+            })
+        })
+        .collect()
+}
+
+/// The pool loads in progress on this host ([`parse_import_progress`]).
+#[cfg(target_os = "linux")]
+pub fn read_import_progress() -> io::Result<Vec<ImportProgress>> {
+    Ok(parse_import_progress(&fs::read_to_string(IMPORT_PROGRESS_PATH)?))
+}
+
+/**
+One entry of the ZFS debug log (`dbgmsg`): the module's ring of internal
+messages (`zfs_dbgmsg()`), such as pool load steps, scan and device-removal
+progress, multihost checks, and errors the code chose to record. Messages
+are kept while the `zfs_dbgmsg_enable` module parameter is set (the Linux
+default), up to `zfs_dbgmsg_maxsize` bytes, oldest dropped first. Reading the
+file needs root.
+*/
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DbgMsg {
+    /// When it was logged, Unix seconds.
+    pub time: u64,
+    /// The message, usually prefixed `file.c:line:function(): `.
+    pub message: String,
+}
+
+/**
+Parse the debug log, oldest first: a header line, then `<timestamp>
+<message>` lines. A message with a newline in it spans lines; a line that
+doesn't start with a timestamp continues the message before it.
+*/
+pub fn parse_dbgmsg(text: &str) -> Vec<DbgMsg> {
+    let mut out: Vec<DbgMsg> = Vec::new();
+    for line in text.lines().skip(1) {
+        let (first, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        match (first.parse::<u64>(), out.last_mut()) {
+            (Ok(time), _) => out.push(DbgMsg { time, message: rest.trim_start().to_string() }),
+            (Err(_), Some(last)) => {
+                last.message.push('\n');
+                last.message.push_str(line);
+            }
+            (Err(_), None) => {}
+        }
+    }
+    out
+}
+
+/// The ZFS debug log, oldest first ([`parse_dbgmsg`]). `PermissionDenied`
+/// unless root.
+#[cfg(target_os = "linux")]
+pub fn read_dbgmsg() -> io::Result<Vec<DbgMsg>> {
+    Ok(parse_dbgmsg(&fs::read_to_string(DBGMSG_PATH)?))
+}
+
 /* ================================ tests ================================== */
 
 #[cfg(test)]
@@ -940,5 +1060,47 @@ mod tests {
         let names = pool_names_in(&dir);
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(names.unwrap(), ["rpool", "tank"]);
+    }
+
+    /// Both table eras, as spa_import_progress_show prints them: the 2.4 one
+    /// adds the free-text `notes` column.
+    #[test]
+    fn import_progress_parses_both_eras() {
+        let v22 = "pool_guid            load_state     multihost_secs max_txg      pool_name\n\
+                   12345678901234567890 2              10             18446744073709551615 tank\n\
+                   42                   3              0              18446744073709551615 -\n";
+        let rows = parse_import_progress(v22);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].pool.as_deref(), Some("tank"));
+        assert_eq!(rows[0].load_state.get(), Some(SpaLoadState::Import));
+        assert_eq!((rows[0].multihost_secs, rows[0].max_txg, rows[0].notes.as_deref()), (10, u64::MAX, None));
+        // a tryimport scan before it knows the name
+        assert_eq!((rows[1].pool.as_deref(), rows[1].load_state.to_string().as_str()), (None, "tryimport"));
+
+        let v24 = "pool_guid            load_state     multihost_secs max_txg      pool_name        notes\n\
+                   7                    4              0              1234         tank             Loading checkpoint txg\n\
+                   8                    9              0              5            data             -\n";
+        let rows = parse_import_progress(v24);
+        assert_eq!(rows[0].notes.as_deref(), Some("Loading checkpoint txg"));
+        assert_eq!(rows[0].load_state.get(), Some(SpaLoadState::Recover));
+        // a load state newer than this crate keeps its number
+        assert_eq!((rows[1].load_state.to_string().as_str(), rows[1].notes.as_deref()), ("?9", None));
+        assert!(parse_import_progress("").is_empty());
+    }
+
+    #[test]
+    fn dbgmsg_entries_and_continuations() {
+        let text = "timestamp    message \n\
+                    1696000000   spa.c:6624:spa_import(): spa_import: importing tank\n\
+                    1696000001   a message with\n\
+                    a second line\n\
+                    1696000002   \n";
+        let msgs = parse_dbgmsg(text);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].time, 1696000000);
+        assert_eq!(msgs[0].message, "spa.c:6624:spa_import(): spa_import: importing tank");
+        assert_eq!(msgs[1].message, "a message with\na second line");
+        assert_eq!(msgs[2].message, "");
+        assert!(parse_dbgmsg("timestamp    message \n").is_empty());
     }
 }
