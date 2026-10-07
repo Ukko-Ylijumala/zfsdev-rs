@@ -5,21 +5,97 @@
 /*!
 Typed mirrors of the on-disk/ioctl C enums (`doc/reference/zfs.h`, `zio.h`,
 `zio_compress.h`, `dmu.h`). `FromRepr` converts the raw numeric values,
-`Display` renders the conventional lowercase names; unknown values surface
-through the `from_*` helpers as a formatted fallback rather than panicking,
-since on-disk data can always be newer (or junk).
+`Display` gives the conventional C names; unknown values surface as a `?N`
+fallback rather than panicking, since kernel and on-disk data can always be
+newer than we are (or junk). [`Coded`] carries such a value through the typed
+APIs without losing the raw number.
 */
 
+use std::fmt;
+use std::marker::PhantomData;
 use strum::{Display, EnumString, FromRepr};
+
+/**
+A C enum mirrored as a `repr(u8)` Rust enum: conversion from the raw value the
+kernel or the disk carries (`None` when out of range). strum's `from_repr` is
+an inherent fn, so this trait is the bridge generic code needs ([`Coded`],
+property-value decoding).
+*/
+pub trait CEnum: Sized + Copy {
+    fn from_raw(v: u64) -> Option<Self>;
+}
+
+/// Implement [`CEnum`] for `repr(u8)` strum `FromRepr` enums.
+macro_rules! impl_cenum {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl CEnum for $ty {
+            fn from_raw(v: u64) -> Option<Self> {
+                u8::try_from(v).ok().and_then(Self::from_repr)
+            }
+        })+
+    };
+}
+pub(crate) use impl_cenum;
 
 /// Render an enum value or a `?N` fallback for out-of-range raw values.
 macro_rules! name_or_unknown {
     ($ty:ty, $v:expr) => {
-        match u8::try_from($v).ok().and_then(<$ty>::from_repr) {
-            Some(x) => x.to_string(),
-            None => format!("?{}", $v),
-        }
+        Coded::<$ty>::new(u64::from($v)).to_string()
     };
+}
+
+/**
+A C enum value exactly as the kernel (or the disk) reported it: the raw number
+always, the typed variant when this build knows it. A newer OpenZFS can add
+values we have never seen; those are kept rather than lost or panicked on, and
+display as `?N`.
+*/
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Coded<E> {
+    raw: u64,
+    _enum: PhantomData<E>,
+}
+
+impl<E: CEnum> Coded<E> {
+    pub fn new(raw: u64) -> Self {
+        Coded { raw, _enum: PhantomData }
+    }
+
+    /// The value as the kernel reported it.
+    pub fn raw(self) -> u64 {
+        self.raw
+    }
+
+    /// The typed value, `None` when this build doesn't know it.
+    pub fn get(self) -> Option<E> {
+        E::from_raw(self.raw)
+    }
+
+    /// Whether the value is exactly `e`.
+    pub fn is(self, e: E) -> bool
+    where
+        E: PartialEq,
+    {
+        self.get() == Some(e)
+    }
+}
+
+impl<E: CEnum + fmt::Display> fmt::Display for Coded<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.get() {
+            Some(e) => e.fmt(f),
+            None => write!(f, "?{}", self.raw),
+        }
+    }
+}
+
+impl<E: CEnum + fmt::Debug> fmt::Debug for Coded<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.get() {
+            Some(e) => e.fmt(f),
+            None => write!(f, "?{}", self.raw),
+        }
+    }
 }
 
 /// zio_compress (zio_compress.h)
@@ -646,6 +722,49 @@ impl VdevRebuildState {
     }
 }
 
+/// vdev_initializing_state_t (zfs.h) - per-leaf `zpool initialize` state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[strum(serialize_all = "lowercase")]
+#[repr(u8)]
+pub enum VdevInitializeState {
+    None = 0,
+    Active,
+    Canceled,
+    Suspended,
+    Complete,
+}
+
+/// vdev_trim_state_t (zfs.h) - per-leaf `zpool trim` state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[strum(serialize_all = "lowercase")]
+#[repr(u8)]
+pub enum VdevTrimState {
+    None = 0,
+    Active,
+    Canceled,
+    Suspended,
+    Complete,
+}
+
+impl_cenum!(
+    ZioCompress,
+    ZstdLevel,
+    BpEmbeddedType,
+    ZioChecksum,
+    PoolState,
+    VdevState,
+    VdevAux,
+    ObjsetType,
+    DirentType,
+    DmuByteswap,
+    DmuObjectType,
+    PoolScanFunc,
+    DslScanState,
+    VdevRebuildState,
+    VdevInitializeState,
+    VdevTrimState,
+);
+
 /* ========================================================================= */
 
 #[cfg(test)]
@@ -682,5 +801,21 @@ mod tests {
         assert_eq!(ZioChecksum::from_repr(11), Some(ZioChecksum::Sha512));
         assert_eq!(DmuObjectType::from_repr(12), Some(DmuObjectType::DslDir));
         assert_eq!(DirentType::from_repr(4), Some(DirentType::Dir));
+    }
+
+    /// A newer kernel's unknown value survives the trip: raw kept, `?N` shown.
+    #[test]
+    fn coded_keeps_unknown_values() {
+        let known = Coded::<VdevState>::new(7);
+        assert_eq!(known.get(), Some(VdevState::Healthy));
+        assert!(known.is(VdevState::Healthy));
+        assert_eq!(known.to_string(), "HEALTHY");
+        let future = Coded::<VdevState>::new(42);
+        assert_eq!((future.get(), future.raw()), (None, 42));
+        assert!(!future.is(VdevState::Healthy));
+        assert_eq!(future.to_string(), "?42");
+        assert_eq!(format!("{future:?}"), "?42");
+        // a value past u8 can't be any repr(u8) variant
+        assert_eq!(Coded::<VdevTrimState>::new(256 + 1).get(), None);
     }
 }

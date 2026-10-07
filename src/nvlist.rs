@@ -958,48 +958,6 @@ impl NvData {
             NvData::Unknown { .. } => "unknown",
         }
     }
-
-    /// Short single-line rendering for list views.
-    pub fn summary(&self) -> String {
-        fn arr<T: std::fmt::Display>(v: &[T]) -> String {
-            const MAX: usize = 4; // keep summaries (and node labels) short
-            let shown: Vec<String> = v.iter().take(MAX).map(|x| x.to_string()).collect();
-            let ell = if v.len() > MAX { ", …" } else { "" };
-            format!("[{}{ell}] ({} elems)", shown.join(", "), v.len())
-        }
-        match self {
-            NvData::BooleanFlag => "(set)".into(),
-            NvData::Boolean(b) => b.to_string(),
-            NvData::Byte(v) => format!("{v:#04x}"),
-            NvData::Int8(v) => v.to_string(),
-            NvData::Uint8(v) => v.to_string(),
-            NvData::Int16(v) => v.to_string(),
-            NvData::Uint16(v) => v.to_string(),
-            NvData::Int32(v) => v.to_string(),
-            NvData::Uint32(v) => v.to_string(),
-            NvData::Int64(v) => v.to_string(),
-            NvData::Uint64(v) => v.to_string(),
-            NvData::HrTime(v) => format!("{v} ns"),
-            NvData::Double(v) => v.to_string(),
-            NvData::Str(s) => s.clone(),
-            NvData::ByteArray(v) => format!("{} bytes", v.len()),
-            NvData::Int8Array(v) => arr(v),
-            NvData::Uint8Array(v) => arr(v),
-            NvData::Int16Array(v) => arr(v),
-            NvData::Uint16Array(v) => arr(v),
-            NvData::Int32Array(v) => arr(v),
-            NvData::Uint32Array(v) => arr(v),
-            NvData::Int64Array(v) => arr(v),
-            NvData::Uint64Array(v) => arr(v),
-            NvData::BooleanArray(v) => arr(v),
-            NvData::StrArray(v) => arr(v),
-            NvData::List(l) => format!("nvlist ({} pairs)", l.pairs.len()),
-            NvData::ListArray(a) => format!("nvlist[{}]", a.len()),
-            NvData::Unknown { dtype, raw } => {
-                format!("unknown type {dtype} ({} bytes)", raw.len())
-            }
-        }
-    }
 }
 
 /* ========================================================================= */

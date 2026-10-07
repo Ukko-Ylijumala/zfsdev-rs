@@ -3,17 +3,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /*!
-Human-friendly rendering of numeric ZFS property values. Property names
-parse into [`ZfsProp`] (strum `EnumString`, lowercase) and the small value
-enums mirror the `ZFS_*` value constants from `doc/reference/zfs.h` — so
-both the dispatch and the value names are typo-proof enums rather than
-string tables. Used by the live ioctl property views and the on-disk DSL
-props ZAPs alike; the names are the same in both worlds.
+Typed ZFS property values. [`decode_prop_value`] says what a numeric value
+*means* ([`PropValue`]: a name, bytes, a time, a ratio, …), and
+[`parse_prop_value`] turns user input into the typed [`NvData`] SET_PROP
+wants; presentation is left to the caller. Property names parse into
+[`ZfsProp`] (strum `EnumString`, lowercase) and the small value enums mirror
+the `ZFS_*` value constants from `doc/reference/zfs.h` — so both the dispatch
+and the value names are typo-proof enums rather than string tables. Used by
+the live ioctl property views and the on-disk DSL props ZAPs alike; the names
+are the same in both worlds.
 */
 
-use crate::util::{fmt_unix_time, human_bytes};
-use crate::zfs::enums::{ZioChecksum, ZioCompress, ZstdLevel};
+use crate::zfs::enums::{CEnum, Coded, ZioChecksum, ZioCompress, ZstdLevel, impl_cenum};
 use crate::zfs::nvlist::NvData;
+use std::fmt;
 use std::str::FromStr;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoEnumIterator};
 
@@ -124,7 +127,7 @@ first requested property whose handler errors - so the settable/tunable props
 whose getters can fail (`comment`, `allocating`, `checksum_n`/`_t`,
 `io_n`/`_t`) are deliberately excluded, leaving only the always-available
 cases. [`request_names`](VdevProp::request_names) yields the full set for the
-input nvlist. Values render via [`format_prop_value`] where the names overlap
+input nvlist. Values decode via [`decode_prop_value`] where the names overlap
 pool/dataset props (size/free/allocated/fragmentation), raw otherwise.
 */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumIter)]
@@ -282,27 +285,12 @@ value_enum!(Encryption {
     Aes256Gcm,
 });
 
-/// `value_enum` lookup: enum display name for an in-range value, else None.
-fn ev<E: TryFromU64 + std::fmt::Display>(v: u64) -> Option<String> {
-    E::try_from_u64(v).map(|e| e.to_string())
+/// `value_enum` lookup: the variant's name for an in-range value, else None.
+fn ev<E: CEnum + fmt::Display>(v: u64) -> Option<PropValue> {
+    E::from_raw(v).map(|e| PropValue::Name(e.to_string()))
 }
 
-/// Bridge trait because strum's `from_repr` is an inherent fn, not a trait.
-trait TryFromU64: Sized {
-    fn try_from_u64(v: u64) -> Option<Self>;
-}
-
-macro_rules! impl_try_from_u64 {
-    ($($ty:ty),+ $(,)?) => {
-        $(impl TryFromU64 for $ty {
-            fn try_from_u64(v: u64) -> Option<Self> {
-                u8::try_from(v).ok().and_then(Self::from_repr)
-            }
-        })+
-    };
-}
-
-impl_try_from_u64!(
+impl_cenum!(
     Canmount,
     AclMode,
     AclInherit,
@@ -322,67 +310,96 @@ impl_try_from_u64!(
     Encryption,
 );
 
-/* ------------------------------- rendering ------------------------------- */
+/* ------------------------------- decoding -------------------------------- */
 
-/// Render a numeric property value by property name. Returns None when the
-/// name isn't a known property (caller shows the raw value).
-pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
+/**
+What a numeric property value *means*: the raw `uint64` the kernel (or an
+on-disk DSL props ZAP) stores, decoded by its property. Presentation - units,
+precision, wording - is the caller's.
+*/
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PropValue {
+    /**
+    A named value, spelled the way `zfs get` prints it: `lz4`, `zstd-3`,
+    `on`, `restricted`, `sha256,verify`, … An out-of-range algorithm value
+    comes through as `?N`.
+    */
+    Name(String),
+    /// A byte quantity.
+    Bytes(u64),
+    /// A plain number: copies, ashift, filesystem/snapshot limits.
+    Count(u64),
+    /// A unix timestamp (seconds).
+    Time(u64),
+    /// A ratio in hundredths (`compressratio` 150 = 1.50x).
+    Ratio(u64),
+    /// A percentage.
+    Percent(u64),
+    /// Explicitly unset, `none` in `zfs get` (quota 0, a limit of UINT64_MAX).
+    Unset,
+    /// Not computed (`fragmentation` without a spacemap histogram).
+    Unavailable,
+}
+
+/// Decode a numeric property value by property name. Returns None when the
+/// name isn't a property we model, or the value is out of its range.
+pub fn decode_prop_value(name: &str, v: u64) -> Option<PropValue> {
+    use PropValue as V;
     use ZfsProp as P;
-    let s = match P::from_str(name).ok()? {
+    let name_of = |s: &str| V::Name(s.into());
+    Some(match P::from_str(name).ok()? {
         /*
         zstd carries its level in the property value above the algorithm
         bits: `ZIO_COMPRESS_ZSTD | (zio_zstd_levels << SPA_COMPRESSBITS(7))`
         — so `zstd-3` is stored as 400, not as an enum ordinal.
         */
-        P::Compression => match (v & 0x7f, v >> 7) {
-            (_, 0) => match u8::try_from(v) {
-                Ok(b) => ZioCompress::name(b),
-                Err(_) => format!("?{v}"),
-            },
+        P::Compression => V::Name(match (v & 0x7f, v >> 7) {
+            (_, 0) => Coded::<ZioCompress>::new(v).to_string(),
             (base, level) if base == ZioCompress::Zstd as u64 => {
-                match u8::try_from(level).ok().and_then(ZstdLevel::from_repr) {
+                match ZstdLevel::from_raw(level) {
                     Some(l) => format!("zstd-{l}"),
                     None => format!("zstd-?{level}"),
                 }
             }
             _ => format!("?{v}"), // level bits on a level-less algorithm
-        },
-        P::Checksum => match u8::try_from(v) {
-            Ok(b) => ZioChecksum::name(b),
-            Err(_) => format!("?{v}"),
-        },
+        }),
+        P::Checksum => V::Name(Coded::<ZioChecksum>::new(v).to_string()),
         /*
         dedup stores a zio_checksum value with the ZIO_CHECKSUM_VERIFY bit
         (1<<8) possibly set (dedup_table in zfs_prop.c): plain "verify" is
         on|verify (257), the named algorithms render "sha256,verify" style.
         */
         P::Dedup => {
-            let base = ZioChecksum::name((v & 0xff) as u8);
-            match (v & 0x100 != 0, v & 0xff) {
+            let base = Coded::<ZioChecksum>::new(v & 0xff).to_string();
+            V::Name(match (v & 0x100 != 0, v & 0xff) {
                 (false, _) => base,
                 (true, 1) => "verify".into(),
                 (true, _) => format!("{base},verify"),
-            }
+            })
         }
 
-        // plain small numbers: the raw value says it all (ashift 0 = auto)
-        P::Copies => return None,
+        // plain small numbers (ashift 0 = auto)
+        P::Copies => V::Count(v),
         P::Ashift => match v {
-            0 => "auto".into(),
-            _ => return None,
+            0 => name_of("auto"),
+            _ => V::Count(v),
         },
         // 0 = unset for the quota/reservation family only (zfs get: "none")
-        P::Quota | P::Reservation | P::Refquota | P::Refreservation => {
-            if v == 0 { "none".into() } else { human_bytes(v) }
-        }
+        P::Quota | P::Reservation | P::Refquota | P::Refreservation => match v {
+            0 => V::Unset,
+            _ => V::Bytes(v),
+        },
         // counts, not sizes; UINT64_MAX is the "none" default
-        P::FilesystemLimit | P::SnapshotLimit => {
-            if v == u64::MAX { "none".into() } else { v.to_string() }
-        }
-        // 0 is a real value here (no small blocks go special), shown as-is
-        P::SpecialSmallBlocks => {
-            if v == 0 { "0".into() } else { human_bytes(v) }
-        }
+        P::FilesystemLimit | P::SnapshotLimit => match v {
+            u64::MAX => V::Unset,
+            _ => V::Count(v),
+        },
+        // 0 is a real value here (no small blocks go special), `zfs get` says "0"
+        P::SpecialSmallBlocks => match v {
+            0 => V::Count(0),
+            _ => V::Bytes(v),
+        },
         P::Used
         | P::Available
         | P::Referenced
@@ -403,20 +420,15 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
         | P::Leaked
         | P::Checkpoint
         | P::BcloneUsed
-        | P::BcloneSaved => human_bytes(v), // a real 0B, as zfs get shows it
+        | P::BcloneSaved => V::Bytes(v), // a real 0B, as zfs get shows it
 
-        P::Creation => fmt_unix_time(v),
-        P::CompressRatio | P::RefCompressRatio | P::BcloneRatio => {
-            format!("{}.{:02}x", v / 100, v % 100)
-        }
+        P::Creation => V::Time(v),
+        P::CompressRatio | P::RefCompressRatio | P::BcloneRatio => V::Ratio(v),
         // u64::MAX = ZFS_FRAG_INVALID (no spacemap histogram) — zpool shows "-"
-        P::Fragmentation => {
-            if v == u64::MAX {
-                "-".into()
-            } else {
-                format!("{v}%")
-            }
-        }
+        P::Fragmentation => match v {
+            u64::MAX => V::Unavailable,
+            _ => V::Percent(v),
+        },
 
         P::Atime
         | P::Relatime
@@ -436,8 +448,8 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
         | P::Delegation
         | P::ListSnapshots
         | P::AutoTrim
-        | P::MultiHost => (if v != 0 { "on" } else { "off" }).into(),
-        P::Mounted => (if v != 0 { "yes" } else { "no" }).into(),
+        | P::MultiHost => name_of(if v != 0 { "on" } else { "off" }),
+        P::Mounted => name_of(if v != 0 { "yes" } else { "no" }),
 
         P::Canmount => ev::<Canmount>(v)?,
         P::AclMode => ev::<AclMode>(v)?,
@@ -456,13 +468,13 @@ pub fn format_prop_value(name: &str, v: u64) -> Option<String> {
         P::KeyFormat => ev::<KeyFormat>(v)?,
         P::KeyStatus => ev::<KeyStatus>(v)?,
         P::Encryption => ev::<Encryption>(v)?,
+        // legacy = fixed 512-byte dnodes; auto = ZFS_DNSIZE_AUTO
         P::DnodeSize => match v {
-            0 => "legacy (512)".into(),
-            1 => "auto".into(), // ZFS_DNSIZE_AUTO
-            n => human_bytes(n),
+            0 => name_of("legacy"),
+            1 => name_of("auto"),
+            n => V::Bytes(n),
         },
-    };
-    Some(format!("{s} ({v})"))
+    })
 }
 
 /* ------------------------------- parsing --------------------------------- */
@@ -763,7 +775,7 @@ fn parse_bool(s: &str) -> Result<u64, String> {
 }
 
 /// Parse a byte size like `128K`, `1.5G`, `4096` (1024-based, optional 'B').
-pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
+pub fn parse_size(s: &str) -> Result<u64, String> {
     let lower = s.trim().to_lowercase();
     let split = lower
         .find(|c: char| !c.is_ascii_digit() && c != '.')
@@ -839,54 +851,66 @@ mod tests {
     #[rustfmt::skip]
     #[test]
     fn known_mappings() {
-        assert_eq!(format_prop_value("compression", 15).unwrap(), "lz4 (15)");
-        assert_eq!(format_prop_value("compression", 16).unwrap(), "zstd (16)");
-        assert_eq!(format_prop_value("compression", 16 | (3 << 7)).unwrap(), "zstd-3 (400)");
-        assert_eq!(format_prop_value("compression", 16 | (112 << 7)).unwrap(),
-                   "zstd-fast-10 (14352)");
-        assert_eq!(format_prop_value("checksum", 14).unwrap(), "blake3 (14)");
-        assert_eq!(format_prop_value("xattr", 2).unwrap(), "sa (2)");
-        assert_eq!(format_prop_value("atime", 0).unwrap(), "off (0)");
-        assert_eq!(format_prop_value("recordsize", 131072).unwrap(), "128K (131072)");
+        use PropValue::*;
+        let d = decode_prop_value;
+        let name = |s: &str| Some(Name(s.into()));
+        assert_eq!(d("compression", 15), name("lz4"));
+        assert_eq!(d("compression", 16), name("zstd"));
+        assert_eq!(d("compression", 16 | (3 << 7)), name("zstd-3"));
+        assert_eq!(d("compression", 16 | (112 << 7)), name("zstd-fast-10"));
+        assert_eq!(d("compression", 15 | (3 << 7)), name(&format!("?{}", 15 | (3 << 7))));
+        assert_eq!(d("compression", 99), name("?99"));
+        assert_eq!(d("checksum", 14), name("blake3"));
+        assert_eq!(d("xattr", 2), name("sa"));
+        assert_eq!(d("atime", 0), name("off"));
+        assert_eq!(d("mounted", 1), name("yes"));
+        assert_eq!(d("recordsize", 131072), Some(Bytes(131072)));
         // ZFS_ACL_* values are sparse: restricted = 4 (the aclinherit default)
-        assert_eq!(format_prop_value("aclinherit", 4).unwrap(), "restricted (4)");
-        assert_eq!(format_prop_value("aclinherit", 5).unwrap(), "passthrough-x (5)");
-        assert_eq!(format_prop_value("aclmode", 3).unwrap(), "passthrough (3)");
-        assert_eq!(format_prop_value("aclmode", 1), None); // noallow isn't an aclmode
+        assert_eq!(d("aclinherit", 4), name("restricted"));
+        assert_eq!(d("aclinherit", 5), name("passthrough-x"));
+        assert_eq!(d("aclmode", 3), name("passthrough"));
+        assert_eq!(d("aclmode", 1), None); // noallow isn't an aclmode
         // normalization stores u8_textprep flags, not a dense enum
-        assert_eq!(format_prop_value("normalization", 0x10).unwrap(), "formD (16)");
-        assert_eq!(format_prop_value("normalization", 0x50).unwrap(), "formC (80)");
-        assert_eq!(format_prop_value("normalization", 0x60).unwrap(), "formKC (96)");
-        assert_eq!(format_prop_value("special_small_blocks", 0).unwrap(), "0 (0)");
+        assert_eq!(d("normalization", 0x10), name("formD"));
+        assert_eq!(d("normalization", 0x50), name("formC"));
+        assert_eq!(d("normalization", 0x60), name("formKC"));
+        assert_eq!(d("special_small_blocks", 0), Some(Count(0)));
+        assert_eq!(d("special_small_blocks", 4096), Some(Bytes(4096)));
         // sizes: integers exact past 2^53, fractions fine, overflow refused
         assert_eq!(parse_size("9007199254740993").unwrap(), 9_007_199_254_740_993);
         assert_eq!(parse_size("1.5G").unwrap(), 3 << 29);
         assert_eq!(parse_size("8K").unwrap(), 8192);
         assert!(parse_size("20E").is_err() && parse_size("1e30").is_err());
-        assert_eq!(format_prop_value("quota", 0).unwrap(), "none (0)");
-        assert_eq!(format_prop_value("written", 0).unwrap(), "0B (0)");
-        assert_eq!(format_prop_value("snapshot_limit", u64::MAX).unwrap(), format!("none ({})", u64::MAX));
-        assert_eq!(format_prop_value("filesystem_limit", 12).unwrap(), "12 (12)");
-        assert_eq!(format_prop_value("no_such_prop", 7), None);
-        // out-of-range enum value falls back to raw display
-        assert_eq!(format_prop_value("canmount", 9), None);
-        // volmode: GEOM==FULL==1 displays "full" like `zfs get`
-        assert_eq!(format_prop_value("volmode", 1).unwrap(), "full (1)");
-        assert_eq!(format_prop_value("volmode", 2).unwrap(), "dev (2)");
-        assert_eq!(format_prop_value("volmode", 3).unwrap(), "none (3)");
+        assert_eq!(d("quota", 0), Some(Unset));
+        assert_eq!(d("quota", 1 << 30), Some(Bytes(1 << 30)));
+        assert_eq!(d("written", 0), Some(Bytes(0)));
+        assert_eq!(d("snapshot_limit", u64::MAX), Some(Unset));
+        assert_eq!(d("filesystem_limit", 12), Some(Count(12)));
+        assert_eq!(d("copies", 2), Some(Count(2)));
+        assert_eq!((d("ashift", 0), d("ashift", 12)), (name("auto"), Some(Count(12))));
+        assert_eq!(d("no_such_prop", 7), None);
+        // out-of-range enum value: nothing to decode
+        assert_eq!(d("canmount", 9), None);
+        // volmode: GEOM==FULL==1 decodes "full" like `zfs get`
+        assert_eq!(d("volmode", 1), name("full"));
+        assert_eq!(d("volmode", 2), name("dev"));
+        assert_eq!(d("volmode", 3), name("none"));
         // encryption: zio_encrypt has INHERIT=0/ON/OFF then the suites 3..=8
-        assert_eq!(format_prop_value("encryption", 2).unwrap(), "off (2)");
-        assert_eq!(format_prop_value("encryption", 6).unwrap(), "aes-128-gcm (6)");
-        assert_eq!(format_prop_value("encryption", 8).unwrap(), "aes-256-gcm (8)");
+        assert_eq!(d("encryption", 2), name("off"));
+        assert_eq!(d("encryption", 6), name("aes-128-gcm"));
+        assert_eq!(d("encryption", 8), name("aes-256-gcm"));
         // dedup carries the verify bit; checksum 3 is LABEL, not "verify"
-        assert_eq!(format_prop_value("dedup", 257).unwrap(), "verify (257)");
-        assert_eq!(format_prop_value("dedup", 8 | 256).unwrap(), "sha256,verify (264)");
-        assert_eq!(format_prop_value("dedup", 2).unwrap(), "off (2)");
-        assert_eq!(format_prop_value("checksum", 3).unwrap(), "label (3)");
-        // dnodesize auto and the fragmentation invalid sentinel
-        assert_eq!(format_prop_value("dnodesize", 1).unwrap(), "auto (1)");
-        assert_eq!(format_prop_value("fragmentation", u64::MAX).unwrap(),
-                   format!("- ({})", u64::MAX));
+        assert_eq!(d("dedup", 257), name("verify"));
+        assert_eq!(d("dedup", 8 | 256), name("sha256,verify"));
+        assert_eq!(d("dedup", 2), name("off"));
+        assert_eq!(d("checksum", 3), name("label"));
+        // times, ratios, dnodesize, and the fragmentation invalid sentinel
+        assert_eq!(d("creation", 1_700_000_000), Some(Time(1_700_000_000)));
+        assert_eq!(d("compressratio", 150), Some(Ratio(150)));
+        assert_eq!((d("dnodesize", 0), d("dnodesize", 1)), (name("legacy"), name("auto")));
+        assert_eq!(d("dnodesize", 2048), Some(Bytes(2048)));
+        assert_eq!(d("fragmentation", 17), Some(Percent(17)));
+        assert_eq!(d("fragmentation", u64::MAX), Some(Unavailable));
     }
 
     #[test]
