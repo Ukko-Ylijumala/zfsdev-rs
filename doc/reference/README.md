@@ -2,8 +2,8 @@
 
 Headers and sources vendored from [OpenZFS](https://github.com/openzfs/zfs) as
 the ground truth for what `zfsdev` mirrors in Rust: the `zfs_cmd_t` layout,
-the ioctl numbers, the nvlist wire format, the stat-array layouts, the C enums
-and the innvl/outnvl contracts of the new-style ioctls.
+the ioctl numbers, the nvlist wire format, the stat-array layouts, the C enums,
+the innvl/outnvl contracts of the new-style ioctls and the kstat formats.
 
 They are **reference only**. Nothing here is compiled into or linked with the
 crate, and `doc/` is excluded from its package. The one programmatic use is
@@ -27,6 +27,8 @@ header unmodified. The `README.md` files are this project's own analyses.
   - the nvlist codec: `nvpair.h`, `nvpair.c`
   - the delegation (`zfs allow`) wire format: `zfs_deleg.{c,h}`, `dsl_deleg.c`
   - pool history record framing: `spa_history.c`
+  - the per-pool kstats: `spa_stats.c` (`txgs`, `dmu_tx_assign`, `state`)
+    and `dataset_kstats.{c,h}` (the `objset-0x*` counters)
   - on-disk enums mirrored in `enums.rs`: `spa.h`, `zio.h`, `zio_compress.h`
 - `0.6/`, `0.7/`, `0.8/`, `2.0/`, `2.1/`, `2.3/` and `2.4/` hold the ioctl-ABI
   headers of each release line: `zfs_ioctl.h`, `zfs.h`, `dmu.h` and

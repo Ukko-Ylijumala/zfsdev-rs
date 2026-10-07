@@ -14,6 +14,8 @@ use zfsdev::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc};
 use zfsdev::ioctl::{SendFlags, ZfsHandle};
 #[cfg(feature = "write")]
 use zfsdev::ioctl::{BeginRecord, DatasetType};
+#[cfg(feature = "kstat")]
+use zfsdev::kstat::{self, PoolHealth, TxgState};
 
 fn handle() -> Option<ZfsHandle> {
     if !std::path::Path::new("/dev/zfs").exists() {
@@ -378,6 +380,52 @@ fn send_recv_ioctls_abi() {
         }
     }
     eprintln!("no snapshot found for the send_space happy path");
+}
+
+/**
+The per-pool kstats parse on the live kernel and agree with the ioctls: every
+pool has a health word, a consecutive txg history on the hrtime clock and a
+tx-assign histogram, and each objset kstat's id is its dataset's `objsetid`.
+*/
+#[cfg(feature = "kstat")]
+#[test]
+fn pool_kstats_agree_with_the_ioctls() {
+    let Some(zfs) = handle() else { return };
+    for pool in zfs.pool_configs().expect("pool configs").iter() {
+        let name = pool.name.as_str();
+        let health = kstat::read_pool_health(name).expect("state kstat");
+        assert!(!matches!(health, PoolHealth::Other(_)), "{name}: unknown state {health}");
+
+        let txgs = kstat::read_txgs(name).expect("txgs kstat");
+        let now = kstat::hrtime_now();
+        assert!(txgs.windows(2).all(|w| w[1].txg == w[0].txg + 1), "{name}: txg gap");
+        assert!(txgs.iter().all(|t| t.birth <= now), "{name}: a txg born in the future");
+        assert!(txgs.iter().filter(|t| t.state == TxgState::Open).count() <= 1);
+        assert!(txgs.iter().filter(|t| t.state == TxgState::Syncing).count() <= 1);
+
+        let waits = kstat::read_tx_assign(name).expect("dmu_tx_assign kstat");
+        eprintln!("{name}: {health}, {} txgs, {} throttled txs", txgs.len(), waits.total());
+
+        let objsets = kstat::read_objset_kstats(name).expect("objset kstats");
+        for o in &objsets {
+            assert!(o.dataset.starts_with(name), "{}: not in {name}", o.dataset);
+            // pre-2.3 kernels keep a renamed dataset's old name
+            let Ok((_, props)) = zfs.objset_stats(&o.dataset) else {
+                eprintln!("{name}: objset {:#x} names {}, which is gone", o.objset, o.dataset);
+                continue;
+            };
+            if let Some(id) = props.get_list("objsetid").and_then(|p| p.get_u64("value")) {
+                assert_eq!(id, o.objset, "{}: objsetid", o.dataset);
+            }
+        }
+        if let Some(first) = objsets.first() {
+            let found = kstat::find_objset_kstat(&first.dataset).expect("find objset kstat");
+            assert_eq!(found.map(|f| f.objset), Some(first.objset));
+            let again = kstat::read_objset_kstat(name, first.objset).expect("re-read by id");
+            assert_eq!(again.dataset, first.dataset);
+        }
+    }
+    assert!(kstat::read_dmu_tx().expect("dmu_tx kstat").has("dmu_tx_assigned"));
 }
 
 #[cfg(feature = "write")]

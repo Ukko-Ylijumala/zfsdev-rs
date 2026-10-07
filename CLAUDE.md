@@ -15,7 +15,8 @@ an API change here ripples there.
 Modules (`src/`): `ioctl` (`ZfsHandle`, Linux-only), `nvlist` (codec),
 `stats` (`vdev_stat_t`, `pool_scan_stat_t`, rebuild stats, `vdev_stats_ex`),
 `enums` (C-enum mirrors, `Coded<E>`, `CEnum`), `props` (property names, value
-enums, decode/parse), `kstat` (procfs SPL kstats, `kstat` feature), `wrapkey`
+enums, decode/parse), `kstat` (procfs SPL kstats: ARC, and per pool txgs,
+tx-assign histogram, objset counters, state; `kstat` feature), `wrapkey`
 (libzfs wrapping-key derivation).
 
 ## Design rules
@@ -116,9 +117,15 @@ Per-era analyses and headers live in `doc/reference/{0.6,0.7,0.8,2.0,2.1,2.3,2.4
   (2.3). Master (2.5-dev) appends `pss_pass_scrub_flags` to
   `pool_scan_stat_t`, which decodes fine.
 - kstat schemas differ too (2.2 reworked ARC accounting: per-state
-  data/metadata, `iohits`, `pd`/`pm` instead of `p`, no `arc_meta_limit`).
-  Views are field-presence driven (`Kstat::has`), never version-branched;
-  `doc/kstat/` holds 2.1 and 2.2 dumps as parser fixtures.
+  data/metadata, `iohits`, `pd`/`pm` instead of `p`, no `arc_meta_limit`;
+  the objset kstats gained the ZIL counters in 2.2, more in 2.3/2.4, and
+  follow renames only from 2.3). Views are field-presence driven
+  (`Kstat::has`), never version-branched; `doc/kstat/` holds 2.1 and 2.2
+  dumps as parser fixtures. The `txgs`, `dmu_tx_assign` and `state` formats
+  are unchanged from 0.8 to 2.4 (vendored `spa_stats.c`,
+  `dataset_kstats.{c,h}`). Named-kstat lines are cut by the SPL's
+  `%-31s %-4d` columns, not by whitespace: `dmu_tx_assign`'s bucket names and
+  string values such as `dataset_name` contain spaces.
 
 ## Build / test
 

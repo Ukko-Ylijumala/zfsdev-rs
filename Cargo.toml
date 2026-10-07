@@ -23,8 +23,10 @@ default = ["kstat"]
 # Without it the crate cannot issue a request that changes pool, dataset or
 # kernel state.
 write = []
-# SPL kstat parsing (ARC / prefetcher counters and derived metrics). No
-# dependencies; reading the procfs files is Linux-only.
+# SPL kstat parsing: ARC / prefetcher counters and derived metrics, and per
+# pool the txg history, the tx-assign delay histogram, the per-dataset I/O
+# counters and the health word. No dependencies; reading the procfs files is
+# Linux-only.
 kstat = []
 
 [package.metadata.docs.rs]

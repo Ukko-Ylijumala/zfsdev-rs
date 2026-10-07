@@ -1,0 +1,26 @@
+24 1 0x01 24 6784 12659445762 81628718614880
+name                            type data
+dataset_name                    7    tank/home
+writes                          4    1788530
+nwritten                        4    22966074955
+reads                           4    80303576
+nread                           4    152582212555
+nunlinks                        4    293033
+nunlinked                       4    292915
+zil_commit_count                4    3263
+zil_commit_writer_count         4    3261
+zil_itx_count                   4    148283
+zil_itx_indirect_count          4    22916
+zil_itx_indirect_bytes          4    2831845268
+zil_itx_copied_count            4    0
+zil_itx_copied_bytes            4    0
+zil_itx_needcopy_count          4    30795
+zil_itx_needcopy_bytes          4    230846824
+zil_itx_metaslab_normal_count   4    5110
+zil_itx_metaslab_normal_bytes   4    250728184
+zil_itx_metaslab_normal_write   4    261709824
+zil_itx_metaslab_normal_alloc   4    380112896
+zil_itx_metaslab_slog_count     4    0
+zil_itx_metaslab_slog_bytes     4    0
+zil_itx_metaslab_slog_write     4    0
+zil_itx_metaslab_slog_alloc     4    0
