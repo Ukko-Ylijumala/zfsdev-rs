@@ -356,6 +356,24 @@ impl VdevType {
     }
 }
 
+/**
+VDEV_ALLOC_BIAS_* (zfs.h): the allocation class a top-level vdev serves, as
+the `alloc_bias` string of its config. The kernel adds that key only to
+configs generated with stats (POOL_STATS); it is not stored on disk, where
+the bias lives in the top-level vdev's ZAP instead.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
+#[strum(serialize_all = "lowercase")]
+#[non_exhaustive]
+pub enum AllocBias {
+    /// A separate intent log.
+    Log,
+    /// Metadata, and small blocks up to `special_small_blocks`.
+    Special,
+    /// The dedup tables.
+    Dedup,
+}
+
 /// vdev_state_t (zfs.h)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
 #[strum(serialize_all = "UPPERCASE")]

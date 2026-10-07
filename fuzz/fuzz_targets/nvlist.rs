@@ -7,7 +7,8 @@
 that reads a decoded list: the property entries and their sources, and the
 stat decoders with their derived figures, on each nested list and array
 (a histogram against itself is an empty window, and its quantiles never
-fall as `q` rises).
+fall as `q` rises), and the vdev walk, which must yield exactly the vdevs a
+naive recursive count finds.
 Whatever decodes must survive our own encoder: `pack` either refuses cleanly
 or produces bytes that decode again and re-pack byte-identically (compared as
 bytes, not `PartialEq`, since a NaN double never equals itself).
@@ -19,6 +20,7 @@ use libfuzzer_sys::fuzz_target;
 use zfsdev::nvlist::{NvData, NvList};
 use zfsdev::props::{decode_prop_value, prop_entries};
 use zfsdev::stats::{RebuildStats, ScanStats, VdevStats, VdevStatsEx};
+use zfsdev::vdev;
 
 /// The `now`s the time-dependent figures are asked at: the epoch, a
 /// plausible present, and the far end.
@@ -53,6 +55,22 @@ fn stats_ex(x: &VdevStatsEx) {
     assert_eq!(x.since(x).histograms.iter().map(|h| h.count()).sum::<u64>(), 0);
 }
 
+/// `nv` and the vdevs beneath it, counted the naive way.
+fn subtree(nv: &NvList) -> usize {
+    1 + nv.get_list_array("children").unwrap_or_default().iter().map(subtree).sum::<usize>()
+}
+
+/// What [`vdev::walk`] must yield for `nv`: below a root, its children and
+/// cache devices and spares, each with everything beneath; otherwise `nv`'s
+/// own subtree.
+fn vdev_count(nv: &NvList) -> usize {
+    if nv.get_str("type") != Some("root") {
+        return subtree(nv);
+    }
+    let under = |key| nv.get_list_array(key).unwrap_or_default().iter().map(subtree).sum::<usize>();
+    under("children") + under("l2cache") + under("spares")
+}
+
 fn walk(list: &NvList) {
     // any pair may be a property, wrapped or bare
     for e in prop_entries(list) {
@@ -67,6 +85,12 @@ fn walk(list: &NvList) {
     RebuildStats::from_vdev(list).iter().for_each(rebuild);
     VdevStatsEx::from_vdev(list).iter().for_each(stats_ex);
     stats_ex(&VdevStatsEx::decode(list));
+    let mut vdevs = 0;
+    for v in vdev::walk(list) {
+        let _ = (v.name(), v.vdev_type(), v.guid(), v.is_leaf());
+        vdevs += 1;
+    }
+    assert_eq!(vdevs, vdev_count(list), "the walk missed or repeated a vdev");
     for pair in list.iter() {
         match &pair.data {
             NvData::Uint64Array(a) => {

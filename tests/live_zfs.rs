@@ -20,6 +20,7 @@ use zfsdev::kstat::{self, PoolHealth, TxgState};
 use zfsdev::props::prop_str;
 use zfsdev::props::{PropSource, prop_entries, prop_entry, prop_u64};
 use zfsdev::stats::{HistogramId, VdevStatsEx};
+use zfsdev::vdev::{self, VdevEntry, VdevRole};
 
 fn handle() -> Option<ZfsHandle> {
     if !std::path::Path::new("/dev/zfs").exists() {
@@ -91,6 +92,36 @@ fn pool_stats_has_vdev_tree() {
             kids.len(),
             kids[0].get_str("type").unwrap_or("?")
         );
+    }
+}
+
+/**
+The walker over each pool's real POOL_STATS tree: every vdev once (guids
+unique), the top-level vdevs at depth 0 with the role their flags give, and
+the cache devices and spares after the tree.
+*/
+#[test]
+fn vdev_walk_covers_real_trees() {
+    let Some(zfs) = handle() else { return };
+    for pair in zfs.pool_configs().expect("pool configs").iter() {
+        let stats = zfs.pool_stats(&pair.name).expect("ZFS_IOC_POOL_STATS");
+        let tree = stats.get_list("vdev_tree").expect("vdev_tree");
+        let vdevs: Vec<VdevEntry> = vdev::walk(tree).collect();
+        let mut guids: Vec<u64> = vdevs.iter().filter_map(VdevEntry::guid).collect();
+        let n = guids.len();
+        guids.sort_unstable();
+        guids.dedup();
+        assert_eq!((guids.len(), n), (vdevs.len(), vdevs.len()), "{}: a guid per vdev, once", pair.name);
+        let tops = tree.get_list_array("children").map_or(0, <[_]>::len);
+        let aux = ["l2cache", "spares"].map(|k| tree.get_list_array(k).map_or(0, <[_]>::len));
+        assert_eq!(vdevs.iter().filter(|v| v.depth == 0).count(), tops + aux[0] + aux[1]);
+        for v in vdevs.iter().filter(|v| v.depth == 0) {
+            let is_log = v.config.get_u64("is_log") == Some(1);
+            assert_eq!(v.role == VdevRole::Log, is_log, "{}: {}", pair.name, v.name());
+        }
+        for v in &vdevs {
+            eprintln!("{}: {:indent$}{} [{}]", pair.name, "", v.name(), v.role, indent = 2 * v.depth);
+        }
     }
 }
 

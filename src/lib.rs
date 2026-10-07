@@ -18,6 +18,8 @@ scraping.
   (`vdev_stat_t`, `pool_scan_stat_t`, rebuild stats, `vdev_stats_ex`). They
   absorb the layout differences between releases: a field one kernel lacks
   is `None`.
+- [`vdev`]: the vdev tree walked, each vdev with its depth, name and role
+  (data, log, special, dedup, cache, spare).
 - [`enums`], [`props`]: typed mirrors of the C enums and property values.
   [`enums::Coded`] keeps the raw number of a value newer than this crate.
 - [`kstat`]: the SPL kstats in `/proc/spl/kstat/zfs`: ARC metrics, the
@@ -67,4 +69,5 @@ pub mod kstat;
 pub mod nvlist;
 pub mod props;
 pub mod stats;
+pub mod vdev;
 pub mod wrapkey;

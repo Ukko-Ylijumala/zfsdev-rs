@@ -22,6 +22,7 @@ that needs ZFS data without that application can use it too.
 | `ioctl`  | `ZfsHandle` and its typed requests: pool configs, stats and properties; datasets, snapshots and bookmarks; holds and delegations; the kernel event feed; the permanent error log; space estimates; `zfs send` streams; pool history. With the `write` feature it also covers the mutations. |
 | `nvlist` | The codec for packed name-value lists. It decodes both the native and XDR encodings and encodes the native one. |
 | `stats`  | Decoders for the kernel's positional stat arrays: `vdev_stat_t`, `pool_scan_stat_t` (scrub, resilver, error scrub), sequential-rebuild stats, and `vdev_stats_ex` (queue depths, latency and request-size histograms). Each type has derived figures such as progress, pass rate and ETA, computed the way `zpool status` does; the histograms give the window between two reads and its quantiles. |
+| `vdev`   | The vdev tree walked: each vdev with its depth, its `zpool` name (`mirror-0`, `raidz2-1`, a device path) and its role (data, log, special, dedup, cache, spare), taken from the flags the kernel spreads over the top-level vdevs and the root's cache and spare arrays. |
 | `enums`  | Typed mirrors of the C enums: pool, vdev and scan states, vdev types, objset types, compression and checksum algorithms, DMU object types. `Coded<E>` keeps the raw number alongside the typed value, so a value newer than the crate still shows as `?N` instead of being lost. |
 | `props`  | Property names, value enums and decoding. `prop_entry` reads a property from the nvlist an ioctl returns, unwrapping its `{value, source}` pair and decoding where the value comes from (`PropSource`, `zfs get`'s SOURCE column); `decode_prop_value` says what a stored number *means*; `parse_prop_value` turns user input into the typed value a set-property request needs. |
 | `kstat`  | The SPL kstats in `/proc/spl/kstat/zfs`: `arc_summary`'s data, with ARC hit ratios and prefetcher metrics derived from whichever counters the kernel exports; and per pool the txg history, the tx-assign delay histogram (the write throttle), each open dataset's I/O and ZIL counters, and the pool's health word, which the kernel serves without taking a lock; the pool list itself, read without a ZFS lock; the imports in progress (an import holds the lock every pool ioctl waits on) and the module's debug log. |
@@ -134,10 +135,22 @@ for pool in zfs.pool_configs()?.iter() {
 }
 ```
 
-`VdevStats::from_vdev` works on any vdev of the `vdev_tree`, so recurse
-through its `children` for the whole layout. Fields that only some releases
-have are `Option`, for example `noalloc` (2.2+), `pspace` (2.1+) and
-`dio_verify_errors` (2.3+).
+`VdevStats::from_vdev` works on any vdev of the `vdev_tree`. Fields that only
+some releases have are `Option`, for example `noalloc` (2.2+), `pspace`
+(2.1+) and `dio_verify_errors` (2.3+). `vdev::walk` goes through the whole
+layout, cache devices and spares included:
+
+```rust
+use zfsdev::vdev::{self, VdevRole};
+
+for v in vdev::walk(root).filter(|v| v.role == VdevRole::Log && v.is_leaf()) {
+    let slow = VdevStats::from_vdev(v.config).map_or(0, |s| s.slow_ios);
+    println!("SLOG {}: {slow} slow I/Os", v.name());
+}
+```
+
+A special or dedup vdev is told apart by `alloc_bias`, which the kernel puts
+only in POOL_STATS configs; in `pool_configs` it reads as data.
 
 ### Datasets and properties
 
