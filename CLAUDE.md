@@ -15,9 +15,10 @@ an API change here ripples there.
 Modules (`src/`): `ioctl` (`ZfsHandle`, Linux-only), `nvlist` (codec),
 `stats` (`vdev_stat_t`, `pool_scan_stat_t`, rebuild stats, `vdev_stats_ex`),
 `enums` (C-enum mirrors, `Coded<E>`, `CEnum`), `props` (property names, value
-enums, decode/parse), `kstat` (procfs SPL kstats: ARC, and per pool txgs,
-tx-assign histogram, objset counters, state; `kstat` feature), `wrapkey`
-(libzfs wrapping-key derivation).
+enums, decode/parse, `PropEntry` over the `{value, source}` nvlists), `kstat`
+(procfs SPL kstats: ARC, and per pool txgs, tx-assign histogram, objset
+counters, state; `kstat` feature), `wrapkey` (libzfs wrapping-key
+derivation).
 
 ## Design rules
 

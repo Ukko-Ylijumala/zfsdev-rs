@@ -411,6 +411,25 @@ impl VdevAux {
     }
 }
 
+/**
+zprop_source_t (zfs.h): where a pool or vdev property's value comes from, as
+POOL_GET_PROPS and VDEV_GET_PROPS report it. The values are single bits
+because libzfs filters on a mask of them. Dataset properties name their
+source as a string instead; [`PropEntry::source`](crate::props::PropEntry::source)
+decodes both.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
+#[strum(serialize_all = "UPPERCASE")]
+#[repr(u8)]
+pub enum ZpropSource {
+    None = 0x1,
+    Default = 0x2,
+    Temporary = 0x4,
+    Local = 0x8,
+    Inherited = 0x10,
+    Received = 0x20,
+}
+
 /// dmu_objset_type_t (dmu.h), shared by the live ioctl stats and the
 /// on-disk objset_phys decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr)]
@@ -802,6 +821,7 @@ impl_cenum!(
     PoolState,
     VdevState,
     VdevAux,
+    ZpropSource,
     ObjsetType,
     DirentType,
     DmuByteswap,

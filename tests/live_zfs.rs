@@ -16,6 +16,9 @@ use zfsdev::ioctl::{SendFlags, ZfsHandle};
 use zfsdev::ioctl::{BeginRecord, DatasetType};
 #[cfg(feature = "kstat")]
 use zfsdev::kstat::{self, PoolHealth, TxgState};
+#[cfg(feature = "write")]
+use zfsdev::props::prop_str;
+use zfsdev::props::{PropSource, prop_entries, prop_entry, prop_u64};
 
 fn handle() -> Option<ZfsHandle> {
     if !std::path::Path::new("/dev/zfs").exists() {
@@ -36,18 +39,6 @@ fn first_disk_guid(tree: &zfsdev::nvlist::NvList) -> Option<u64> {
         }
     }
     None
-}
-
-/// A `{value, source}` property pair's numeric value.
-#[cfg(feature = "write")]
-fn prop_value_u64(props: &zfsdev::nvlist::NvList, name: &str) -> Option<u64> {
-    props.get_list(name)?.get_u64("value")
-}
-
-/// A `{value, source}` property pair's string value.
-#[cfg(feature = "write")]
-fn prop_value_str(props: &zfsdev::nvlist::NvList, name: &str) -> Option<String> {
-    props.get_list(name)?.get_str("value").map(str::to_string)
 }
 
 /* ========================================================================= */
@@ -110,6 +101,36 @@ fn pool_props_decode() {
     let props = zfs.pool_props(&first.name).expect("ZFS_IOC_POOL_GET_PROPS");
     assert!(props.get("size").is_some(), "pool props missing 'size'");
     eprintln!("{}: {} pool properties", first.name, props.pairs.len());
+}
+
+/**
+Property sources decode on real props: pool props carry known
+`zprop_source_t` flags, statistics have no source, and a dataset property
+inherited from somewhere names one of the dataset's ancestors.
+*/
+#[test]
+fn prop_sources_decode() {
+    let Some(zfs) = handle() else { return };
+    for pool in zfs.pool_configs().expect("pool configs").iter() {
+        let name = pool.name.as_str();
+        let props = zfs.pool_props(name).expect("pool props");
+        assert_eq!(prop_entry(&props, "size").map(|e| e.source(name)), Some(PropSource::None));
+        for e in prop_entries(&props) {
+            assert!(!matches!(e.source(name), PropSource::Unknown(_)), "{name}: {}", e.name);
+        }
+
+        let children = zfs.datasets(name).expect("dataset list");
+        for ds in std::iter::once(name.to_string()).chain(children.into_iter().map(|c| c.name)) {
+            let (_, props) = zfs.objset_stats(&ds).expect("objset stats");
+            assert!(prop_u64(&props, "used").is_some(), "{ds}: no used");
+            assert_eq!(prop_entry(&props, "used").map(|e| e.source(&ds)), Some(PropSource::None));
+            for e in prop_entries(&props) {
+                if let PropSource::Inherited(Some(from)) = e.source(&ds) {
+                    assert!(ds.starts_with(&format!("{from}/")), "{ds}: {} from {from}", e.name);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -414,7 +435,7 @@ fn pool_kstats_agree_with_the_ioctls() {
                 eprintln!("{name}: objset {:#x} names {}, which is gone", o.objset, o.dataset);
                 continue;
             };
-            if let Some(id) = props.get_list("objsetid").and_then(|p| p.get_u64("value")) {
+            if let Some(id) = prop_u64(&props, "objsetid") {
                 assert_eq!(id, o.objset, "{}: objsetid", o.dataset);
             }
         }
@@ -687,13 +708,13 @@ fn load_key_roundtrip_in_playground() {
     let result = (|| -> Result<(), String> {
         let keystatus = |zfs: &ZfsHandle| -> Result<u64, String> {
             let (_, props) = zfs.objset_stats(&ds).map_err(|e| e.to_string())?;
-            prop_value_u64(&props, "keystatus").ok_or_else(|| "no keystatus prop".into())
+            prop_u64(&props, "keystatus").ok_or_else(|| "no keystatus prop".into())
         };
         let (_, props) = zfs.objset_stats(&ds).map_err(|e| e.to_string())?;
         assert_eq!(keystatus(&zfs)?, 2, "fresh encrypted dataset must have its key loaded");
-        assert_eq!(prop_value_str(&props, "encryptionroot").as_deref(), Some(ds.as_str()));
-        let salt = prop_value_u64(&props, "pbkdf2salt").ok_or("no pbkdf2salt")?;
-        let iters = prop_value_u64(&props, "pbkdf2iters").ok_or("no pbkdf2iters")?;
+        assert_eq!(prop_str(&props, "encryptionroot"), Some(ds.as_str()));
+        let salt = prop_u64(&props, "pbkdf2salt").ok_or("no pbkdf2salt")?;
+        let iters = prop_u64(&props, "pbkdf2iters").ok_or("no pbkdf2iters")?;
 
         if let Err(e) = zfs.unload_key(&ds) {
             // delegation may lack load-key on some machines — skip, don't fail

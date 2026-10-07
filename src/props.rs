@@ -12,13 +12,25 @@ the `ZFS_*` value constants from `doc/reference/zfs.h` — so both the dispatch
 and the value names are typo-proof enums rather than string tables. Applies to
 the live ioctl properties and the on-disk DSL props ZAPs alike; the names are
 the same in both worlds.
+
+The property nvlists the ioctls return are read through [`PropEntry`]
+([`prop_entry`], [`prop_entries`], [`prop_u64`], [`prop_str`]): it unwraps the
+`{value, source}` pairs most of them use and decodes the source
+([`PropSource`]), `zfs get`'s SOURCE column.
 */
 
-use crate::enums::{CEnum, Coded, ZioChecksum, ZioCompress, ZstdLevel, impl_cenum};
-use crate::nvlist::NvData;
+use crate::enums::{CEnum, Coded, ZioChecksum, ZioCompress, ZpropSource, ZstdLevel, impl_cenum};
+use crate::nvlist::{NvData, NvList, NvPair};
 use std::fmt;
 use std::str::FromStr;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoEnumIterator};
+
+/// The value key of a `{value, source}` property pair (`ZPROP_VALUE`).
+const ZPROP_VALUE: &str = "value";
+/// The source key of a `{value, source}` property pair (`ZPROP_SOURCE`).
+const ZPROP_SOURCE: &str = "source";
+/// The source string of a received dataset property (`ZPROP_SOURCE_VAL_RECVD`).
+const ZPROP_SOURCE_VAL_RECVD: &str = "$recvd";
 
 /// Every property name we know how to render. Lowercase matching; names
 /// with underscores are spelled out explicitly.
@@ -475,6 +487,128 @@ pub fn decode_prop_value(name: &str, v: u64) -> Option<PropValue> {
             n => V::Bytes(n),
         },
     })
+}
+
+/* ---------------------------- property nvlists --------------------------- */
+
+/**
+Where a property's value comes from: `zfs get`'s SOURCE column. Dataset
+properties name it as a string (the dataset the value is set on, `$recvd`
+for a received value, empty for the default), while pool and vdev properties
+carry a `zprop_source_t` flag ([`ZpropSource`]). A value with no source at
+all is a statistic (`used`, `creation`, …), shown as `-` by `zfs get`.
+*/
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PropSource {
+    /// No source: a statistic or another computed value.
+    None,
+    /// The built-in default.
+    Default,
+    /// Set on the dataset, pool or vdev itself.
+    Local,
+    /// Inherited: from the named ancestor dataset, or unnamed for a pool or
+    /// vdev property.
+    Inherited(Option<String>),
+    /// From a `zfs receive`.
+    Received,
+    /// A temporary override, such as a mount option.
+    Temporary,
+    /// A `zprop_source_t` value newer than this crate.
+    Unknown(u64),
+}
+
+/**
+One property of a property nvlist, in either shape the kernel uses. Most
+property ioctls wrap each value as `{value, source}` (OBJSET_STATS,
+POOL_GET_PROPS, VDEV_GET_PROPS, OBJSET_RECVD_PROPS, a bookmark's props),
+while OBJSET_ZPLPROPS stores the bare value. A property at its default is
+often absent altogether, and the default is then the caller's to supply.
+*/
+#[derive(Debug, Clone, Copy)]
+pub struct PropEntry<'a> {
+    /// The property's name.
+    pub name: &'a str,
+    /// Its value, unwrapped from a `{value, source}` pair.
+    pub value: &'a NvData,
+    source: Option<&'a NvData>,
+}
+
+impl<'a> PropEntry<'a> {
+    /// The entry for one pair of a property nvlist.
+    pub fn new(pair: &'a NvPair) -> Self {
+        let (value, source) = match &pair.data {
+            NvData::List(l) => match l.get(ZPROP_VALUE) {
+                Some(v) => (v, l.get(ZPROP_SOURCE)),
+                None => (&pair.data, None),
+            },
+            bare => (bare, None),
+        };
+        PropEntry { name: &pair.name, value, source }
+    }
+
+    /// The value, if it is a number.
+    pub fn u64(&self) -> Option<u64> {
+        match self.value {
+            NvData::Uint64(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// The value, if it is a string.
+    pub fn str(&self) -> Option<&'a str> {
+        match self.value {
+            NvData::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /**
+    Where the value comes from, decoded as libzfs's `get_source` does.
+    `owner` is the dataset the properties belong to, which tells a local
+    value from an inherited one; pool and vdev properties carry their source
+    as a flag and don't need it.
+    */
+    pub fn source(&self, owner: &str) -> PropSource {
+        match self.source {
+            Some(NvData::Str(s)) if s.is_empty() => PropSource::Default,
+            Some(NvData::Str(s)) if s.contains(ZPROP_SOURCE_VAL_RECVD) => PropSource::Received,
+            Some(NvData::Str(s)) if s == owner => PropSource::Local,
+            Some(NvData::Str(s)) => PropSource::Inherited(Some(s.clone())),
+            Some(NvData::Uint64(v)) => match ZpropSource::from_raw(*v) {
+                Some(ZpropSource::None) => PropSource::None,
+                Some(ZpropSource::Default) => PropSource::Default,
+                Some(ZpropSource::Temporary) => PropSource::Temporary,
+                Some(ZpropSource::Local) => PropSource::Local,
+                Some(ZpropSource::Inherited) => PropSource::Inherited(None),
+                Some(ZpropSource::Received) => PropSource::Received,
+                None => PropSource::Unknown(*v),
+            },
+            // no source, or one of a type no kernel sends
+            _ => PropSource::None,
+        }
+    }
+}
+
+/// Property `name` of a property nvlist (the last pair of that name, as the
+/// kernel resolves duplicates).
+pub fn prop_entry<'a>(props: &'a NvList, name: &str) -> Option<PropEntry<'a>> {
+    props.pairs.iter().rfind(|p| p.name == name).map(PropEntry::new)
+}
+
+/// Every property of a property nvlist, in the kernel's order.
+pub fn prop_entries(props: &NvList) -> impl Iterator<Item = PropEntry<'_>> {
+    props.iter().map(PropEntry::new)
+}
+
+/// Property `name`'s value, if it is a number.
+pub fn prop_u64(props: &NvList, name: &str) -> Option<u64> {
+    prop_entry(props, name)?.u64()
+}
+
+/// Property `name`'s value, if it is a string.
+pub fn prop_str<'a>(props: &'a NvList, name: &str) -> Option<&'a str> {
+    prop_entry(props, name)?.str()
 }
 
 /* ------------------------------- parsing --------------------------------- */
@@ -1031,5 +1165,64 @@ mod tests {
         // bad values rejected
         assert!(parse_prop_value("compression", "b00gus").is_err());
         assert!(parse_prop_value("atime", "anytimenow").is_err());
+    }
+
+    /// A `{value, source}` pair as the property ioctls return it.
+    fn wrapped(value: NvData, source: Option<NvData>) -> NvList {
+        let mut l = NvList::new();
+        l.pairs.push(NvPair { name: ZPROP_VALUE.into(), data: value });
+        if let Some(s) = source {
+            l.pairs.push(NvPair { name: ZPROP_SOURCE.into(), data: s });
+        }
+        l
+    }
+
+    #[test]
+    fn dataset_prop_sources_decode_like_libzfs() {
+        use NvData::{Str, Uint64};
+        let src = |s: &str| Some(Str(s.into()));
+        let mut props = NvList::new();
+        props
+            .add_nvlist("compression", wrapped(Uint64(15), src("tank/a")))
+            .add_nvlist("atime", wrapped(Uint64(0), src("tank")))
+            .add_nvlist("recordsize", wrapped(Uint64(131072), src("")))
+            .add_nvlist("quota", wrapped(Uint64(1 << 30), src("$recvd")))
+            .add_nvlist("used", wrapped(Uint64(42), None))
+            .add_nvlist("mountpoint", wrapped(Str("/a".into()), src("tank/a")));
+        let source = |name: &str| prop_entry(&props, name).unwrap().source("tank/a");
+        assert_eq!(source("compression"), PropSource::Local);
+        assert_eq!(source("atime"), PropSource::Inherited(Some("tank".into())));
+        assert_eq!(source("recordsize"), PropSource::Default);
+        assert_eq!(source("quota"), PropSource::Received);
+        assert_eq!(source("used"), PropSource::None);
+        assert_eq!(prop_u64(&props, "compression"), Some(15));
+        assert_eq!(prop_str(&props, "mountpoint"), Some("/a"));
+        assert_eq!(prop_u64(&props, "mountpoint"), None);
+        assert_eq!(prop_u64(&props, "absent"), None);
+        let names: Vec<&str> = prop_entries(&props).map(|e| e.name).collect();
+        assert_eq!(names, ["compression", "atime", "recordsize", "quota", "used", "mountpoint"]);
+    }
+
+    #[test]
+    fn pool_sources_are_flags_and_zpl_values_bare() {
+        let mut props = NvList::new();
+        props
+            .add_nvlist("size", wrapped(NvData::Uint64(1 << 40), Some(NvData::Uint64(0x1))))
+            .add_nvlist("autotrim", wrapped(NvData::Uint64(1), Some(NvData::Uint64(0x8))))
+            .add_nvlist("failmode", wrapped(NvData::Uint64(0), Some(NvData::Uint64(0x40))))
+            .add_u64("version", 5)
+            // a duplicate resolves to the last pair, as in the kernel
+            .add_u64("version", 6);
+        let source = |name: &str| prop_entry(&props, name).unwrap().source("tank");
+        assert_eq!(source("size"), PropSource::None);
+        assert_eq!(source("autotrim"), PropSource::Local);
+        assert_eq!(source("failmode"), PropSource::Unknown(0x40));
+        // OBJSET_ZPLPROPS stores bare values: no unwrapping, no source
+        assert_eq!(prop_u64(&props, "version"), Some(6));
+        assert_eq!(source("version"), PropSource::None);
+        // a list without a "value" key is the value itself
+        let mut odd = NvList::new();
+        odd.add_nvlist("weird", NvList::new());
+        assert!(matches!(prop_entry(&odd, "weird").unwrap().value, NvData::List(_)));
     }
 }

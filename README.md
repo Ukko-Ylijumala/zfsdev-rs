@@ -23,7 +23,7 @@ that needs ZFS data without that application can use it too.
 | `nvlist` | The codec for packed name-value lists. It decodes both the native and XDR encodings and encodes the native one. |
 | `stats`  | Decoders for the kernel's positional stat arrays: `vdev_stat_t`, `pool_scan_stat_t` (scrub, resilver, error scrub), sequential-rebuild stats, and `vdev_stats_ex` (queue depths, latency and request-size histograms). Each type has derived figures such as progress, pass rate and ETA, computed the way `zpool status` does. |
 | `enums`  | Typed mirrors of the C enums: pool, vdev and scan states, vdev types, objset types, compression and checksum algorithms, DMU object types. `Coded<E>` keeps the raw number alongside the typed value, so a value newer than the crate still shows as `?N` instead of being lost. |
-| `props`  | Property names, value enums and decoding. `decode_prop_value` says what a stored number *means*; `parse_prop_value` turns user input into the typed value a set-property request needs. |
+| `props`  | Property names, value enums and decoding. `prop_entry` reads a property from the nvlist an ioctl returns, unwrapping its `{value, source}` pair and decoding where the value comes from (`PropSource`, `zfs get`'s SOURCE column); `decode_prop_value` says what a stored number *means*; `parse_prop_value` turns user input into the typed value a set-property request needs. |
 | `kstat`  | The SPL kstats in `/proc/spl/kstat/zfs`: `arc_summary`'s data, with ARC hit ratios and prefetcher metrics derived from whichever counters the kernel exports; and per pool the txg history, the tx-assign delay histogram (the write throttle), each open dataset's I/O and ZIL counters, and the pool's health word, which the kernel serves without taking a lock. |
 | `wrapkey` | libzfs's native-encryption wrapping-key derivation (PBKDF2 for a passphrase, hex and raw keys), the userspace half of `zfs load-key`. |
 
@@ -142,21 +142,29 @@ have are `Option`, for example `noalloc` (2.2+), `pspace` (2.1+) and
 ### Datasets and properties
 
 ```rust
-use zfsdev::props::{PropValue, decode_prop_value};
+use zfsdev::props::{PropSource, PropValue, decode_prop_value, prop_entry, prop_u64};
 
 for ds in zfs.datasets("tank")? {
-    // properties arrive as {value, source} pairs
-    let raw = |name: &str| ds.props.get_list(name).and_then(|p| p.get_u64("value"));
-    let compression = raw("compression").and_then(|v| decode_prop_value("compression", v));
-    if let (Some(used), Some(PropValue::Name(alg))) = (raw("used"), compression) {
+    let compression = prop_u64(&ds.props, "compression")
+        .and_then(|v| decode_prop_value("compression", v));
+    if let (Some(used), Some(PropValue::Name(alg))) = (prop_u64(&ds.props, "used"), compression) {
         println!("{}: {used} bytes used, compression={alg}", ds.name);
+    }
+    if let Some(PropSource::Inherited(Some(from))) =
+        prop_entry(&ds.props, "compression").map(|e| e.source(&ds.name))
+    {
+        println!("  compression inherited from {from}");
     }
 }
 ```
 
 `datasets` lists direct children, `snapshots` lists a dataset's snapshots, and
 `objset_stats` fetches one dataset. Each comes with its properties, plus
-`ObjsetStats` (type, guid, creation txg, origin, …).
+`ObjsetStats` (type, guid, creation txg, origin, …). Most property nvlists
+wrap each value as a `{value, source}` pair; `prop_entry`, `prop_entries`,
+`prop_u64` and `prop_str` unwrap it (and take the bare values of
+`objset_zplprops` as they are). A property at its default is often absent:
+the default is then yours to supply.
 
 ### The kernel event feed
 
@@ -245,12 +253,12 @@ Loading an encryption key derives the wrapping key in userspace, exactly as
 libzfs does. The kernel only ever sees the derived 32 bytes:
 
 ```rust
-use zfsdev::props::KeyFormat;
+use zfsdev::props::{KeyFormat, prop_u64};
 use zfsdev::wrapkey::derive_wrapping_key;
 
 let (_, props) = zfs.objset_stats("tank/secret")?;
-let raw = |name: &str| props.get_list(name).and_then(|p| p.get_u64("value"));
-let (salt, iters) = (raw("pbkdf2salt").unwrap_or(0), raw("pbkdf2iters").unwrap_or(0));
+let salt = prop_u64(&props, "pbkdf2salt").unwrap_or(0);
+let iters = prop_u64(&props, "pbkdf2iters").unwrap_or(0);
 let key = derive_wrapping_key(KeyFormat::Passphrase, b"correct horse", salt, iters)?;
 zfs.load_key("tank/secret", &key, false)?; // a wrong passphrase fails with EACCES
 ```
