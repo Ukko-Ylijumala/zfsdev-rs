@@ -14,9 +14,9 @@ the kernel copies its own smaller sizeof in both directions); the per-era
 analyses live in `doc/reference/<version>/README.md`. The two pre-2.0
 decode differences (`dds_origin` offset, `pss_skipped` semantics) key off
 [`kernel_pre_2_0`], probed once from `/sys/module/zfs/version`. Ioctl
-numbers (`0x5a00 + n`, `doc/reference/zfs.h`) live in the "legacy" range
-that has been stable since at least 0.6.3 (2014), the platform range
-(`0x5a80`, events) included.
+numbers ([`Ioc`], `0x5a00 + n`, `doc/reference/zfs.h`) live in the
+"legacy" range that has been stable since at least 0.6.3 (2014), the
+platform range (`0x5a80`, events) included.
 
 Reads use the GET/LIST ioctls; the mutating ioctls (SET_PROP, CREATE,
 DESTROY, SNAPSHOT, …) are also defined. Write requests pass their
@@ -24,6 +24,15 @@ parameters in as a packed nvlist (`NvList::pack`) in `zc_nvlist_src` and
 read the kernel's per-element errors nvlist back from `zc_nvlist_dst`.
 Whether a given write is permitted for the calling uid is decided by the
 kernel (root, or a matching `zfs allow` delegation).
+
+Two guards cover kernels this code wasn't verified against
+([`KernelSupport`]): every `zfs_cmd_t` travels in a zeroed buffer with
+spare room past the struct ([`HandleOptions::cmd_buffer_size`]), so a
+module whose struct grew reads zeros for its new fields and writes them
+into the padding instead of past our allocation; and a handle refuses the
+mutating ioctls ([`Ioc::mutates`]) outside the verified range unless opened
+with [`HandleOptions::allow_unverified_writes`]. Reads stay available —
+upstream has only ever appended to the ABI since 0.8.
 */
 
 use super::enums::PoolScanFunc;
@@ -34,94 +43,28 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::LazyLock;
-use strum::Display;
+use std::sync::{LazyLock, PoisonError, RwLock};
+use strum::{Display, EnumIter};
 use thiserror::Error;
 
 const ZFS_DEV: &str = "/dev/zfs";
 const ZFS_MODULE_VERSION: &str = "/sys/module/zfs/version";
 
-const ZFS_IOC_POOL_CONFIGS: u64 = 0x5a04;
-const ZFS_IOC_POOL_STATS: u64 = 0x5a05;
-const ZFS_IOC_POOL_GET_HISTORY: u64 = 0x5a0a;
-const ZFS_IOC_OBJSET_STATS: u64 = 0x5a12;
-const ZFS_IOC_OBJSET_ZPLPROPS: u64 = 0x5a13;
-const ZFS_IOC_ERROR_LOG: u64 = 0x5a20;
-const ZFS_IOC_DSOBJ_TO_DSNAME: u64 = 0x5a24;
-const ZFS_IOC_OBJ_TO_PATH: u64 = 0x5a25;
-const ZFS_IOC_OBJ_TO_STATS: u64 = 0x5a38;
-const ZFS_IOC_SPACE_WRITTEN: u64 = 0x5a39;
-const ZFS_IOC_SPACE_SNAPS: u64 = 0x5a3a;
-const ZFS_IOC_DATASET_LIST_NEXT: u64 = 0x5a14;
-const ZFS_IOC_SNAPSHOT_LIST_NEXT: u64 = 0x5a15;
-const ZFS_IOC_POOL_GET_PROPS: u64 = 0x5a27;
-const ZFS_IOC_GET_FSACL: u64 = 0x5a29;
-const ZFS_IOC_USERSPACE_MANY: u64 = 0x5a2e;
-const ZFS_IOC_GET_HOLDS: u64 = 0x5a32;
-const ZFS_IOC_OBJSET_RECVD_PROPS: u64 = 0x5a33;
-const ZFS_IOC_GET_BOOKMARKS: u64 = 0x5a44;
-const ZFS_IOC_VDEV_GET_PROPS: u64 = 0x5a55;
-const ZFS_IOC_VDEV_SET_PROPS: u64 = 0x5a56;
-
-/*
-Linux event-stream ioctls (`zpool events`): ZFS_IOC_PLATFORM = ZFS_IOC_FIRST +
-0x80 = 0x5a80, then EVENTS_NEXT/_CLEAR/_SEEK. The cursor is per-fd (keyed by
-`zc_cleanup_fd`), so a dedicated handle reads the whole kernel ring.
-*/
-const ZFS_IOC_EVENTS_NEXT: u64 = 0x5a81;
-const ZFS_IOC_EVENTS_SEEK: u64 = 0x5a83;
 /// `zc_guid` flag for EVENTS_NEXT: return ENOENT instead of blocking when the
 /// cursor has caught up (doc/reference/zfs_ioctl.h).
 const ZEVENT_NONBLOCK: u64 = 0x1;
 /// EVENTS_SEEK target: rewind the cursor to the oldest retained event.
 const ZEVENT_SEEK_START: u64 = 0;
+/// What an event ioctl's error names in place of a pool (they take none).
+const EVENTS_NAME: &str = "(zevents)";
 
-/*
-Mutating ioctls (ordinals from doc/reference/zfs.h). SET_PROP, DESTROY,
-RENAME and INHERIT_PROP are "legacy" (parameters in zc_ fields); SNAPSHOT,
-DESTROY_SNAPS and CREATE are "new"-style (parameters as a packed nvlist in
-zc_nvlist_src).
-*/
-const ZFS_IOC_POOL_SCAN: u64 = 0x5a07;
-const ZFS_IOC_VDEV_SET_STATE: u64 = 0x5a0d;
 /// `zc_obj` flag for VDEV_SET_STATE online: re-read the device size and grow the
 /// vdev into it (`zpool online -e`). The other flags (CHECKREMOVE 0x1, UNSPARE
 /// 0x2, FORCEFAULT 0x4) we don't use.
 const ZFS_ONLINE_EXPAND: u64 = 0x8;
-const ZFS_IOC_VDEV_ATTACH: u64 = 0x5a0e;
-const ZFS_IOC_VDEV_DETACH: u64 = 0x5a0f;
-const ZFS_IOC_CLEAR: u64 = 0x5a21;
-const ZFS_IOC_POOL_INITIALIZE: u64 = 0x5a4f;
-const ZFS_IOC_POOL_TRIM: u64 = 0x5a50;
-const ZFS_IOC_SET_PROP: u64 = 0x5a16;
-const ZFS_IOC_SET_FSACL: u64 = 0x5a28;
-const ZFS_IOC_CREATE: u64 = 0x5a17;
-const ZFS_IOC_DESTROY: u64 = 0x5a18;
-const ZFS_IOC_RENAME: u64 = 0x5a1a;
-const ZFS_IOC_SNAPSHOT: u64 = 0x5a23;
-const ZFS_IOC_POOL_SET_PROPS: u64 = 0x5a26;
-const ZFS_IOC_INHERIT_PROP: u64 = 0x5a2b;
-const ZFS_IOC_DESTROY_SNAPS: u64 = 0x5a3b;
-const ZFS_IOC_HOLD: u64 = 0x5a30;
-const ZFS_IOC_RELEASE: u64 = 0x5a31;
-const ZFS_IOC_LOAD_KEY: u64 = 0x5a49;
-const ZFS_IOC_UNLOAD_KEY: u64 = 0x5a4a;
-const ZFS_IOC_LOG_HISTORY: u64 = 0x5a3f;
 
-/*
-Send/receive (replication). SEND_NEW and SEND_SPACE are new-style, keyed by
-the snapshot name; the *kernel* generates the whole stream into the fd the
-innvl names (lzc_send). RECV_NEW consumes a stream from an fd, keyed by the
-destination filesystem (or its parent when it doesn't exist yet).
-SEND_PROGRESS is legacy (zc fields), polled from a second handle while a
-send blocks. innvl contracts per zfs_keys_send_new / zfs_keys_recv_new in
-doc/reference/zfs_ioctl.c; the userspace side is doc/reference/libzfs_core.c.
-*/
-const ZFS_IOC_SEND_PROGRESS: u64 = 0x5a3e;
-const ZFS_IOC_SEND_NEW: u64 = 0x5a40;
-const ZFS_IOC_SEND_SPACE: u64 = 0x5a41;
-const ZFS_IOC_RECV_NEW: u64 = 0x5a46;
 /// `drr_magic` of a send stream's BEGIN record (doc/reference/zfs_ioctl.h).
 const DMU_BACKUP_MAGIC: u64 = 0x2F5BACBAC; // (spelled 0x2F5bacbac in the C header)
 
@@ -131,14 +74,191 @@ const MAXNAMELEN: usize = 256;
 /// Initial nvlist output buffer; grown on ENOMEM as instructed by the kernel.
 const DST_INITIAL: usize = 256 * 1024;
 
+/// `sizeof (zfs_cmd_t)` as mirrored here: the least a command buffer can be.
+pub const MIN_CMD_BUFFER_SIZE: usize = size_of::<ZfsCmd>();
+/**
+Default command buffer: 16 KiB, i.e. ~2.6 KiB of room for a newer module's
+larger `zfs_cmd_t`. Upstream `_Static_assert`s the struct size since 2.4, so a
+grow would be a deliberate ABI break, not a drive-by field addition.
+*/
+pub const DEFAULT_CMD_BUFFER_SIZE: usize = 16 * 1024;
+/// Upper clamp for [`HandleOptions::cmd_buffer_size`]: every ioctl zero-fills
+/// one, so a runaway setting must not cost a huge allocation per call.
+pub const MAX_CMD_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// The oldest release the decoders handle (ZoL 0.8; see `doc/reference/0.8`).
+const OLDEST_SUPPORTED: KernelVersion = KernelVersion { major: 0, minor: 8 };
+/// The newest release whose ABI was checked against vendored headers
+/// (`doc/reference/2.4`).
+const NEWEST_VERIFIED: KernelVersion = KernelVersion { major: 2, minor: 4 };
+/// The patch level OpenZFS gives development builds of the *next* minor
+/// (master after the 2.4 branch reports 2.4.99).
+const DEV_PATCH_LEVEL: u32 = 99;
+
+/// Process-wide options for [`ZfsHandle::open`].
+static DEFAULT_OPTIONS: RwLock<HandleOptions> = RwLock::new(HandleOptions::DEFAULT);
+
+/**
+The `/dev/zfs` ioctls this module issues, by `zfs_ioc_t` ordinal
+(`doc/reference/zfs.h`; pinned against every vendored header by a test).
+Display is the C name without its `ZFS_IOC_` prefix.
+
+"Legacy" ioctls carry their parameters in `zfs_cmd_t` fields (SET_PROP,
+DESTROY, RENAME, INHERIT_PROP, …); "new-style" ones take a packed nvlist in
+`zc_nvlist_src` (SNAPSHOT, DESTROY_SNAPS, CREATE, …), with innvl contracts per
+the `zfs_keys_*` tables in `doc/reference/zfs_ioctl.c`.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumIter)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[repr(u64)]
+#[non_exhaustive]
+pub enum Ioc {
+    PoolConfigs = 0x5a04,
+    PoolStats = 0x5a05,
+    PoolScan = 0x5a07,
+    PoolGetHistory = 0x5a0a,
+    VdevSetState = 0x5a0d,
+    VdevAttach = 0x5a0e,
+    VdevDetach = 0x5a0f,
+    ObjsetStats = 0x5a12,
+    ObjsetZplprops = 0x5a13,
+    DatasetListNext = 0x5a14,
+    SnapshotListNext = 0x5a15,
+    SetProp = 0x5a16,
+    Create = 0x5a17,
+    Destroy = 0x5a18,
+    Rename = 0x5a1a,
+    ErrorLog = 0x5a20,
+    Clear = 0x5a21,
+    Snapshot = 0x5a23,
+    DsobjToDsname = 0x5a24,
+    ObjToPath = 0x5a25,
+    PoolSetProps = 0x5a26,
+    PoolGetProps = 0x5a27,
+    SetFsacl = 0x5a28,
+    GetFsacl = 0x5a29,
+    InheritProp = 0x5a2b,
+    UserspaceMany = 0x5a2e,
+    Hold = 0x5a30,
+    Release = 0x5a31,
+    GetHolds = 0x5a32,
+    ObjsetRecvdProps = 0x5a33,
+    ObjToStats = 0x5a38,
+    SpaceWritten = 0x5a39,
+    SpaceSnaps = 0x5a3a,
+    DestroySnaps = 0x5a3b,
+    /*
+    Send/receive (replication). SEND_NEW and SEND_SPACE are new-style, keyed
+    by the snapshot name; the *kernel* generates the whole stream into the fd
+    the innvl names (lzc_send). RECV_NEW consumes a stream from an fd, keyed by
+    the destination filesystem (or its parent when it doesn't exist yet).
+    SEND_PROGRESS is legacy (zc fields), polled from a second handle while a
+    send blocks. The userspace side is doc/reference/libzfs_core.c.
+    */
+    SendProgress = 0x5a3e,
+    LogHistory = 0x5a3f,
+    SendNew = 0x5a40,
+    SendSpace = 0x5a41,
+    GetBookmarks = 0x5a44,
+    RecvNew = 0x5a46,
+    LoadKey = 0x5a49,
+    UnloadKey = 0x5a4a,
+    PoolInitialize = 0x5a4f,
+    PoolTrim = 0x5a50,
+    VdevGetProps = 0x5a55,
+    VdevSetProps = 0x5a56,
+    /*
+    Linux event-stream ioctls (`zpool events`): ZFS_IOC_PLATFORM =
+    ZFS_IOC_FIRST + 0x80 = 0x5a80, then EVENTS_NEXT/_CLEAR/_SEEK. The cursor
+    is per-fd (keyed by `zc_cleanup_fd`), so a dedicated handle reads the
+    whole kernel ring.
+    */
+    EventsNext = 0x5a81,
+    EventsSeek = 0x5a83,
+}
+
+impl Ioc {
+    /// The ioctl request number.
+    pub fn code(self) -> u64 {
+        self as u64
+    }
+
+    /**
+    Does this ioctl change pool, dataset or kernel state? These are what a
+    handle refuses on a kernel outside the verified ABI range (see
+    [`KernelSupport`]). Exhaustive on purpose: a new ioctl must take a side.
+    SEND_NEW only reads the pool (the stream goes to a caller's fd); the key
+    ioctls change the kernel's keystore, LOG_HISTORY appends to the pool.
+    */
+    pub fn mutates(self) -> bool {
+        match self {
+            Ioc::PoolConfigs
+            | Ioc::PoolStats
+            | Ioc::PoolGetHistory
+            | Ioc::ObjsetStats
+            | Ioc::ObjsetZplprops
+            | Ioc::DatasetListNext
+            | Ioc::SnapshotListNext
+            | Ioc::ErrorLog
+            | Ioc::DsobjToDsname
+            | Ioc::ObjToPath
+            | Ioc::PoolGetProps
+            | Ioc::GetFsacl
+            | Ioc::UserspaceMany
+            | Ioc::GetHolds
+            | Ioc::ObjsetRecvdProps
+            | Ioc::ObjToStats
+            | Ioc::SpaceWritten
+            | Ioc::SpaceSnaps
+            | Ioc::SendProgress
+            | Ioc::SendNew
+            | Ioc::SendSpace
+            | Ioc::GetBookmarks
+            | Ioc::VdevGetProps
+            | Ioc::EventsNext
+            | Ioc::EventsSeek => false,
+            Ioc::PoolScan
+            | Ioc::VdevSetState
+            | Ioc::VdevAttach
+            | Ioc::VdevDetach
+            | Ioc::SetProp
+            | Ioc::Create
+            | Ioc::Destroy
+            | Ioc::Rename
+            | Ioc::Clear
+            | Ioc::Snapshot
+            | Ioc::PoolSetProps
+            | Ioc::SetFsacl
+            | Ioc::InheritProp
+            | Ioc::Hold
+            | Ioc::Release
+            | Ioc::DestroySnaps
+            | Ioc::LogHistory
+            | Ioc::RecvNew
+            | Ioc::LoadKey
+            | Ioc::UnloadKey
+            | Ioc::PoolInitialize
+            | Ioc::PoolTrim
+            | Ioc::VdevSetProps => true,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ZfsError {
     #[error("cannot open {ZFS_DEV}: {0}")]
     Open(io::Error),
     /// A read (GET/LIST) ioctl failed; `name` is the pool/dataset it targeted.
-    #[error("zfs ioctl {ioc:#x} ({name}): {err}")]
-    Ioctl { ioc: u64, name: String, err: io::Error },
+    #[error("zfs ioctl {ioc} ({name}): {err}")]
+    Ioctl { ioc: Ioc, name: String, err: io::Error },
+    /**
+    A mutating ioctl the handle refused without issuing it: the loaded module
+    is outside the verified ABI range and the handle wasn't opened with
+    [`HandleOptions::allow_unverified_writes`].
+    */
+    #[error("zfs ioctl {ioc} refused: {kernel}; writes need an explicit opt-in")]
+    WriteRefused { ioc: Ioc, kernel: KernelSupport },
     /**
     A mutating operation failed in the kernel. New-style ioctls also name the
     elements that failed (snapshots, holds, vdevs, …) with their own errno;
@@ -745,14 +865,56 @@ const _: () = assert!(size_of::<ZfsCmd>() == 13744);
 const _: () = assert!(size_of::<DmuObjsetStatsRaw>() == 288);
 const _: () = assert!(size_of::<DrrBegin>() == 304);
 const _: () = assert!(size_of::<ZinjectRecord>() == 352);
+// CmdBuf hands out a ZfsCmd over u64 words: alignment and whole words must fit
+const _: () = assert!(align_of::<ZfsCmd>() <= align_of::<u64>());
+const _: () = assert!(size_of::<ZfsCmd>().is_multiple_of(size_of::<u64>()));
 
-impl ZfsCmd {
-    fn new() -> Box<ZfsCmd> {
-        // All-zero is the valid "empty" state for zfs_cmd_t (plain integers
-        // and byte arrays only).
-        unsafe { Box::new(std::mem::zeroed()) }
+/**
+A zeroed `zfs_cmd_t` with spare room past the struct. The kernel copies *its
+own* `sizeof (zfs_cmd_t)` in and out, so a module whose struct grew would read
+past a bare `ZfsCmd` and write its larger struct back over whatever follows it;
+in here it reads zeros (every new field's "unset") and writes into the
+padding. Derefs to the mirrored [`ZfsCmd`]; the ioctl gets the whole buffer.
+*/
+struct CmdBuf {
+    words: Box<[u64]>,
+}
+
+impl CmdBuf {
+    /// A zeroed buffer of `bytes` (rounded up to whole words, at least the struct).
+    fn new(bytes: usize) -> CmdBuf {
+        let words = bytes.max(MIN_CMD_BUFFER_SIZE).div_ceil(size_of::<u64>());
+        CmdBuf { words: vec![0u64; words].into_boxed_slice() }
     }
 
+    /// The ioctl argument: a pointer over the *whole* buffer, padding included.
+    fn as_mut_ptr(&mut self) -> *mut u64 {
+        self.words.as_mut_ptr()
+    }
+}
+
+impl Deref for CmdBuf {
+    type Target = ZfsCmd;
+
+    fn deref(&self) -> &ZfsCmd {
+        /*
+        SAFETY: the buffer holds at least size_of::<ZfsCmd>() bytes at u64
+        alignment (both const-asserted above), and ZfsCmd is plain integers
+        and byte arrays, so any bit pattern — all-zero or kernel-written — is
+        a valid value.
+        */
+        unsafe { &*self.words.as_ptr().cast::<ZfsCmd>() }
+    }
+}
+
+impl DerefMut for CmdBuf {
+    fn deref_mut(&mut self) -> &mut ZfsCmd {
+        // SAFETY: as in deref
+        unsafe { &mut *self.words.as_mut_ptr().cast::<ZfsCmd>() }
+    }
+}
+
+impl ZfsCmd {
     /**
     Set `zc_name` (the primary pool/dataset name). The field is a fixed
     `MAXPATHLEN`-byte buffer; an oversized name (e.g. unbounded modal input)
@@ -802,10 +964,12 @@ fn cstr_field(buf: &[u8]) -> String {
 /**
 The loaded ZFS module's release, from `/sys/module/zfs/version` (e.g.
 "2.2.2-0ubuntu9" or "0.8.6-1"). Only major.minor is kept — that is all the
-ABI-era decisions need. Read once per process; `None` when no module is
-loaded (e.g. pure `--device` runs, where nothing consults it either).
+ABI-era decisions need — except that a development build's `.99` patch level
+counts as the next minor (master after the 2.4 branch is "2.4.99", i.e. the
+2.5 line). Read once per process; `None` when no module is loaded (e.g. pure
+`--device` runs, where nothing consults it either).
 */
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct KernelVersion {
     pub major: u32,
     pub minor: u32,
@@ -815,8 +979,17 @@ impl KernelVersion {
     fn parse(s: &str) -> Option<KernelVersion> {
         let mut parts = s.trim().split(['.', '-', '_']);
         let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        Some(KernelVersion { major, minor })
+        let minor: u32 = parts.next()?.parse().ok()?;
+        let dev = parts.next().and_then(|p| p.parse::<u32>().ok()) == Some(DEV_PATCH_LEVEL);
+        Some(KernelVersion { major, minor: minor + u32::from(dev) })
+    }
+}
+
+impl fmt::Display for KernelVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 0.x was "ZFS on Linux"; the project became OpenZFS with 2.0
+        let brand = if self.major == 0 { "ZoL" } else { "OpenZFS" };
+        write!(f, "{brand} {}.{}", self.major, self.minor)
     }
 }
 
@@ -826,6 +999,112 @@ static KERNEL_VERSION: LazyLock<Option<KernelVersion>> =
 /// The loaded module's version, if one could be probed.
 pub fn kernel_version() -> Option<KernelVersion> {
     *KERNEL_VERSION
+}
+
+/**
+How the loaded module relates to the ABI this code was verified against
+(ZoL 0.8 through OpenZFS 2.4, per `doc/reference/<version>/README.md`).
+Outside that range a handle still reads — every change since 0.8 has been
+an append — but refuses the mutating ioctls unless opened with
+[`HandleOptions::allow_unverified_writes`].
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KernelSupport {
+    Verified(KernelVersion),
+    /// Newer than the newest verified release.
+    Newer(KernelVersion),
+    /// Older than the oldest supported release; some stats decode wrong
+    /// (0.7's `vdev_stat_t` has a mid-array insert).
+    Older(KernelVersion),
+    /// No version could be probed.
+    Unknown,
+}
+
+impl KernelSupport {
+    fn of(version: Option<KernelVersion>) -> KernelSupport {
+        match version {
+            None => KernelSupport::Unknown,
+            Some(v) if v < OLDEST_SUPPORTED => KernelSupport::Older(v),
+            Some(v) if v > NEWEST_VERIFIED => KernelSupport::Newer(v),
+            Some(v) => KernelSupport::Verified(v),
+        }
+    }
+
+    pub fn is_verified(self) -> bool {
+        matches!(self, KernelSupport::Verified(_))
+    }
+}
+
+impl fmt::Display for KernelSupport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KernelSupport::Verified(v) => write!(f, "{v} (verified ABI)"),
+            KernelSupport::Newer(v) => {
+                write!(f, "{v} is newer than the newest verified ABI ({NEWEST_VERIFIED})")
+            }
+            KernelSupport::Older(v) => {
+                write!(f, "{v} is older than the oldest supported release ({OLDEST_SUPPORTED})")
+            }
+            KernelSupport::Unknown => write!(f, "the ZFS module version could not be probed"),
+        }
+    }
+}
+
+/// The loaded module's [`KernelSupport`] (probed once per process).
+pub fn kernel_support() -> KernelSupport {
+    KernelSupport::of(kernel_version())
+}
+
+/**
+How a [`ZfsHandle`] talks to the kernel. Defaults suit every verified
+release; [`set_default_handle_options`] changes what [`ZfsHandle::open`]
+uses process-wide (the settings describe the host's kernel, which is the
+same for every handle), [`ZfsHandle::open_with`] sets them per handle.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HandleOptions {
+    /**
+    Bytes of the zeroed buffer each `zfs_cmd_t` is passed in, clamped to
+    [`MIN_CMD_BUFFER_SIZE`]..=[`MAX_CMD_BUFFER_SIZE`]. Raise it if a future
+    release grows the struct past [`DEFAULT_CMD_BUFFER_SIZE`].
+    */
+    pub cmd_buffer_size: usize,
+    /// Allow mutating ioctls on a kernel outside the verified ABI range.
+    pub allow_unverified_writes: bool,
+}
+
+impl HandleOptions {
+    pub const DEFAULT: HandleOptions =
+        HandleOptions { cmd_buffer_size: DEFAULT_CMD_BUFFER_SIZE, allow_unverified_writes: false };
+
+    pub fn cmd_buffer_size(mut self, bytes: usize) -> Self {
+        self.cmd_buffer_size = bytes;
+        self
+    }
+
+    pub fn allow_unverified_writes(mut self, allow: bool) -> Self {
+        self.allow_unverified_writes = allow;
+        self
+    }
+}
+
+impl Default for HandleOptions {
+    fn default() -> Self {
+        HandleOptions::DEFAULT
+    }
+}
+
+/// Set the options [`ZfsHandle::open`] uses from now on (handles already
+/// open keep theirs).
+pub fn set_default_handle_options(opts: HandleOptions) {
+    *DEFAULT_OPTIONS.write().unwrap_or_else(PoisonError::into_inner) = opts;
+}
+
+/// The options [`ZfsHandle::open`] currently uses.
+pub fn default_handle_options() -> HandleOptions {
+    *DEFAULT_OPTIONS.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 /**
@@ -962,33 +1241,84 @@ pub struct ZfsHandle {
     heartbeat. Per handle, like the fd (handles aren't shared across threads).
     */
     dst_hint: Cell<usize>,
+    /// Bytes per command buffer ([`HandleOptions::cmd_buffer_size`], clamped).
+    cmd_size: usize,
+    support: KernelSupport,
+    /// Verified kernel, or the caller opted in: the [`Self::ioctl`] gate.
+    writes_allowed: bool,
 }
 
 impl ZfsHandle {
+    /// Open `/dev/zfs` with the process-wide [`default_handle_options`].
     pub fn open() -> Result<Self> {
+        Self::open_with(default_handle_options())
+    }
+
+    pub fn open_with(opts: HandleOptions) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(ZFS_DEV)
             .map_err(ZfsError::Open)?;
-        Ok(ZfsHandle { file, dst_hint: Cell::new(DST_INITIAL) })
+        Ok(Self::with_file(file, kernel_support(), opts))
     }
 
-    fn ioctl(&self, ioc: u64, zc: &mut ZfsCmd) -> io::Result<()> {
+    fn with_file(file: File, support: KernelSupport, opts: HandleOptions) -> Self {
+        ZfsHandle {
+            file,
+            dst_hint: Cell::new(DST_INITIAL),
+            cmd_size: opts.cmd_buffer_size.clamp(MIN_CMD_BUFFER_SIZE, MAX_CMD_BUFFER_SIZE),
+            support,
+            writes_allowed: support.is_verified() || opts.allow_unverified_writes,
+        }
+    }
+
+    /// The loaded module's standing against the verified ABI range.
+    pub fn kernel_support(&self) -> KernelSupport {
+        self.support
+    }
+
+    /// Will this handle issue mutating ioctls? (False only outside the verified
+    /// range without the opt-in.)
+    pub fn writes_allowed(&self) -> bool {
+        self.writes_allowed
+    }
+
+    /// A fresh zeroed command buffer.
+    fn cmd(&self) -> CmdBuf {
+        CmdBuf::new(self.cmd_size)
+    }
+
+    /**
+    Issue one ioctl — the only place that does. The outer `Result` is the
+    write gate ([`ZfsError::WriteRefused`], nothing reaches the kernel); the
+    inner one is the kernel's answer, left raw because callers branch on
+    errnos (ENOMEM regrow, ESRCH end-of-list, …) before naming a failure.
+    */
+    fn ioctl(&self, ioc: Ioc, zc: &mut CmdBuf) -> Result<io::Result<()>> {
+        if ioc.mutates() && !self.writes_allowed {
+            return Err(ZfsError::WriteRefused { ioc, kernel: self.support });
+        }
         /*
         The ioctl request arg is c_ulong on glibc but c_int on musl; the
         0x5a00-range request numbers fit either. `libc::Ioctl` is the
         per-target alias, so this casts to the right width on both.
         */
         let rc = unsafe {
-            libc::ioctl(self.file.as_raw_fd(), ioc as libc::Ioctl, zc as *mut ZfsCmd)
+            libc::ioctl(self.file.as_raw_fd(), ioc.code() as libc::Ioctl, zc.as_mut_ptr())
         };
-        if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+        Ok(if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) })
+    }
+
+    /// [`Self::ioctl`] with no errno to branch on: a failure is a
+    /// [`ZfsError::Ioctl`] naming `name`.
+    fn ioctl_named(&self, ioc: Ioc, zc: &mut CmdBuf, name: &str) -> Result<()> {
+        self.ioctl(ioc, zc)?.map_err(|err| ZfsError::Ioctl { ioc, name: name.to_string(), err })
     }
 
     /// Run an ioctl whose result is an nvlist in `zc_nvlist_dst`, growing the
     /// destination buffer on ENOMEM as the kernel requests.
-    fn ioctl_nv(&self, ioc: u64, zc: &mut ZfsCmd) -> Result<NvList> {
+    fn ioctl_nv(&self, ioc: Ioc, zc: &mut CmdBuf) -> Result<NvList> {
         self.ioctl_nv_in(ioc, zc, None)
     }
 
@@ -998,7 +1328,7 @@ impl ZfsHandle {
     GET_BOOKMARKS, which name what to fetch. The packed source is held for the
     duration of the call(s).
     */
-    fn ioctl_nv_in(&self, ioc: u64, zc: &mut ZfsCmd, innvl: Option<&NvList>) -> Result<NvList> {
+    fn ioctl_nv_in(&self, ioc: Ioc, zc: &mut CmdBuf, innvl: Option<&NvList>) -> Result<NvList> {
         let src = innvl.map(|nv| nv.pack()).transpose()?;
         if let Some(s) = &src {
             zc.zc_nvlist_src = s.as_ptr() as u64;
@@ -1017,7 +1347,7 @@ impl ZfsHandle {
             zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
             zc.zc_nvlist_dst_size = dst.len() as u64;
             zc.zc_nvlist_dst_filled = 0;
-            match self.ioctl(ioc, zc) {
+            match self.ioctl(ioc, zc)? {
                 Ok(()) => {
                     let len = (zc.zc_nvlist_dst_size as usize).min(dst.len());
                     // remember a big reply (+1/8 headroom for growth) so the
@@ -1044,23 +1374,23 @@ impl ZfsHandle {
     /// All imported pools: one nvpair per pool, name → config nvlist
     /// (ZFS_IOC_POOL_CONFIGS).
     pub fn pool_configs(&self) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
-        self.ioctl_nv(ZFS_IOC_POOL_CONFIGS, &mut zc)
+        let mut zc = self.cmd();
+        self.ioctl_nv(Ioc::PoolConfigs, &mut zc)
     }
 
     /// Detailed config for one pool, including the vdev tree with stats
     /// (ZFS_IOC_POOL_STATS).
     pub fn pool_stats(&self, pool: &str) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.ioctl_nv(ZFS_IOC_POOL_STATS, &mut zc)
+        self.ioctl_nv(Ioc::PoolStats, &mut zc)
     }
 
     /// Pool properties (ZFS_IOC_POOL_GET_PROPS).
     pub fn pool_props(&self, pool: &str) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.ioctl_nv(ZFS_IOC_POOL_GET_PROPS, &mut zc)
+        self.ioctl_nv(Ioc::PoolGetProps, &mut zc)
     }
 
     /**
@@ -1083,16 +1413,12 @@ impl ZfsHandle {
         */
         let mut offset = 0u64;
         loop {
-            let mut zc = ZfsCmd::new();
+            let mut zc = self.cmd();
             zc.set_name(pool)?;
             zc.zc_history = buf.as_mut_ptr() as u64;
             zc.zc_history_len = buf.len() as u64;
             zc.zc_history_offset = offset;
-            self.ioctl(ZFS_IOC_POOL_GET_HISTORY, &mut zc).map_err(|err| ZfsError::Ioctl {
-                ioc: ZFS_IOC_POOL_GET_HISTORY,
-                name: pool.to_string(),
-                err,
-            })?;
+            self.ioctl_named(Ioc::PoolGetHistory, &mut zc, pool)?;
             let bytes_read = (zc.zc_history_len as usize).min(buf.len());
             if bytes_read == 0 {
                 break; // EOF
@@ -1125,9 +1451,9 @@ impl ZfsHandle {
     "who" keys → the granted permission set.
     */
     pub fn get_fsacl(&self, dataset: &str) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        self.ioctl_nv(ZFS_IOC_GET_FSACL, &mut zc)
+        self.ioctl_nv(Ioc::GetFsacl, &mut zc)
     }
 
     /**
@@ -1137,9 +1463,9 @@ impl ZfsHandle {
     `{value, source}` sub-nvlist. Only meaningful for ZFS (not zvol) objsets.
     */
     pub fn objset_zplprops(&self, dataset: &str) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        self.ioctl_nv(ZFS_IOC_OBJSET_ZPLPROPS, &mut zc)
+        self.ioctl_nv(Ioc::ObjsetZplprops, &mut zc)
     }
 
     /**
@@ -1150,9 +1476,9 @@ impl ZfsHandle {
     received.
     */
     pub fn objset_recvd_props(&self, dataset: &str) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        self.ioctl_nv(ZFS_IOC_OBJSET_RECVD_PROPS, &mut zc)
+        self.ioctl_nv(Ioc::ObjsetRecvdProps, &mut zc)
     }
 
     /**
@@ -1161,9 +1487,9 @@ impl ZfsHandle {
     destroyed until they are released. New-style ioctl with no input nvlist.
     */
     pub fn get_holds(&self, snapshot: &str) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(snapshot)?;
-        self.ioctl_nv(ZFS_IOC_GET_HOLDS, &mut zc)
+        self.ioctl_nv(Ioc::GetHolds, &mut zc)
     }
 
     /**
@@ -1186,9 +1512,9 @@ impl ZfsHandle {
         let mut innvl = NvList::new();
         innvl.add_u64("vdevprops_get_vdev", guid);
         innvl.add_nvlist("vdevprops_get_props", want);
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.ioctl_nv_in(ZFS_IOC_VDEV_GET_PROPS, &mut zc, Some(&innvl))
+        self.ioctl_nv_in(Ioc::VdevGetProps, &mut zc, Some(&innvl))
     }
 
     /**
@@ -1202,9 +1528,9 @@ impl ZfsHandle {
         for p in ["guid", "createtxg", "creation"] {
             innvl.add_bool_flag(p);
         }
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        self.ioctl_nv_in(ZFS_IOC_GET_BOOKMARKS, &mut zc, Some(&innvl))
+        self.ioctl_nv_in(Ioc::GetBookmarks, &mut zc, Some(&innvl))
     }
 
     /**
@@ -1223,17 +1549,13 @@ impl ZfsHandle {
         let mut buf = vec![0u8; 64 * REC];
         let mut cookie = 0u64;
         loop {
-            let mut zc = ZfsCmd::new();
+            let mut zc = self.cmd();
             zc.set_name(dataset)?;
             zc.zc_objset_type = prop_type;
             zc.zc_cookie = cookie;
             zc.zc_nvlist_dst = buf.as_mut_ptr() as u64;
             zc.zc_nvlist_dst_size = buf.len() as u64;
-            self.ioctl(ZFS_IOC_USERSPACE_MANY, &mut zc).map_err(|err| ZfsError::Ioctl {
-                ioc: ZFS_IOC_USERSPACE_MANY,
-                name: dataset.to_string(),
-                err,
-            })?;
+            self.ioctl_named(Ioc::UserspaceMany, &mut zc, dataset)?;
             let filled = (zc.zc_nvlist_dst_size as usize).min(buf.len());
             for rec in buf[..filled].chunks_exact(REC) {
                 out.push(UserAcct {
@@ -1261,14 +1583,10 @@ impl ZfsHandle {
     whole in-kernel ring from the start. Reading events needs root (EPERM).
     */
     pub fn events_seek_start(&self) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.zc_cleanup_fd = self.file.as_raw_fd();
         zc.zc_guid = ZEVENT_SEEK_START;
-        self.ioctl(ZFS_IOC_EVENTS_SEEK, &mut zc).map_err(|err| ZfsError::Ioctl {
-            ioc: ZFS_IOC_EVENTS_SEEK,
-            name: "(zevents)".into(),
-            err,
-        })
+        self.ioctl_named(Ioc::EventsSeek, &mut zc, EVENTS_NAME)
     }
 
     /**
@@ -1281,14 +1599,14 @@ impl ZfsHandle {
     pub fn events_next(&self, block: bool) -> Result<Option<(NvList, u64)>> {
         let mut dst: Vec<u8> = vec![0; DST_INITIAL];
         loop {
-            let mut zc = ZfsCmd::new();
+            let mut zc = self.cmd();
             zc.zc_cleanup_fd = self.file.as_raw_fd();
             if !block {
                 zc.zc_guid = ZEVENT_NONBLOCK;
             }
             zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
             zc.zc_nvlist_dst_size = dst.len() as u64;
-            match self.ioctl(ZFS_IOC_EVENTS_NEXT, &mut zc) {
+            match self.ioctl(Ioc::EventsNext, &mut zc)? {
                 Ok(()) => {
                     let len = (zc.zc_nvlist_dst_size as usize).min(dst.len());
                     return Ok(Some((NvList::unpack(&dst[..len])?, zc.zc_cookie)));
@@ -1304,8 +1622,8 @@ impl ZfsHandle {
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
                 Err(err) => {
                     return Err(ZfsError::Ioctl {
-                        ioc: ZFS_IOC_EVENTS_NEXT,
-                        name: "(zevents)".into(),
+                        ioc: Ioc::EventsNext,
+                        name: EVENTS_NAME.into(),
                         err,
                     });
                 }
@@ -1329,11 +1647,11 @@ impl ZfsHandle {
         let mut cap: u64 = 128;
         loop {
             let mut buf = vec![0u8; cap as usize * ENT];
-            let mut zc = ZfsCmd::new();
+            let mut zc = self.cmd();
             zc.set_name(pool)?;
             zc.zc_nvlist_dst = buf.as_mut_ptr() as u64;
             zc.zc_nvlist_dst_size = cap;
-            match self.ioctl(ZFS_IOC_ERROR_LOG, &mut zc) {
+            match self.ioctl(Ioc::ErrorLog, &mut zc)? {
                 Ok(()) => {
                     // entries occupy [remaining, cap); `remaining` is the unused
                     // leading slots the kernel left after back-filling
@@ -1354,7 +1672,7 @@ impl ZfsHandle {
                 }
                 Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => cap = cap.saturating_mul(2),
                 Err(err) => {
-                    return Err(ZfsError::Ioctl { ioc: ZFS_IOC_ERROR_LOG, name: pool.to_string(), err });
+                    return Err(ZfsError::Ioctl { ioc: Ioc::ErrorLog, name: pool.to_string(), err });
                 }
             }
         }
@@ -1363,14 +1681,10 @@ impl ZfsHandle {
     /// Resolve a dataset object id to its dataset name within `pool`
     /// (ZFS_IOC_DSOBJ_TO_DSNAME). Used to name error-log bookmarks.
     pub fn dsobj_to_dsname(&self, pool: &str, dsobj: u64) -> Result<String> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
         zc.zc_obj = dsobj;
-        self.ioctl(ZFS_IOC_DSOBJ_TO_DSNAME, &mut zc).map_err(|err| ZfsError::Ioctl {
-            ioc: ZFS_IOC_DSOBJ_TO_DSNAME,
-            name: pool.to_string(),
-            err,
-        })?;
+        self.ioctl_named(Ioc::DsobjToDsname, &mut zc, pool)?;
         Ok(cstr_field(&zc.zc_value))
     }
 
@@ -1379,28 +1693,20 @@ impl ZfsHandle {
     (ZFS_IOC_OBJ_TO_PATH). Only ZFS (ZPL) objsets — EINVAL for a zvol or the MOS.
     */
     pub fn obj_to_path(&self, dataset: &str, obj: u64) -> Result<String> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
         zc.zc_obj = obj;
-        self.ioctl(ZFS_IOC_OBJ_TO_PATH, &mut zc).map_err(|err| ZfsError::Ioctl {
-            ioc: ZFS_IOC_OBJ_TO_PATH,
-            name: dataset.to_string(),
-            err,
-        })?;
+        self.ioctl_named(Ioc::ObjToPath, &mut zc, dataset)?;
         Ok(cstr_field(&zc.zc_value))
     }
 
     /// Resolve an object to its path *and* stat (ZFS_IOC_OBJ_TO_STATS); same
     /// ZPL-only restriction as [`Self::obj_to_path`].
     pub fn obj_to_stats(&self, dataset: &str, obj: u64) -> Result<(String, ZStat)> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
         zc.zc_obj = obj;
-        self.ioctl(ZFS_IOC_OBJ_TO_STATS, &mut zc).map_err(|err| ZfsError::Ioctl {
-            ioc: ZFS_IOC_OBJ_TO_STATS,
-            name: dataset.to_string(),
-            err,
-        })?;
+        self.ioctl_named(Ioc::ObjToStats, &mut zc, dataset)?;
         Ok((cstr_field(&zc.zc_value), (&zc.zc_stat).into()))
     }
 
@@ -1412,14 +1718,10 @@ impl ZfsHandle {
     (uncompressed) fields.
     */
     pub fn space_written(&self, dataset: &str, earlier: &str) -> Result<SpaceUsage> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
         zc.set_value(earlier)?;
-        self.ioctl(ZFS_IOC_SPACE_WRITTEN, &mut zc).map_err(|err| ZfsError::Ioctl {
-            ioc: ZFS_IOC_SPACE_WRITTEN,
-            name: dataset.to_string(),
-            err,
-        })?;
+        self.ioctl_named(Ioc::SpaceWritten, &mut zc, dataset)?;
         Ok(SpaceUsage {
             used: zc.zc_cookie,
             compressed: zc.zc_objset_type,
@@ -1437,9 +1739,9 @@ impl ZfsHandle {
     pub fn space_snaps(&self, lastsnap: &str, firstsnap: &str) -> Result<SpaceUsage> {
         let mut innvl = NvList::new();
         innvl.add_str("firstsnap", firstsnap);
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(lastsnap)?;
-        let out = self.ioctl_nv_in(ZFS_IOC_SPACE_SNAPS, &mut zc, Some(&innvl))?;
+        let out = self.ioctl_nv_in(Ioc::SpaceSnaps, &mut zc, Some(&innvl))?;
         Ok(SpaceUsage {
             used: out.get_u64("used").unwrap_or(0),
             compressed: out.get_u64("compressed").unwrap_or(0),
@@ -1461,9 +1763,9 @@ impl ZfsHandle {
             innvl.add_str("from", f);
         }
         flags.fill(&mut innvl);
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(snapshot)?;
-        let out = self.ioctl_nv_in(ZFS_IOC_SEND_SPACE, &mut zc, Some(&innvl))?;
+        let out = self.ioctl_nv_in(Ioc::SendSpace, &mut zc, Some(&innvl))?;
         Ok(out.get_u64("space").unwrap_or(0))
     }
 
@@ -1487,9 +1789,9 @@ impl ZfsHandle {
             innvl.add_str("fromsnap", f);
         }
         flags.fill(&mut innvl);
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(snapshot)?;
-        self.write_ioctl(ZFS_IOC_SEND_NEW, WriteOp::Send, &mut zc, Some(&innvl))?;
+        self.write_ioctl(Ioc::SendNew, WriteOp::Send, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -1501,11 +1803,10 @@ impl ZfsHandle {
     ENOENT.
     */
     pub fn send_progress(&self, snapshot: &str, fd: RawFd) -> Result<u64> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(snapshot)?;
         zc.zc_cookie = fd as u64;
-        self.ioctl(ZFS_IOC_SEND_PROGRESS, &mut zc)
-            .map_err(|err| ZfsError::Ioctl { ioc: ZFS_IOC_SEND_PROGRESS, name: zc.name(), err })?;
+        self.ioctl_named(Ioc::SendProgress, &mut zc, snapshot)?;
         Ok(zc.zc_cookie)
     }
 
@@ -1557,9 +1858,9 @@ impl ZfsHandle {
         if resumable {
             innvl.add_bool_flag("resumable");
         }
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(target)?;
-        let out = self.write_ioctl(ZFS_IOC_RECV_NEW, WriteOp::Receive, &mut zc, Some(&innvl))?;
+        let out = self.write_ioctl(Ioc::RecvNew, WriteOp::Receive, &mut zc, Some(&innvl))?;
         Ok(RecvResult {
             read_bytes: out.get_u64("read_bytes").unwrap_or(0),
             error_flags: out.get_u64("error_flags").unwrap_or(0),
@@ -1569,20 +1870,20 @@ impl ZfsHandle {
 
     /// Stats and properties for one dataset (ZFS_IOC_OBJSET_STATS).
     pub fn objset_stats(&self, dataset: &str) -> Result<(ObjsetStats, NvList)> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        let props = self.ioctl_nv(ZFS_IOC_OBJSET_STATS, &mut zc)?;
+        let props = self.ioctl_nv(Ioc::ObjsetStats, &mut zc)?;
         Ok(((&zc.zc_objset_stats).into(), props))
     }
 
     /// Direct child datasets of `parent` (ZFS_IOC_DATASET_LIST_NEXT).
     pub fn datasets(&self, parent: &str) -> Result<Vec<DatasetEntry>> {
-        self.list_next(ZFS_IOC_DATASET_LIST_NEXT, parent, false)
+        self.list_next(Ioc::DatasetListNext, parent, false)
     }
 
     /// Snapshots of `dataset` (ZFS_IOC_SNAPSHOT_LIST_NEXT), with all props.
     pub fn snapshots(&self, dataset: &str) -> Result<Vec<DatasetEntry>> {
-        self.list_next(ZFS_IOC_SNAPSHOT_LIST_NEXT, dataset, false)
+        self.list_next(Ioc::SnapshotListNext, dataset, false)
     }
 
     /**
@@ -1595,24 +1896,24 @@ impl ZfsHandle {
     fast-stat fill isn't vendored for pre-2.2 kernels, so don't trust it).
     */
     pub fn snapshot_stats(&self, dataset: &str) -> Result<Vec<DatasetEntry>> {
-        let fast = self.list_next(ZFS_IOC_SNAPSHOT_LIST_NEXT, dataset, true)?;
+        let fast = self.list_next(Ioc::SnapshotListNext, dataset, true)?;
         if fast.iter().any(|e| e.stats.guid == 0) {
             return self.snapshots(dataset);
         }
         Ok(fast)
     }
 
-    fn list_next(&self, ioc: u64, parent: &str, simple: bool) -> Result<Vec<DatasetEntry>> {
+    fn list_next(&self, ioc: Ioc, parent: &str, simple: bool) -> Result<Vec<DatasetEntry>> {
         let mut out = Vec::new();
         let mut cookie = 0u64;
         loop {
-            let mut zc = ZfsCmd::new();
+            let mut zc = self.cmd();
             zc.set_name(parent)?;
             zc.zc_cookie = cookie;
             let listed = if simple {
                 // no props nvlist comes back in simple mode: pass no dst buffer
                 zc.zc_simple = 1;
-                self.ioctl(ioc, &mut zc)
+                self.ioctl(ioc, &mut zc)?
                     .map(|()| NvList::default())
                     .map_err(|err| ZfsError::Ioctl { ioc, name: zc.name(), err })
             } else {
@@ -1648,9 +1949,9 @@ impl ZfsHandle {
     */
     fn write_ioctl(
         &self,
-        ioc: u64,
+        ioc: Ioc,
         op: WriteOp,
-        zc: &mut ZfsCmd,
+        zc: &mut CmdBuf,
         innvl: Option<&NvList>,
     ) -> Result<NvList> {
         // The packed source must outlive the ioctl call(s); hold it here.
@@ -1664,7 +1965,7 @@ impl ZfsHandle {
             zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
             zc.zc_nvlist_dst_size = dst.len() as u64;
             zc.zc_nvlist_dst_filled = 0;
-            match self.ioctl(ioc, zc) {
+            match self.ioctl(ioc, zc)? {
                 Ok(()) => {
                     // Only some ioctls return an nvlist; honor the filled flag.
                     let len = zc.zc_nvlist_dst_size as usize;
@@ -1705,26 +2006,26 @@ impl ZfsHandle {
     on full success).
     */
     pub fn set_prop(&self, dataset: &str, props: &NvList) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        self.write_ioctl(ZFS_IOC_SET_PROP, WriteOp::SetProp, &mut zc, Some(props))
+        self.write_ioctl(Ioc::SetProp, WriteOp::SetProp, &mut zc, Some(props))
     }
 
     /// Set pool properties (ZFS_IOC_POOL_SET_PROPS).
     pub fn pool_set_props(&self, pool: &str, props: &NvList) -> Result<NvList> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_POOL_SET_PROPS, WriteOp::PoolSetProps, &mut zc, Some(props))
+        self.write_ioctl(Ioc::PoolSetProps, WriteOp::PoolSetProps, &mut zc, Some(props))
     }
 
     /// Reset a property to its inherited value (ZFS_IOC_INHERIT_PROP).
     /// `received` reverts to the received value rather than clearing it.
     pub fn inherit_prop(&self, dataset: &str, prop: &str, received: bool) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
         zc.set_value(prop)?;
         zc.zc_cookie = received as u64;
-        self.write_ioctl(ZFS_IOC_INHERIT_PROP, WriteOp::InheritProp, &mut zc, None)?;
+        self.write_ioctl(Ioc::InheritProp, WriteOp::InheritProp, &mut zc, None)?;
         Ok(())
     }
 
@@ -1744,9 +2045,9 @@ impl ZfsHandle {
         if let Some(p) = props {
             innvl.add_nvlist("props", p.clone());
         }
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_SNAPSHOT, WriteOp::Snapshot, &mut zc, Some(&innvl))
+        self.write_ioctl(Ioc::Snapshot, WriteOp::Snapshot, &mut zc, Some(&innvl))
     }
 
     /**
@@ -1764,9 +2065,9 @@ impl ZfsHandle {
         if defer {
             innvl.add_bool_flag("defer");
         }
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_DESTROY_SNAPS, WriteOp::DestroySnaps, &mut zc, Some(&innvl))
+        self.write_ioctl(Ioc::DestroySnaps, WriteOp::DestroySnaps, &mut zc, Some(&innvl))
     }
 
     /**
@@ -1788,9 +2089,9 @@ impl ZfsHandle {
         if let Some(p) = props {
             innvl.add_nvlist("props", p.clone());
         }
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(name)?;
-        self.write_ioctl(ZFS_IOC_CREATE, WriteOp::Create, &mut zc, Some(&innvl))?;
+        self.write_ioctl(Ioc::Create, WriteOp::Create, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -1800,21 +2101,21 @@ impl ZfsHandle {
     first (or use `destroy_snaps` for snapshots in bulk).
     */
     pub fn destroy(&self, name: &str, defer: bool) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(name)?;
         zc.zc_defer_destroy = defer as u32;
-        self.write_ioctl(ZFS_IOC_DESTROY, WriteOp::Destroy, &mut zc, None)?;
+        self.write_ioctl(Ioc::Destroy, WriteOp::Destroy, &mut zc, None)?;
         Ok(())
     }
 
     /// Rename a dataset (ZFS_IOC_RENAME). `recursive` also renames the
     /// snapshots of descendants (only meaningful when renaming a snapshot).
     pub fn rename(&self, from: &str, to: &str, recursive: bool) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(from)?;
         zc.set_value(to)?;
         zc.zc_cookie = recursive as u64;
-        self.write_ioctl(ZFS_IOC_RENAME, WriteOp::Rename, &mut zc, None)?;
+        self.write_ioctl(Ioc::Rename, WriteOp::Rename, &mut zc, None)?;
         Ok(())
     }
 
@@ -1856,11 +2157,11 @@ impl ZfsHandle {
             }
             fsacl.add_nvlist(whokey, permnv);
         }
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
         zc.zc_perm_action = unset as u64; // 0 = allow, 1 = unallow
         let op = if unset { WriteOp::Unallow } else { WriteOp::Allow };
-        self.write_ioctl(ZFS_IOC_SET_FSACL, op, &mut zc, Some(&fsacl))?;
+        self.write_ioctl(Ioc::SetFsacl, op, &mut zc, Some(&fsacl))?;
         Ok(())
     }
 
@@ -1876,8 +2177,8 @@ impl ZfsHandle {
     pub fn log_history(&self, message: &str) -> Result<()> {
         let mut innvl = NvList::new();
         innvl.add_str("message", message);
-        let mut zc = ZfsCmd::new();
-        self.write_ioctl(ZFS_IOC_LOG_HISTORY, WriteOp::LogHistory, &mut zc, Some(&innvl))?;
+        let mut zc = self.cmd();
+        self.write_ioctl(Ioc::LogHistory, WriteOp::LogHistory, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -1893,9 +2194,9 @@ impl ZfsHandle {
         holds.add_str(snapshot, tag);
         let mut args = NvList::new();
         args.add_nvlist("holds", holds);
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_HOLD, WriteOp::Hold, &mut zc, Some(&args))
+        self.write_ioctl(Ioc::Hold, WriteOp::Hold, &mut zc, Some(&args))
     }
 
     /**
@@ -1908,9 +2209,9 @@ impl ZfsHandle {
         tags.add_bool_flag(tag);
         let mut holds = NvList::new();
         holds.add_nvlist(snapshot, tags);
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_RELEASE, WriteOp::Release, &mut zc, Some(&holds))
+        self.write_ioctl(Ioc::Release, WriteOp::Release, &mut zc, Some(&holds))
     }
 
     /**
@@ -1931,9 +2232,9 @@ impl ZfsHandle {
         if noop {
             innvl.add_bool_flag("noop");
         }
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        self.write_ioctl(ZFS_IOC_LOAD_KEY, WriteOp::LoadKey, &mut zc, Some(&innvl))?;
+        self.write_ioctl(Ioc::LoadKey, WriteOp::LoadKey, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -1941,9 +2242,9 @@ impl ZfsHandle {
     /// (ZFS_IOC_UNLOAD_KEY; `zfs unload-key`). Fails while the dataset (or a
     /// descendant sharing the key) is mounted/busy — the kernel enforces it.
     pub fn unload_key(&self, dataset: &str) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        self.write_ioctl(ZFS_IOC_UNLOAD_KEY, WriteOp::UnloadKey, &mut zc, None)?;
+        self.write_ioctl(Ioc::UnloadKey, WriteOp::UnloadKey, &mut zc, None)?;
         Ok(())
     }
 
@@ -1957,13 +2258,13 @@ impl ZfsHandle {
     would leave the pool without a valid replica.
     */
     pub fn vdev_set_state(&self, pool: &str, guid: u64, online: bool, expand: bool) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
         zc.zc_guid = guid;
         zc.zc_cookie = if online { 7 } else { 2 };
         zc.zc_obj = if expand { ZFS_ONLINE_EXPAND } else { 0 };
         let op = if online { WriteOp::VdevOnline } else { WriteOp::VdevOffline };
-        self.write_ioctl(ZFS_IOC_VDEV_SET_STATE, op, &mut zc, None)?;
+        self.write_ioctl(Ioc::VdevSetState, op, &mut zc, None)?;
         Ok(())
     }
 
@@ -1979,9 +2280,9 @@ impl ZfsHandle {
         let mut innvl = NvList::new();
         innvl.add_u64("vdevprops_set_vdev", guid);
         innvl.add_nvlist("vdevprops_set_props", set);
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_VDEV_SET_PROPS, WriteOp::VdevSetProps, &mut zc, Some(&innvl))
+        self.write_ioctl(Ioc::VdevSetProps, WriteOp::VdevSetProps, &mut zc, Some(&innvl))
     }
 
     /* ---------------------------- pool maintenance ----------------------- */
@@ -1992,10 +2293,10 @@ impl ZfsHandle {
     drop the last replica.
     */
     pub fn vdev_detach(&self, pool: &str, guid: u64) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
         zc.zc_guid = guid;
-        self.ioctl(ZFS_IOC_VDEV_DETACH, &mut zc)
+        self.ioctl(Ioc::VdevDetach, &mut zc)?
             .map_err(|err| ZfsError::Write { op: WriteOp::VdevDetach, err, elements: Vec::new() })?;
         Ok(())
     }
@@ -2021,7 +2322,7 @@ impl ZfsHandle {
         root.add_str("type", "root");
         root.push("children", NvData::ListArray(vec![dev]));
         let conf = root.pack()?;
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
         zc.zc_guid = guid;
         zc.zc_cookie = u64::from(replacing);
@@ -2029,7 +2330,7 @@ impl ZfsHandle {
         zc.zc_nvlist_conf_size = conf.len() as u64;
         let op = if replacing { WriteOp::VdevReplace } else { WriteOp::VdevAttach };
         // `conf` outlives the ioctl (dropped at fn end)
-        self.ioctl(ZFS_IOC_VDEV_ATTACH, &mut zc)
+        self.ioctl(Ioc::VdevAttach, &mut zc)?
             .map_err(|err| ZfsError::Write { op, err, elements: Vec::new() })?;
         Ok(())
     }
@@ -2048,12 +2349,12 @@ impl ZfsHandle {
     pause on a running scrub.)
     */
     pub fn pool_scan(&self, pool: &str, func: u64, pause: bool) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
         zc.zc_cookie = func;
         zc.zc_flags = u32::from(pause); // POOL_SCRUB_PAUSE = 1, else NORMAL
         let scrub = func == PoolScanFunc::Scrub as u64 || func == PoolScanFunc::ErrorScrub as u64;
-        match self.ioctl(ZFS_IOC_POOL_SCAN, &mut zc) {
+        match self.ioctl(Ioc::PoolScan, &mut zc)? {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::ECANCELED) && scrub && !pause => Ok(()),
             Err(err) => Err(ZfsError::Write { op: WriteOp::Scrub, err, elements: Vec::new() }),
@@ -2067,11 +2368,11 @@ impl ZfsHandle {
     what clearing an online pool wants.
     */
     pub fn clear_errors(&self, pool: &str, guid: u64) -> Result<()> {
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
         zc.zc_guid = guid;
         zc.zc_cookie = 1; // ZPOOL_NO_REWIND
-        self.write_ioctl(ZFS_IOC_CLEAR, WriteOp::ClearErrors, &mut zc, None)?;
+        self.write_ioctl(Ioc::Clear, WriteOp::ClearErrors, &mut zc, None)?;
         Ok(())
     }
 
@@ -2098,9 +2399,9 @@ impl ZfsHandle {
         let mut innvl = NvList::new();
         innvl.add_u64("trim_command", cmd);
         innvl.add_nvlist("trim_vdevs", Self::vdev_guid_nvlist(guids));
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_POOL_TRIM, WriteOp::Trim, &mut zc, Some(&innvl))?;
+        self.write_ioctl(Ioc::PoolTrim, WriteOp::Trim, &mut zc, Some(&innvl))?;
         Ok(())
     }
 
@@ -2113,9 +2414,9 @@ impl ZfsHandle {
         let mut innvl = NvList::new();
         innvl.add_u64("initialize_command", cmd);
         innvl.add_nvlist("initialize_vdevs", Self::vdev_guid_nvlist(guids));
-        let mut zc = ZfsCmd::new();
+        let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.write_ioctl(ZFS_IOC_POOL_INITIALIZE, WriteOp::Initialize, &mut zc, Some(&innvl))?;
+        self.write_ioctl(Ioc::PoolInitialize, WriteOp::Initialize, &mut zc, Some(&innvl))?;
         Ok(())
     }
 }
@@ -2125,6 +2426,9 @@ impl ZfsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use strum::IntoEnumIterator;
 
     /// EACCES from LOAD_KEY is a wrong key, not a permission problem.
     #[test]
@@ -2186,8 +2490,127 @@ mod tests {
         assert_eq!(v("2.2.2-0ubuntu9.1"), Some(KernelVersion { major: 2, minor: 2 }));
         assert_eq!(v("0.8.6-1\n"), Some(KernelVersion { major: 0, minor: 8 }));
         assert_eq!(v("2.3.0-rc4"), Some(KernelVersion { major: 2, minor: 3 }));
+        // a master build after the 2.4 branch is the 2.5 line
+        assert_eq!(v("2.4.99-123_g0123abcd"), Some(KernelVersion { major: 2, minor: 5 }));
+        assert_eq!(v("2.4.9"), Some(KernelVersion { major: 2, minor: 4 }));
         assert_eq!(v("garbage"), None);
         assert_eq!(v(""), None);
+    }
+
+    #[test]
+    fn kernel_support_brackets_the_verified_range() {
+        let s = |major, minor| KernelSupport::of(Some(KernelVersion { major, minor }));
+        assert!(matches!(s(0, 7), KernelSupport::Older(_)));
+        assert!(s(0, 8).is_verified());
+        assert!(s(2, 2).is_verified());
+        assert!(s(2, 4).is_verified());
+        assert!(matches!(s(2, 5), KernelSupport::Newer(_)));
+        assert!(matches!(s(3, 0), KernelSupport::Newer(_)));
+        assert_eq!(KernelSupport::of(None), KernelSupport::Unknown);
+        assert_eq!(
+            s(2, 5).to_string(),
+            "OpenZFS 2.5 is newer than the newest verified ABI (OpenZFS 2.4)"
+        );
+        assert_eq!(
+            s(0, 7).to_string(),
+            "ZoL 0.7 is older than the oldest supported release (ZoL 0.8)"
+        );
+    }
+
+    /// A handle over /dev/null (every ioctl fails ENOTTY) with the given gate.
+    fn null_handle(support: KernelSupport, opts: HandleOptions) -> ZfsHandle {
+        ZfsHandle::with_file(File::open("/dev/null").unwrap(), support, opts)
+    }
+
+    /**
+    Outside the verified range a mutating ioctl never reaches the kernel —
+    including the ones that bypass write_ioctl — while reads (and every ioctl
+    once opted in) do: those fail with the device's ENOTTY instead.
+    */
+    #[test]
+    fn write_gate_refuses_unverified_kernels_unless_opted_in() {
+        let newer = KernelSupport::Newer(KernelVersion { major: 2, minor: 5 });
+        let gated = null_handle(newer, HandleOptions::default());
+        assert!(!gated.writes_allowed());
+        let refused = |r: Result<()>, want: Ioc| match r {
+            Err(ZfsError::WriteRefused { ioc, kernel }) => assert_eq!((ioc, kernel), (want, newer)),
+            other => panic!("{want}: expected WriteRefused, got {other:?}"),
+        };
+        refused(gated.destroy("nopool/ds", false), Ioc::Destroy);
+        refused(gated.vdev_detach("nopool", 1), Ioc::VdevDetach);
+        refused(gated.pool_scan("nopool", 1, false), Ioc::PoolScan);
+        let enotty = Some(libc::ENOTTY);
+        assert_eq!(gated.pool_configs().unwrap_err().errno(), enotty);
+        assert!(gated.destroy("nopool/ds", false).unwrap_err().to_string().contains("opt-in"));
+
+        let opted = null_handle(newer, HandleOptions::default().allow_unverified_writes(true));
+        assert!(opted.writes_allowed());
+        assert_eq!(opted.destroy("nopool/ds", false).unwrap_err().errno(), enotty);
+        let verified = KernelSupport::Verified(KernelVersion { major: 2, minor: 2 });
+        let plain = null_handle(verified, HandleOptions::default());
+        assert_eq!(plain.vdev_detach("nopool", 1).unwrap_err().errno(), enotty);
+    }
+
+    #[test]
+    fn cmd_buffer_is_zeroed_padded_and_clamped() {
+        let buf = CmdBuf::new(0);
+        assert_eq!(buf.words.len() * 8, MIN_CMD_BUFFER_SIZE);
+        let buf = CmdBuf::new(DEFAULT_CMD_BUFFER_SIZE + 1);
+        assert_eq!(buf.words.len() * 8, DEFAULT_CMD_BUFFER_SIZE + 8);
+        assert!(buf.words.iter().all(|&w| w == 0));
+        assert_eq!(buf.zc_name[0], 0);
+        let verified = KernelSupport::Verified(KernelVersion { major: 2, minor: 2 });
+        let size = |n| null_handle(verified, HandleOptions::default().cmd_buffer_size(n)).cmd_size;
+        assert_eq!(size(0), MIN_CMD_BUFFER_SIZE);
+        assert_eq!(size(usize::MAX), MAX_CMD_BUFFER_SIZE);
+        assert_eq!(size(DEFAULT_CMD_BUFFER_SIZE), DEFAULT_CMD_BUFFER_SIZE);
+    }
+
+    /**
+    The `zfs_ioc_t` ordinals a vendored zfs.h states in its per-line hex
+    comments (`ZFS_IOC_POOL_STATS, /* 0x5a05 */`), keyed by C name. The
+    platform range is commented relative (`/* 0x81 (Linux) */`) from 2.0 on.
+    */
+    fn header_ordinals(header: &str) -> HashMap<String, u64> {
+        let mut out = HashMap::new();
+        for line in header.lines() {
+            let line = line.trim_start();
+            let name: String = line
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            let Some(hex) = line.split_once("/* 0x").map(|(_, rest)| rest) else { continue };
+            let digits: String = hex.chars().take_while(char::is_ascii_hexdigit).collect();
+            if !name.starts_with("ZFS_IOC_") || digits.is_empty() {
+                continue;
+            }
+            let n = u64::from_str_radix(&digits, 16).unwrap();
+            out.insert(name, if n < 0x100 { 0x5a00 + n } else { n });
+        }
+        out
+    }
+
+    /**
+    Every `Ioc` ordinal agrees with each vendored header of the verified range
+    (2.2 at the reference root). Headers that predate an ioctl (the 2.2 vdev
+    props on 0.8–2.1) may lack it; the 2.2+ ones must have them all.
+    */
+    #[test]
+    fn ioc_ordinals_match_vendored_headers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("doc/reference");
+        let headers =
+            [("0.8", false), ("2.0", false), ("2.1", false), ("", true), ("2.3", true), ("2.4", true)];
+        for (dir, complete) in headers {
+            let header = fs::read_to_string(root.join(dir).join("zfs.h")).unwrap();
+            let ords = header_ordinals(&header);
+            for ioc in Ioc::iter() {
+                let name = format!("ZFS_IOC_{ioc}");
+                match ords.get(&name) {
+                    Some(&n) => assert_eq!(n, ioc.code(), "{name} in {dir:?}"),
+                    None => assert!(!complete, "{name} missing from {dir:?}"),
+                }
+            }
+        }
     }
 
     /**
