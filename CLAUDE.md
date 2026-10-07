@@ -124,9 +124,10 @@ Per-era analyses and headers live in `doc/reference/{0.6,0.7,0.8,2.0,2.1,2.3,2.4
   (`Kstat::has`), never version-branched; `doc/kstat/` holds 2.1 and 2.2
   dumps as parser fixtures. The `txgs`, `dmu_tx_assign` and `state` formats
   are unchanged from 0.8 to 2.4 (vendored `spa_stats.c`,
-  `dataset_kstats.{c,h}`). Named-kstat lines are cut by the SPL's
-  `%-31s %-4d` columns, not by whitespace: `dmu_tx_assign`'s bucket names and
-  string values such as `dataset_name` contain spaces.
+  `dataset_kstats.{c,h}`). Named-kstat lines are split at their type token
+  (the first numeric token after the name's first word), not plainly by
+  whitespace: `dmu_tx_assign`'s bucket names and string values such as
+  `dataset_name` contain spaces. Compact hand-written lines parse too.
 
 ## Build / test
 

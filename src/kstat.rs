@@ -50,6 +50,7 @@ hit ratio) is the delta between two timed reads, which is left to the caller.
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::iter;
 #[cfg(target_os = "linux")]
 use std::mem;
 use std::path::Path;
@@ -76,10 +77,7 @@ pub const DMU_TX_PATH: &str = "/proc/spl/kstat/zfs/dmu_tx";
 /// objset id in hex.
 #[cfg(target_os = "linux")]
 const OBJSET_PREFIX: &str = "objset-0x";
-/// The width the SPL pads a named kstat's name to (`%-31s `); a longer name
-/// runs on to its first space.
-const NAME_WIDTH: usize = 31;
-/// The width of the type column after the name (`%-4d `).
+/// The width the SPL pads a named kstat's type column to (`%-4d `).
 const TYPE_WIDTH: usize = 4;
 /// `KSTAT_DATA_CHAR`: a short string, printed padded.
 const KSTAT_DATA_CHAR: u8 = 0;
@@ -167,21 +165,34 @@ impl<S: Into<String>> FromIterator<(S, i64)> for Kstat {
 /**
 Split a named-kstat line into `(name, type, value)`. The SPL prints
 `%-31s %-4d <value>`, and both a name (`dmu_tx_assign`'s `1024 ns` buckets)
-and a string value (a dataset name) may contain spaces, so the line is cut by
-those columns rather than by whitespace: a name of up to 31 bytes ends at the
-padded column, a longer one at its first space past it.
+and a string value (a dataset name) may contain spaces, so a plain
+whitespace split won't do. The line is split at its type instead: the first
+numeric token after the name's first word. A value keeps its exact text
+after the SPL's type padding; a compact line (`name 4 17`) works too.
 */
 fn named_line(line: &str) -> Option<(&str, u8, &str)> {
-    let name_end = match line.as_bytes().get(NAME_WIDTH)? {
-        b' ' => NAME_WIDTH,
-        _ => NAME_WIDTH + line.get(NAME_WIDTH..)?.find(' ')?,
+    let mut tokens = token_spans(line);
+    tokens.next()?;
+    let (ty_start, ty_end, ty) =
+        tokens.find_map(|(s, e)| line[s..e].parse::<u8>().ok().map(|ty| (s, e, ty)))?;
+    let after = &line[ty_end..];
+    let pad = TYPE_WIDTH.saturating_sub(ty_end - ty_start) + 1;
+    let value = match after.get(..pad) {
+        Some(p) if p.bytes().all(|b| b == b' ') => &after[pad..],
+        _ => after.trim_start(),
     };
-    let name = line[..name_end].trim_end();
-    let rest = &line[name_end + 1..];
-    let ty_end = rest.find(' ').unwrap_or(rest.len());
-    let ty = rest[..ty_end].parse().ok()?;
-    let value = rest.get(ty_end.max(TYPE_WIDTH) + 1..).unwrap_or("");
-    (!name.is_empty()).then_some((name, ty, value))
+    Some((line[..ty_start].trim_end(), ty, value))
+}
+
+/// The byte spans of `line`'s whitespace-separated tokens.
+fn token_spans(line: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut pos = 0;
+    iter::from_fn(move || {
+        let start = pos + line[pos..].find(|c: char| !c.is_whitespace())?;
+        let end = line[start..].find(char::is_whitespace).map_or(line.len(), |i| start + i);
+        pos = end;
+        Some((start, end))
+    })
 }
 
 /// The current arcstats.
@@ -596,9 +607,9 @@ impl TxAssignHistogram {
         1u64.checked_shl(i as u32).unwrap_or(u64::MAX)
     }
 
-    /// All waits counted.
+    /// All waits counted (saturating: the counts come from a text file).
     pub fn total(&self) -> u64 {
-        self.counts.iter().sum()
+        self.counts.iter().fold(0u64, |acc, &c| acc.saturating_add(c))
     }
 
     /// The waits known to have taken longer than `ns`: the buckets whose
@@ -609,8 +620,7 @@ impl TxAssignHistogram {
             .enumerate()
             .skip(1)
             .filter(|(i, _)| Self::bucket_limit_ns(i - 1) >= ns)
-            .map(|(_, c)| c)
-            .sum()
+            .fold(0u64, |acc, (_, &c)| acc.saturating_add(c))
     }
 
     /**
@@ -718,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn named_lines_cut_by_column_not_whitespace() {
+    fn named_lines_split_at_the_type() {
         // a name with a space, and a string value with spaces
         let bucket = spl_line("1024 ns", 4, "17");
         assert_eq!(named_line(&bucket), Some(("1024 ns", 4, "17")));
@@ -727,12 +737,15 @@ mod tests {
         // a name longer than the padded column runs on
         let long = spl_line("zil_itx_metaslab_normal_count_extra", 4, "9");
         assert_eq!(named_line(&long), Some(("zil_itx_metaslab_normal_count_extra", 4, "9")));
+        // a compact line, as a hand-written fixture has it
+        assert_eq!(named_line("memory_available_bytes 3 -2147483648"),
+                   Some(("memory_available_bytes", 3, "-2147483648")));
+        assert_eq!(named_line("dataset_name 7 tank/x y"), Some(("dataset_name", 7, "tank/x y")));
         // a CHAR value is padded; parse trims it
         let k = Kstat::parse(&format!("hdr\nname type data\n{}\n", spl_line("c", 0, "abc   ")));
         assert_eq!(k.str("c"), Some("abc"));
-        // the header lines are no fields
+        // the column header is no field (parse skips both header lines anyway)
         assert_eq!(named_line("name                            type data"), None);
-        assert_eq!(named_line("24 1 0x01 24 6784 12659445762 81628718614880"), None);
         assert_eq!(named_line("short"), None);
     }
 
@@ -819,6 +832,20 @@ mod tests {
         assert_eq!(h.longer_than(0), 1150);
         // a pool that never throttled has an empty file
         assert_eq!(TxAssignHistogram::parse("").total(), 0);
+    }
+
+    #[test]
+    fn tx_assign_sums_saturate() {
+        // hostile counts: two full buckets must not overflow the sums
+        let text = format!(
+            "hdr\nname type data\n{}\n{}\n",
+            spl_line("1 ns", 4, &u64::MAX.to_string()),
+            spl_line("2 ns", 4, &u64::MAX.to_string())
+        );
+        let h = TxAssignHistogram::parse(&text);
+        assert_eq!(h.counts(), [u64::MAX, u64::MAX]);
+        assert_eq!(h.total(), u64::MAX);
+        assert_eq!(h.longer_than(0), u64::MAX);
     }
 
     #[test]
