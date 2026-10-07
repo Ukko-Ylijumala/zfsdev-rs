@@ -11,7 +11,8 @@ portable.
 
 Host-wide there are the ARC's `arcstats` (the `arc_summary` / `arcstat`
 data), the prefetcher's `zfetchstats` and the DMU's `dmu_tx` counters. Each
-imported pool has a directory of its own, `/proc/spl/kstat/zfs/<pool>/`:
+imported pool has a directory of its own, `/proc/spl/kstat/zfs/<pool>/`
+([`pool_names`] lists them, the one pool list that needs no ZFS lock):
 
 - `txgs`, the recent txg history with each txg's phase and timings
   ([`TxgInfo`]);
@@ -269,11 +270,46 @@ contain no `/`.
 */
 #[cfg(target_os = "linux")]
 pub fn pool_dir(pool: &str) -> io::Result<PathBuf> {
-    if !pool.starts_with(|c: char| c.is_ascii_alphabetic()) || pool.contains('/') {
+    if !is_pool_name(pool) {
         let msg = format!("not a pool name: {pool:?}");
         return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
     }
     Ok(Path::new(KSTAT_DIR).join(pool))
+}
+
+/// Whether `name` could be a pool's: pool names begin with a letter and hold
+/// no `/` (which also rules out the transient `$import` of `zpool import`).
+#[cfg(target_os = "linux")]
+fn is_pool_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic()) && !name.contains('/')
+}
+
+/**
+The imported pools, by name and sorted, from their kstat directories: each
+imported pool has one, holding its `state` kstat, for as long as it is
+imported. This takes no ZFS lock, where the pool list from `/dev/zfs`
+(`ZfsHandle::pool_configs`) waits on the pool namespace lock: when a stuck
+pool holds that lock every pool ioctl blocks, and this still answers.
+*/
+#[cfg(target_os = "linux")]
+pub fn pool_names() -> io::Result<Vec<String>> {
+    pool_names_in(Path::new(KSTAT_DIR))
+}
+
+/// [`pool_names`] over the kstat directory `dir`: the subdirectories with a
+/// `state` kstat, under a name a pool can have.
+#[cfg(target_os = "linux")]
+fn pool_names_in(dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        if is_pool_name(&name) && entry.path().join("state").is_file() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /**
@@ -884,5 +920,25 @@ mod tests {
         for bad in ["", "..", ".", "a/../b", "9pool", "/etc"] {
             assert!(pool_dir(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /**
+    Pool names come from the subdirectories holding a `state` kstat: not the
+    host-wide kstat files, not a directory without one, and not the
+    transient `$import` pool.
+    */
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pool_names_are_the_dirs_with_a_state() {
+        let dir = std::env::temp_dir().join(format!("zfsdev-pool-names-{}", std::process::id()));
+        for pool in ["tank", "rpool", "$import"] {
+            fs::create_dir_all(dir.join(pool)).unwrap();
+            fs::write(dir.join(pool).join("state"), "ONLINE\n").unwrap();
+        }
+        fs::create_dir_all(dir.join("nostate")).unwrap();
+        fs::write(dir.join("arcstats"), ARC_22).unwrap();
+        let names = pool_names_in(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(names.unwrap(), ["rpool", "tank"]);
     }
 }

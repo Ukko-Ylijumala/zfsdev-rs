@@ -404,15 +404,20 @@ fn send_recv_ioctls_abi() {
 }
 
 /**
-The per-pool kstats parse on the live kernel and agree with the ioctls: every
-pool has a health word, a consecutive txg history on the hrtime clock and a
-tx-assign histogram, and each objset kstat's id is its dataset's `objsetid`.
+The per-pool kstats parse on the live kernel and agree with the ioctls: the
+kstat pool list is the kernel's, every pool has a health word, a consecutive
+txg history on the hrtime clock and a tx-assign histogram, and each objset
+kstat's id is its dataset's `objsetid`.
 */
 #[cfg(feature = "kstat")]
 #[test]
 fn pool_kstats_agree_with_the_ioctls() {
     let Some(zfs) = handle() else { return };
-    for pool in zfs.pool_configs().expect("pool configs").iter() {
+    let configs = zfs.pool_configs().expect("pool configs");
+    let mut imported: Vec<&str> = configs.iter().map(|p| p.name.as_str()).collect();
+    imported.sort();
+    assert_eq!(kstat::pool_names().expect("pool names"), imported);
+    for pool in configs.iter() {
         let name = pool.name.as_str();
         let health = kstat::read_pool_health(name).expect("state kstat");
         assert!(!matches!(health, PoolHealth::Other(_)), "{name}: unknown state {health}");

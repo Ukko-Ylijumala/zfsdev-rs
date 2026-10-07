@@ -24,7 +24,7 @@ that needs ZFS data without that application can use it too.
 | `stats`  | Decoders for the kernel's positional stat arrays: `vdev_stat_t`, `pool_scan_stat_t` (scrub, resilver, error scrub), sequential-rebuild stats, and `vdev_stats_ex` (queue depths, latency and request-size histograms). Each type has derived figures such as progress, pass rate and ETA, computed the way `zpool status` does. |
 | `enums`  | Typed mirrors of the C enums: pool, vdev and scan states, vdev types, objset types, compression and checksum algorithms, DMU object types. `Coded<E>` keeps the raw number alongside the typed value, so a value newer than the crate still shows as `?N` instead of being lost. |
 | `props`  | Property names, value enums and decoding. `prop_entry` reads a property from the nvlist an ioctl returns, unwrapping its `{value, source}` pair and decoding where the value comes from (`PropSource`, `zfs get`'s SOURCE column); `decode_prop_value` says what a stored number *means*; `parse_prop_value` turns user input into the typed value a set-property request needs. |
-| `kstat`  | The SPL kstats in `/proc/spl/kstat/zfs`: `arc_summary`'s data, with ARC hit ratios and prefetcher metrics derived from whichever counters the kernel exports; and per pool the txg history, the tx-assign delay histogram (the write throttle), each open dataset's I/O and ZIL counters, and the pool's health word, which the kernel serves without taking a lock. |
+| `kstat`  | The SPL kstats in `/proc/spl/kstat/zfs`: `arc_summary`'s data, with ARC hit ratios and prefetcher metrics derived from whichever counters the kernel exports; and per pool the txg history, the tx-assign delay histogram (the write throttle), each open dataset's I/O and ZIL counters, and the pool's health word, which the kernel serves without taking a lock; the pool list itself, read without a ZFS lock. |
 | `wrapkey` | libzfs's native-encryption wrapping-key derivation (PBKDF2 for a passphrase, hex and raw keys), the userspace half of `zfs load-key`. |
 
 ## Installation
@@ -198,7 +198,11 @@ take the difference between two timed reads.
 ```rust
 use zfsdev::kstat::{self, TxgState};
 
-// served without a lock, so it answers even while the pool is wedged
+// listed and served without a ZFS lock, so they answer even while a pool
+// is wedged and every /dev/zfs call blocks
+for pool in kstat::pool_names()? {
+    println!("{pool}: {}", kstat::read_pool_health(&pool)?);
+}
 let health = kstat::read_pool_health("tank")?;
 let txgs = kstat::read_txgs("tank")?;
 let now = kstat::hrtime_now();
