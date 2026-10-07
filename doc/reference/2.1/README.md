@@ -46,8 +46,8 @@ Nothing at the `zfs_cmd_t` layer — but one stats array differs:
 - **`vdev_stat_t` is 46 words**, ending `vs_physical_ashift`(44),
   `vs_pspace`(45). 2.2 *inserted* `vs_noalloc` at 45 (pspace → 46, 47
   words). Reading 2.2 indices on 2.1 showed every vdev with space as
-  "halted (noalloc)" and lost pspace; `node.rs::vdev_stat_rows` now picks
-  the indices by array length (`VS_LEN_WITH_NOALLOC`).
+  "halted (noalloc)" and lost pspace; `stats.rs::VdevStats::decode` now
+  picks the layout by array length.
 
 The remaining 2.1 gaps are feature-level and already degrade gracefully:
 
