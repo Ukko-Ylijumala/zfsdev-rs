@@ -1,6 +1,6 @@
 [package]
 name = "zfsdev"
-version = "0.4.1"
+version = "0.4.2"
 authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
 description = "Pure-Rust OpenZFS /dev/zfs access: ioctls, nvlist codec, typed kernel stats"
 readme = "README.md"
