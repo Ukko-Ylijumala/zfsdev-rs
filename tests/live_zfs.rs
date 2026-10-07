@@ -6,8 +6,8 @@
 //! gracefully on machines without ZFS so CI stays green.
 
 use std::os::fd::AsRawFd;
-use zfs_browser::zfs::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc, UserquotaProp};
-use zfs_browser::zfs::ioctl::{BeginRecord, DatasetType, SendFlags, ZfsHandle};
+use zfsdev::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc, UserquotaProp};
+use zfsdev::ioctl::{BeginRecord, DatasetType, SendFlags, ZfsHandle};
 
 fn handle() -> Option<ZfsHandle> {
     if !std::path::Path::new("/dev/zfs").exists() {
@@ -17,21 +17,8 @@ fn handle() -> Option<ZfsHandle> {
     Some(ZfsHandle::open().expect("open /dev/zfs"))
 }
 
-/// Walk a vdev tree to the first leaf device path.
-fn first_disk_path(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<String> {
-    if let Some(path) = tree.get_str("path") {
-        return Some(path.to_string());
-    }
-    for child in tree.get_list_array("children")? {
-        if let Some(p) = first_disk_path(child) {
-            return Some(p);
-        }
-    }
-    None
-}
-
 /// Walk a vdev tree to the first leaf device's guid.
-fn first_disk_guid(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<u64> {
+fn first_disk_guid(tree: &zfsdev::nvlist::NvList) -> Option<u64> {
     if tree.get_str("path").is_some() {
         return tree.get_u64("guid");
     }
@@ -41,6 +28,16 @@ fn first_disk_guid(tree: &zfs_browser::zfs::nvlist::NvList) -> Option<u64> {
         }
     }
     None
+}
+
+/// A `{value, source}` property pair's numeric value.
+fn prop_value_u64(props: &zfsdev::nvlist::NvList, name: &str) -> Option<u64> {
+    props.get_list(name)?.get_u64("value")
+}
+
+/// A `{value, source}` property pair's string value.
+fn prop_value_str(props: &zfsdev::nvlist::NvList, name: &str) -> Option<String> {
+    props.get_list(name)?.get_str("value").map(str::to_string)
 }
 
 /* ========================================================================= */
@@ -57,7 +54,7 @@ fn pool_configs_decode_and_match_cli() {
     // each pool config must decode with the essentials present
     for pair in configs.iter() {
         let config = match &pair.data {
-            zfs_browser::zfs::nvlist::NvData::List(l) => l,
+            zfsdev::nvlist::NvData::List(l) => l,
             other => panic!("pool {} config is not an nvlist: {other:?}", pair.name),
         };
         assert_eq!(config.get_str("name"), Some(pair.name.as_str()));
@@ -140,7 +137,7 @@ fn snapshot_stats_match_full_listing() {
         targets.push("data/test".into()); // the delegated playground has a few
     }
     for name in &targets {
-        let key = |v: Vec<zfs_browser::zfs::ioctl::DatasetEntry>| {
+        let key = |v: Vec<zfsdev::ioctl::DatasetEntry>| {
             let mut k: Vec<_> =
                 v.into_iter().map(|e| (e.name, e.stats.guid, e.stats.creation_txg)).collect();
             k.sort();
@@ -152,65 +149,6 @@ fn snapshot_stats_match_full_listing() {
         assert!(fast.iter().all(|(_, g, _)| *g != 0));
         eprintln!("{name}: {} snapshot(s) agree", fast.len());
     }
-}
-
-#[test]
-fn on_disk_labels_match_ioctl_config() {
-    use zfs_browser::zfs::ondisk::label::read_device_labels;
-
-    let Some(zfs) = handle() else { return };
-    let configs = zfs.pool_configs().expect("pool configs");
-    let mut checked = 0;
-    for pair in configs.iter() {
-        let stats = zfs.pool_stats(&pair.name).expect("pool stats");
-        let tree = stats.get_list("vdev_tree").expect("vdev tree");
-        let Some(path) = first_disk_path(tree) else { continue };
-        let dl = match read_device_labels(std::path::Path::new(&path)) {
-            Ok(dl) => dl,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("skipping {}: {path}: permission denied (run as root)", pair.name);
-                continue;
-            }
-            Err(e) => panic!("{}: reading labels from {path}: {e}", pair.name),
-        };
-        let pool_guid = stats.get_u64("pool_guid").expect("pool guid");
-        for label in &dl.labels {
-            let config = label
-                .config
-                .as_ref()
-                .unwrap_or_else(|e| panic!("{path} L{}: config: {e}", label.index));
-            assert_eq!(config.get_str("name"), Some(pair.name.as_str()), "L{}", label.index);
-            assert_eq!(config.get_u64("pool_guid"), Some(pool_guid), "L{}", label.index);
-            assert_eq!(
-                label.cksum_ok,
-                Some(true),
-                "{path} L{}: vdev_phys checksum",
-                label.index
-            );
-            assert!(!label.uberblocks.is_empty(), "{path} L{}: no uberblocks", label.index);
-            for slot in &label.uberblocks {
-                assert_eq!(
-                    slot.cksum_ok,
-                    Some(true),
-                    "{path} L{} ub slot {}: checksum",
-                    label.index,
-                    slot.slot
-                );
-            }
-            let best = label.best_uberblock().unwrap();
-            assert!(best.ub.txg > 0);
-            assert!(!best.ub.rootbp.is_hole(), "active rootbp should not be a hole");
-        }
-        let best_txg =
-            dl.labels.iter().filter_map(|l| l.best_uberblock()).map(|s| s.ub.txg).max().unwrap();
-        eprintln!(
-            "{}: {path}: 4 labels OK, best uberblock txg {best_txg} (ioctl txg {})",
-            pair.name,
-            stats.get_u64("txg").unwrap_or(0),
-        );
-        checked += 1;
-    }
-    eprintln!("verified labels on {checked} pool(s)");
 }
 
 /*
@@ -368,7 +306,7 @@ and zfs_cmd_t layout are correct for the mutating path — the ABI canary for
 writes — with zero side effects. A wrong struct size/number would surface
 as EFAULT/EINVAL or a panic, not the clean "no such pool" we expect.
 */
-const NOPE_POOL: &str = "zfsbrowser_nonexistent_pool_canary";
+const NOPE_POOL: &str = "zfsdev_nonexistent_pool_canary";
 
 #[test]
 fn send_recv_ioctls_abi() {
@@ -405,7 +343,7 @@ fn send_recv_ioctls_abi() {
 
     // a well-formed synthetic BEGIN record into a nonexistent pool: the key
     // types and the byte-array framing are validated, the name is not found
-    let mut begin = vec![0u8; zfs_browser::zfs::ioctl::DRR_RECORD_SIZE];
+    let mut begin = vec![0u8; zfsdev::ioctl::DRR_RECORD_SIZE];
     begin[8..16].copy_from_slice(&0x2F5BACBACu64.to_le_bytes());
     let begin = BeginRecord::parse(&begin).unwrap();
     let src = std::fs::File::open("/dev/null").unwrap();
@@ -496,7 +434,7 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
     assert!(det.to_string().starts_with("detach vdev:"), "unmapped: {det}");
 
     // attach stats the new device first; a temp file proves the conf-nvlist path
-    let tmp = std::env::temp_dir().join("zfs-browser-attach-canary");
+    let tmp = std::env::temp_dir().join("zfsdev-attach-canary");
     std::fs::write(&tmp, b"x").expect("write temp device file");
     let att = zfs
         .vdev_attach(NOPE_POOL, 0xdead, tmp.to_str().unwrap(), false)
@@ -505,7 +443,7 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
     let _ = std::fs::remove_file(&tmp);
 
     let setp = zfs
-        .vdev_set_props(NOPE_POOL, 0xdead, "failfast", &zfs_browser::zfs::nvlist::NvData::Uint64(0))
+        .vdev_set_props(NOPE_POOL, 0xdead, "failfast", &zfsdev::nvlist::NvData::Uint64(0))
         .expect_err("set vdev prop in bogus pool must fail");
     assert!(setp.to_string().starts_with("set vdev property:"), "unmapped: {setp}");
     eprintln!("pool-maintenance canaries all failed cleanly at pool lookup");
@@ -583,7 +521,7 @@ parent). Needs the `allow` delegation on the playground; skips otherwise.
 */
 #[test]
 fn unallow_whole_who_in_playground() {
-    use zfs_browser::zfs::ioctl::DelegWho;
+    use zfsdev::ioctl::DelegWho;
 
     const PLAYGROUND: &str = "data/test";
     let Some(zfs) = handle() else { return };
@@ -591,7 +529,7 @@ fn unallow_whole_who_in_playground() {
         eprintln!("skipping: no {PLAYGROUND} playground on this machine");
         return;
     }
-    let ds = format!("{PLAYGROUND}/zb-deleg-{}", std::process::id());
+    let ds = format!("{PLAYGROUND}/zfsdev-deleg-{}", std::process::id());
     // CREATE never mounts (that's libzfs, userspace) — fine under delegation
     if let Err(e) = zfs.create(&ds, DatasetType::Filesystem, None) {
         eprintln!("skipping: cannot create {ds}: {e}");
@@ -638,7 +576,7 @@ fn load_unload_key_in_nonexistent_pool_is_a_clean_error() {
 
 /**
 End-to-end key management against the delegated playground `data/test`
-(mtanner holds `zfs allow` perms there): create a passphrase-encrypted
+(the test user holds `zfs allow` perms there): create a passphrase-encrypted
 child via the CLI (`-u` skips the mount, which delegation can't do),
 then drive UNLOAD_KEY / LOAD_KEY through our ioctls with the wrapping key
 derived by `wrapkey::derive_wrapping_key` from the dataset's own
@@ -650,20 +588,19 @@ verified our PBKDF2 output). Skips wherever the environment is absent.
 fn load_key_roundtrip_in_playground() {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    use zfs_browser::node::{prop_value_str, prop_value_u64};
-    use zfs_browser::zfs::wrapkey::derive_wrapping_key;
-    use zfs_browser::zfs::props::KeyFormat;
+    use zfsdev::wrapkey::derive_wrapping_key;
+    use zfsdev::props::KeyFormat;
 
     const PLAYGROUND: &str = "data/test";
-    const PASS: &str = "zfs-browser test passphrase";
+    const PASS: &str = "zfsdev test passphrase";
     let Some(zfs) = handle() else { return };
     if zfs.objset_stats(PLAYGROUND).is_err() {
         eprintln!("skipping: no {PLAYGROUND} playground on this machine");
         return;
     }
-    let ds = format!("{PLAYGROUND}/zb-enc-{}", std::process::id());
+    let ds = format!("{PLAYGROUND}/zfsdev-enc-{}", std::process::id());
     // encrypted create needs wkeydata via hidden_args, which our CREATE
-    // doesn't pass yet — use the CLI here (tests may; the app never does)
+    // doesn't pass yet — use the CLI here (tests may; the crate never does)
     let mut child = Command::new("zfs")
         .args(["create", "-u", "-o", "encryption=on", "-o", "keyformat=passphrase", &ds])
         .stdin(Stdio::piped())

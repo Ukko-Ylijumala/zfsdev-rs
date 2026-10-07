@@ -7,15 +7,15 @@ Typed ZFS property values. [`decode_prop_value`] says what a numeric value
 *means* ([`PropValue`]: a name, bytes, a time, a ratio, …), and
 [`parse_prop_value`] turns user input into the typed [`NvData`] SET_PROP
 wants; presentation is left to the caller. Property names parse into
-[`ZfsProp`] (strum `EnumString`, lowercase) and the small value enums mirror
+`ZfsProp` (strum `EnumString`, lowercase) and the small value enums mirror
 the `ZFS_*` value constants from `doc/reference/zfs.h` — so both the dispatch
-and the value names are typo-proof enums rather than string tables. Used by
-the live ioctl property views and the on-disk DSL props ZAPs alike; the names
-are the same in both worlds.
+and the value names are typo-proof enums rather than string tables. Applies to
+the live ioctl properties and the on-disk DSL props ZAPs alike; the names are
+the same in both worlds.
 */
 
-use crate::zfs::enums::{CEnum, Coded, ZioChecksum, ZioCompress, ZstdLevel, impl_cenum};
-use crate::zfs::nvlist::NvData;
+use crate::enums::{CEnum, Coded, ZioChecksum, ZioCompress, ZstdLevel, impl_cenum};
+use crate::nvlist::NvData;
 use std::fmt;
 use std::str::FromStr;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoEnumIterator};

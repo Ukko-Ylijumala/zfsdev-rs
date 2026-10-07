@@ -13,7 +13,7 @@ OpenZFS releases: fields appended, `vs_noalloc` *inserted* mid-array in 2.2,
 length the kernel hands back, so no version probe is needed — and that
 knowledge lives here once: callers get named fields, with `Option` for the
 ones the running kernel doesn't report. Each decoder reads its words in the C
-struct's field order ([`Words`]), so it can be checked against the header
+struct's field order (`Words`), so it can be checked against the header
 line by line: `doc/reference/zfs.h` (2.2) and `doc/reference/{0.8,2.0,2.1,
 2.3}/zfs.h`. ZoL 0.6/0.7 layouts are not supported (0.7's `vdev_stat_t` has a
 mid-array insert that the length alone can't tell apart).
@@ -23,11 +23,11 @@ rate, ETA — computed the way `zpool status` does) are methods; presentation is
 the caller's.
 */
 
-use crate::zfs::enums::{
+use crate::enums::{
     CEnum, Coded, DslScanState, PoolScanFunc, VdevAux, VdevInitializeState, VdevRebuildState,
     VdevState, VdevTrimState,
 };
-use crate::zfs::nvlist::{NvData, NvList};
+use crate::nvlist::{NvData, NvList};
 use std::str::FromStr;
 use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 

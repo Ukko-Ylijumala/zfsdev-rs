@@ -24,8 +24,8 @@ const HEX_KEY_DIGITS: usize = WRAPPING_KEY_LEN * 2;
 
 /**
 Sanity cap on `pbkdf2iters`, which is read from the (possibly hostile)
-image's DSL Crypto Key ZAP: 2^32-1 iterations would pin the worker or the
-FUSE reader for many minutes with no way to cancel. libzfs defaults to
+image's DSL Crypto Key ZAP: 2^32-1 iterations would pin the calling thread
+for many minutes with no way to cancel. libzfs defaults to
 350k (minimum 100k); 100M is ~300x the default and still bounded to tens of
 seconds.
 */

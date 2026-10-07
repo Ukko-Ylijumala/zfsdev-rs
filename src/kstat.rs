@@ -160,10 +160,10 @@ mod tests {
     use super::*;
 
     // the committed reference dumps (root-free regression fixtures)
-    const ARC_21: &str = include_str!("../../doc/kstat/arcstats_v2.1.6.txt");
-    const ARC_22: &str = include_str!("../../doc/kstat/arcstats_v2.2.2.txt");
-    const ZF_21: &str = include_str!("../../doc/kstat/zfetchstats_v2.1.6.txt");
-    const ZF_22: &str = include_str!("../../doc/kstat/zfetchstats_v2.2.2.txt");
+    const ARC_21: &str = include_str!("../doc/kstat/arcstats_v2.1.6.txt");
+    const ARC_22: &str = include_str!("../doc/kstat/arcstats_v2.2.2.txt");
+    const ZF_21: &str = include_str!("../doc/kstat/zfetchstats_v2.1.6.txt");
+    const ZF_22: &str = include_str!("../doc/kstat/zfetchstats_v2.2.2.txt");
 
     /// Round a fraction to one decimal percent, as `arc_summary` prints it.
     fn pct(f: f64) -> f64 {

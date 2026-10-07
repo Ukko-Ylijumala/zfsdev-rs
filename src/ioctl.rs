@@ -274,7 +274,7 @@ pub enum ZfsError {
     /// an unusable device path, …).
     #[error("{0}")]
     Invalid(String),
-    /// A name/value (often modal input) exceeds the fixed `zfs_cmd_t` field.
+    /// A name/value (often user input) exceeds the fixed `zfs_cmd_t` field.
     #[error("{field} too long: {len} bytes (max {max})")]
     NameTooLong { field: &'static str, len: usize, max: usize },
 }
@@ -492,15 +492,15 @@ fn device_vtype(path: &str) -> Result<&'static str> {
 /*
 The passwd/group lookups use the reentrant `_r` variants: the plain
 getpwnam/getpwuid/getgrnam/getgrgid family returns pointers into per-process
-static storage (POSIX MT-Unsafe), and these run on BOTH threads —
-`resolve_who` on the UI thread (the delegation modal) can race `name_for_id`
-on the worker (space-accounting rows). A torn result here could resolve a
+static storage (POSIX MT-Unsafe), and a threaded caller can run
+`resolve_who` (a delegation target) concurrently with `name_for_id`
+(labelling space-accounting rows). A torn result here could resolve a
 `zfs allow` to the wrong uid. Buffer grown on ERANGE for pathologically
 long entries.
 */
 
 /// Look up a numeric uid (or gid) in the system database, returning its name.
-/// The inverse of [`resolve_id`]; used to label userused@/groupused@ rows.
+/// The inverse of the lookup behind [`resolve_who`]; used to label userused@/groupused@ rows.
 pub fn name_for_id(id: u64, group: bool) -> Option<String> {
     let id = u32::try_from(id).ok()?;
     let mut buf = vec![0i8; 4096];
@@ -936,7 +936,7 @@ impl DerefMut for CmdBuf {
 impl ZfsCmd {
     /**
     Set `zc_name` (the primary pool/dataset name). The field is a fixed
-    `MAXPATHLEN`-byte buffer; an oversized name (e.g. unbounded modal input)
+    `MAXPATHLEN`-byte buffer; an oversized name (e.g. unbounded user input)
     returns an error rather than panicking — the kernel would reject it
     anyway, and silently truncating could redirect a write to a *different*
     existing dataset.
@@ -985,8 +985,7 @@ The loaded ZFS module's release, from `/sys/module/zfs/version` (e.g.
 "2.2.2-0ubuntu9" or "0.8.6-1"). Only major.minor is kept — that is all the
 ABI-era decisions need — except that a development build's `.99` patch level
 counts as the next minor (master after the 2.4 branch is "2.4.99", i.e. the
-2.5 line). Read once per process; `None` when no module is loaded (e.g. pure
-`--device` runs, where nothing consults it either).
+2.5 line). Read once per process; `None` when no module is loaded.
 */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct KernelVersion {
@@ -1131,7 +1130,7 @@ Is the loaded module a pre-2.0 ZoL release (0.6/0.7/0.8)? Gates the
 kernel-decode difference of that era: `dmu_objset_stats_t` has no
 `dds_redacted` (so `dds_origin` sits one byte earlier). (The other
 version-dependent layouts — `vdev_stat_t` noalloc/pspace, `pool_scan_stat_t`
-slot 6 — are keyed off the arrays' lengths instead, in node.rs.) An
+slot 6 — are keyed off the arrays' lengths instead, in [`crate::stats`].) An
 unprobeable version (no module) defaults to the modern layout.
 */
 pub fn kernel_pre_2_0() -> bool {
@@ -1558,7 +1557,7 @@ impl ZfsHandle {
     with a packed array of `zfs_useracct_t` (`zu_domain[256]`, `zu_rid` u32,
     `zu_spare` u32, `zu_space` u64 = 272 bytes) and advances `zc_cookie` as an
     iteration cursor, so we loop until a read returns no bytes. Reading other
-    users' usage needs privilege; non-root gets EPERM (surfaced to the UI).
+    users' usage needs privilege; non-root gets EPERM.
     */
     pub fn userspace_many(&self, dataset: &str, prop: UserquotaProp) -> Result<Vec<UserAcct>> {
         const REC: usize = 272;
@@ -1794,10 +1793,10 @@ impl ZfsHandle {
     base snapshot (None = full stream).
 
     BLOCKS until the whole stream is written — run it on a dedicated
-    thread with its own handle, never the worker. Closing the read side of
-    the pipe fails the call with EPIPE, which is the cancellation
-    mechanism; [`Self::send_progress`] polls bytes-written from a second
-    handle meanwhile.
+    thread with its own handle. Closing the read side of the pipe fails
+    the call with EPIPE, which is the cancellation mechanism;
+    [`Self::send_progress`] polls bytes-written from a second handle
+    meanwhile.
     */
     pub fn send_new(&self, snapshot: &str, fd: RawFd, from: Option<&str>, flags: SendFlags) -> Result<()> {
         let mut innvl = NvList::new();
@@ -1839,8 +1838,8 @@ impl ZfsHandle {
     dedicated-thread and closed-pipe-cancel rules apply.
 
     `resumable` keeps partial receive state on a torn stream (`zfs recv
-    -s`); `force` is the `-F` rollback, which the browser's planner keeps
-    off.
+    -s`); `force` is the `-F` rollback of the destination to its most
+    recent snapshot before receiving.
     */
     pub fn recv_new(
         &self,
@@ -2360,8 +2359,8 @@ impl ZfsHandle {
     `dsl_scan` *resumes* a paused (error) scrub on a scrub-start and reports
     that by returning ECANCELED — success, as libzfs `zpool_scan` treats it.
     (libzfs also swallows ENOENT on a pause with no scan running; not here: an
-    ENOENT is indistinguishable from a missing pool, and the UI only offers
-    pause on a running scrub.)
+    ENOENT is indistinguishable from a missing pool, so pausing with no scan
+    running is an error.)
     */
     pub fn pool_scan(&self, pool: &str, func: PoolScanFunc, pause: bool) -> Result<()> {
         let mut zc = self.cmd();

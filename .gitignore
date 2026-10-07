@@ -1,0 +1,11 @@
+# Rust section
+target/
+Cargo.lock
+.cargo
+
+# misc development files:
+*.bak
+*.old
+
+# Local LLM stuff
+.claude

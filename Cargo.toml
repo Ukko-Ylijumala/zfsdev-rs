@@ -1,0 +1,31 @@
+[package]
+name = "zfsdev"
+version = "0.4.0"
+authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
+description = "Pure-Rust OpenZFS /dev/zfs access: ioctls, nvlist codec, typed kernel stats"
+readme = "README.md"
+repository = "https://github.com/Ukko-Ylijumala/zfsdev-rs"
+license = "MIT OR Apache-2.0"
+categories = ["filesystem", "os::linux-apis"]
+keywords = ["zfs", "openzfs", "ioctl", "nvlist", "kstat"]
+publish = false
+edition = "2024"
+# let-chains (1.88), u64::is_multiple_of (1.87)
+rust-version = "1.88"
+# doc/ is vendored OpenZFS reference material under the CDDL (see
+# doc/reference/README.md) — never part of a packaged crate
+exclude = ["doc/"]
+
+[dependencies]
+libc = "0.2"
+sha1 = "0.10"
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2"
+
+# native-encryption wrapping keys: PBKDF2-SHA1 passphrase derivation, exactly
+# libzfs's userspace half of `zfs load-key` (the kernel gets raw key bytes).
+# default-features off drops the password-hash "simple" API we don't use.
+[dependencies.pbkdf2]
+version = "0.12"
+default-features = false
+features = ["hmac"]
