@@ -19,8 +19,8 @@ Modules (`src/`): `ioctl` (`ZfsHandle`, Linux-only), `nvlist` (codec),
 enums, decode/parse, `PropEntry` over the `{value, source}` nvlists), `kstat`
 (procfs SPL kstats: ARC, import progress, the debug log, the lock-free pool
 list, and per pool txgs, tx-assign histogram, objset counters, state;
-`kstat` feature), `wrapkey` (libzfs wrapping-key
-derivation).
+`kstat` feature), `mount` (path → dataset from `statfs` and the mount
+table, Linux-only), `wrapkey` (libzfs wrapping-key derivation).
 
 ## Design rules
 
@@ -52,7 +52,7 @@ derivation).
   `write_ioctl` itself stays in the read build: SEND_NEW (a read) uses it for
   its structured error.
 - `kstat` (on by default): the `kstat` module.
-- `ioctl`, the `libc` dependency and kstat's procfs readers are
+- `ioctl`, `mount`, the `libc` dependency and kstat's procfs readers are
   `cfg(target_os = "linux")`; the rest must stay portable. Check with
   `cargo +nightly check -Zbuild-std=std,panic_abort --target
   x86_64-unknown-freebsd --lib` (needs nightly's `rust-src`).

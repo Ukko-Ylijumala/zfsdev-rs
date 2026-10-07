@@ -26,6 +26,7 @@ that needs ZFS data without that application can use it too.
 | `enums`  | Typed mirrors of the C enums: pool, vdev and scan states, vdev types, objset types, compression and checksum algorithms, DMU object types. `Coded<E>` keeps the raw number alongside the typed value, so a value newer than the crate still shows as `?N` instead of being lost. |
 | `props`  | Property names, value enums and decoding. `prop_entry` reads a property from the nvlist an ioctl returns, unwrapping its `{value, source}` pair and decoding where the value comes from (`PropSource`, `zfs get`'s SOURCE column); `decode_prop_value` says what a stored number *means*; `parse_prop_value` turns user input into the typed value a set-property request needs. |
 | `kstat`  | The SPL kstats in `/proc/spl/kstat/zfs`: `arc_summary`'s data, with ARC hit ratios and prefetcher metrics derived from whichever counters the kernel exports; and per pool the txg history, the tx-assign delay histogram (the write throttle), each open dataset's I/O and ZIL counters, and the pool's health word, which the kernel serves without taking a lock; the pool list itself, read without a ZFS lock; the imports in progress (an import holds the lock every pool ioctl waits on) and the module's debug log. |
+| `mount`  | Which ZFS dataset a path lives on: `statfs` tells ZFS apart, the mount table names the dataset (bind mounts and snapshot automounts included), without a `/dev/zfs` call. |
 | `wrapkey` | libzfs's native-encryption wrapping-key derivation (PBKDF2 for a passphrase, hex and raw keys), the userspace half of `zfs load-key`. |
 
 ## Installation
@@ -61,8 +62,9 @@ function that issues requests refuses any mutating request outright.
 
 ## Platform and kernel support
 
-The `ioctl` module, and the procfs readers in `kstat`, are **Linux-only**:
-the request encoding and the event ioctls are those of OpenZFS's Linux port.
+The `ioctl` and `mount` modules, and the procfs readers in `kstat`, are
+**Linux-only**: the request encoding and the event ioctls are those of
+OpenZFS's Linux port, and the mount table is Linux procfs.
 Everything else is portable, so the nvlist codec, the enums and the decoders
 work anywhere, for example on vdev labels read from a disk image.
 
@@ -246,6 +248,24 @@ at once.
 None of these reads does pool I/O or takes a pool lock. `find_objset_kstat`
 scans the pool's objset kstats; to sample one dataset repeatedly, keep its
 `objset` id and re-read it with `read_objset_kstat`.
+
+### Which dataset a path is on
+
+```rust
+use zfsdev::kstat;
+use zfsdev::mount;
+
+match mount::dataset_of("/srv/db")? {
+    Some(m) => {
+        println!("{} (pool {}), mounted at {}", m.dataset, m.pool(), m.mount_point.display());
+        // the dataset's own I/O counters
+        if let Some(io) = kstat::find_objset_kstat(&m.dataset)? {
+            println!("  {} writes since mount", io.stats.u("writes"));
+        }
+    }
+    None => println!("not on ZFS"),
+}
+```
 
 ### nvlists
 

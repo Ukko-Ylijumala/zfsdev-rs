@@ -27,6 +27,8 @@ scraping.
   ZFS lock, and per pool the txg history, the tx-assign delay histogram, the
   per-dataset I/O counters and the lock-free health word. It is plain
   procfs, with no ioctl involved.
+- [`mount`]: which ZFS dataset a path lives on, from `statfs` and the
+  mount table.
 - [`wrapkey`]: libzfs's native-encryption wrapping-key derivation (the
   userspace half of `zfs load-key`).
 
@@ -38,8 +40,8 @@ scraping.
   pool, dataset or kernel state.
 - `kstat` (on by default) adds the [`kstat`] module.
 
-[`ioctl`] is Linux-only, as are kstat's procfs readers: the request encoding
-and the event ioctls are those of OpenZFS's Linux port. The rest is portable;
+[`ioctl`] and [`mount`] are Linux-only, as are kstat's procfs readers: the
+request encoding and the event ioctls are those of OpenZFS's Linux port. The rest is portable;
 the nvlist codec, the enums and the decoders work anywhere, for example on
 vdev labels read from a disk image.
 
@@ -66,6 +68,8 @@ pub mod enums;
 pub mod ioctl;
 #[cfg(feature = "kstat")]
 pub mod kstat;
+#[cfg(target_os = "linux")]
+pub mod mount;
 pub mod nvlist;
 pub mod props;
 pub mod stats;

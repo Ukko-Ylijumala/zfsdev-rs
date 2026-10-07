@@ -7,7 +7,9 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use zfsdev::enums::UserquotaProp;
 #[cfg(feature = "write")]
 use zfsdev::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc};
@@ -16,9 +18,8 @@ use zfsdev::ioctl::{SendFlags, ZfsHandle};
 use zfsdev::ioctl::{BeginRecord, DatasetType};
 #[cfg(feature = "kstat")]
 use zfsdev::kstat::{self, PoolHealth, TxgState};
-#[cfg(feature = "write")]
-use zfsdev::props::prop_str;
-use zfsdev::props::{PropSource, prop_entries, prop_entry, prop_u64};
+use zfsdev::mount;
+use zfsdev::props::{PropSource, prop_entries, prop_entry, prop_str, prop_u64};
 use zfsdev::stats::{HistogramId, VdevStatsEx};
 use zfsdev::vdev::{self, VdevEntry, VdevRole};
 
@@ -215,6 +216,62 @@ fn datasets_and_snapshots_enumerate() {
 
 /// The zc_simple (fast-stat) snapshot listing agrees with the full one on
 /// everything its callers use: names, guids, creation txgs.
+/**
+A dataset's effective mountpoint, from the kernel's `mountpoint` property:
+an inherited value is the ancestor's, to which the path below it is
+appended (as libzfs does).
+*/
+fn effective_mountpoint(name: &str, props: &zfsdev::nvlist::NvList) -> Option<String> {
+    let entry = prop_entry(props, "mountpoint")?;
+    let value = entry.str()?;
+    match entry.source(name) {
+        PropSource::Inherited(Some(from)) => {
+            let below = name.strip_prefix(from.as_str())?;
+            Some(if value == "/" { below.to_string() } else { format!("{value}{below}") })
+        }
+        _ => Some(value.to_string()),
+    }
+}
+
+/**
+`mount::dataset_of` against the kernel's `mountpoint` properties: each
+absolute mountpoint that is mounted resolves to a dataset whose own
+mountpoint is that path (two datasets may share one, like a boot pool's
+root and its `BOOT/<os>` with only the latter mounted). Non-ZFS paths
+resolve to nothing.
+*/
+#[test]
+fn mount_points_resolve_to_their_datasets() {
+    let Some(zfs) = handle() else { return };
+    assert_eq!(mount::dataset_of("/proc").expect("statfs /proc"), None);
+    let mut mountpoints = HashMap::new();
+    for pair in zfs.pool_configs().expect("pool configs").iter() {
+        let (_, props) = zfs.objset_stats(&pair.name).expect("objset stats");
+        let mut pending = vec![(pair.name.clone(), props)];
+        while let Some((name, props)) = pending.pop() {
+            for child in zfs.datasets(&name).expect("dataset list") {
+                pending.push((child.name, child.props));
+            }
+            if let Some(mp) = effective_mountpoint(&name, &props) {
+                mountpoints.insert(name, mp);
+            }
+        }
+    }
+    let (mut checked, mut exact) = (0, 0);
+    for mp in mountpoints.values().filter(|mp| mp.starts_with('/')) {
+        let Ok(Some(m)) = mount::dataset_of(mp) else { continue };
+        if m.mount_point != Path::new(mp) {
+            continue; // not mounted: the path is a directory of the dataset above
+        }
+        let own = mountpoints.get(&m.dataset).map(String::as_str);
+        assert!(own.is_none_or(|own| own == mp || own == "legacy"), "{mp}: {} has {own:?}", m.dataset);
+        assert_eq!(m.pool(), m.dataset.split('/').next().unwrap());
+        checked += 1;
+        exact += usize::from(own == Some(mp.as_str()));
+    }
+    eprintln!("{checked} mountpoint(s) resolved, {exact} to a dataset with that very mountpoint");
+}
+
 #[test]
 fn snapshot_stats_match_full_listing() {
     let Some(zfs) = handle() else { return };
