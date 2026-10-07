@@ -16,8 +16,21 @@ rust-version = "1.88"
 # doc/reference/README.md) — never part of a packaged crate
 exclude = ["doc/"]
 
+[features]
+default = ["kstat"]
+# The mutating ioctls: properties, snapshots, create/destroy/rename,
+# delegation, holds, encryption keys, receive, pool/vdev maintenance.
+# Without it the crate cannot issue a request that changes pool, dataset or
+# kernel state.
+write = []
+# SPL kstat parsing (ARC / prefetcher counters and derived metrics). No
+# dependencies; reading the procfs files is Linux-only.
+kstat = []
+
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
-libc = "0.2"
 sha1 = "0.10"
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
@@ -29,3 +42,7 @@ thiserror = "2"
 version = "0.12"
 default-features = false
 features = ["hmac"]
+
+# /dev/zfs (the ioctl module) is Linux-only; nothing else needs libc
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

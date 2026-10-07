@@ -18,12 +18,15 @@ numbers ([`Ioc`], `0x5a00 + n`, `doc/reference/zfs.h`) live in the
 "legacy" range that has been stable since at least 0.6.3 (2014), the
 platform range (`0x5a80`, events) included.
 
-Reads use the GET/LIST ioctls; the mutating ioctls (SET_PROP, CREATE,
-DESTROY, SNAPSHOT, …) are also defined. Write requests pass their
-parameters in as a packed nvlist (`NvList::pack`) in `zc_nvlist_src` and
-read the kernel's per-element errors nvlist back from `zc_nvlist_dst`.
-Whether a given write is permitted for the calling uid is decided by the
-kernel (root, or a matching `zfs allow` delegation).
+Reads use the GET/LIST ioctls. The methods issuing the mutating ones
+(SET_PROP, CREATE, DESTROY, SNAPSHOT, receive, pool/vdev maintenance, …)
+exist only with the crate's `write` feature; without it a handle refuses
+every [`Ioc::mutates`] request, so nothing built on it can change pool,
+dataset or kernel state. Write requests pass their parameters in as a
+packed nvlist (`NvList::pack`) in `zc_nvlist_src` and read the kernel's
+per-element errors nvlist back from `zc_nvlist_dst`. Whether a given write
+is permitted for the calling uid is decided by the kernel (root, or a
+matching `zfs allow` delegation).
 
 Two guards cover kernels this code wasn't verified against
 ([`KernelSupport`]): every `zfs_cmd_t` travels in a zeroed buffer with
@@ -35,13 +38,15 @@ with [`HandleOptions::allow_unverified_writes`]. Reads stay available —
 upstream has only ever appended to the ABI since 0.8.
 */
 
-use super::enums::{
-    Coded, ObjsetType, PoolInitializeFunc, PoolScanFunc, PoolTrimFunc, UserquotaProp,
-};
+use super::enums::{Coded, ObjsetType, UserquotaProp};
+#[cfg(feature = "write")]
+use super::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc};
 use super::nvlist::{NvData, NvError, NvList};
 use super::props::VdevProp;
 use std::cell::Cell;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+#[cfg(feature = "write")]
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -65,6 +70,7 @@ const EVENTS_NAME: &str = "(zevents)";
 /// `zc_obj` flag for VDEV_SET_STATE online: re-read the device size and grow the
 /// vdev into it (`zpool online -e`). The other flags (CHECKREMOVE 0x1, UNSPARE
 /// 0x2, FORCEFAULT 0x4) we don't use.
+#[cfg(feature = "write")]
 const ZFS_ONLINE_EXPAND: u64 = 0x8;
 
 /// `drr_magic` of a send stream's BEGIN record (doc/reference/zfs_ioctl.h).
@@ -440,6 +446,7 @@ fn errno_hint(op: WriteOp, err: &io::Error) -> &'static str {
 }
 
 /// A `zfs allow` subject: a user/group (by numeric id) or everyone.
+#[cfg(feature = "write")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DelegWho {
     User(u64),
@@ -452,6 +459,7 @@ Resolve a who-spec to a [`DelegWho`]: `everyone`; `group:NAME` / `g:NAME`;
 `user:NAME` / `u:NAME` / a bare name (defaults to user); or a bare numeric id.
 Names are looked up via the system passwd/group databases.
 */
+#[cfg(feature = "write")]
 pub fn resolve_who(spec: &str) -> std::result::Result<DelegWho, String> {
     let spec = spec.trim();
     if spec.eq_ignore_ascii_case("everyone") {
@@ -475,6 +483,7 @@ pub fn resolve_who(spec: &str) -> std::result::Result<DelegWho, String> {
 
 /// The ZFS vdev `type` for a path: `disk` for a block device, `file` for a
 /// regular file (what VDEV_ATTACH's device nvlist needs).
+#[cfg(feature = "write")]
 fn device_vtype(path: &str) -> Result<&'static str> {
     use std::os::unix::fs::FileTypeExt;
     let ft = std::fs::metadata(path)
@@ -499,8 +508,8 @@ static storage (POSIX MT-Unsafe), and a threaded caller can run
 long entries.
 */
 
-/// Look up a numeric uid (or gid) in the system database, returning its name.
-/// The inverse of the lookup behind [`resolve_who`]; used to label userused@/groupused@ rows.
+/// Look up a numeric uid (or gid) in the system database, returning its name;
+/// used to label userused@/groupused@ rows (`resolve_who` goes the other way).
 pub fn name_for_id(id: u64, group: bool) -> Option<String> {
     let id = u32::try_from(id).ok()?;
     let mut buf = vec![0i8; 4096];
@@ -535,6 +544,7 @@ pub fn name_for_id(id: u64, group: bool) -> Option<String> {
 }
 
 /// Look up a user (or group) name in the system database, returning its id.
+#[cfg(feature = "write")]
 fn resolve_id(name: &str, group: bool) -> Option<u64> {
     let cname = CString::new(name).ok()?;
     let mut buf = vec![0i8; 4096];
@@ -572,6 +582,7 @@ ZFS_DELEG_FIELD_SEP_CHR and `inherit` is `l` (ZFS_DELEG_LOCAL) or `d`
 (ZFS_DELEG_DESCENDENT), per doc/reference/zfs_deleg.h. A bare `zfs allow`
 writes both, which `set_fsacl` does.
 */
+#[cfg(feature = "write")]
 fn deleg_whokey(who: &DelegWho, inherit: char) -> String {
     match who {
         DelegWho::User(id) => format!("u{inherit}${id}"),
@@ -757,6 +768,7 @@ impl BeginRecord {
 }
 
 /// What [`ZfsHandle::create`] makes: the two creatable `dmu_objset_type_t`s.
+#[cfg(feature = "write")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatasetType {
     Filesystem,
@@ -764,6 +776,7 @@ pub enum DatasetType {
     Volume,
 }
 
+#[cfg(feature = "write")]
 impl DatasetType {
     pub fn objset_type(self) -> ObjsetType {
         match self {
@@ -799,6 +812,7 @@ impl SendFlags {
     }
 }
 
+#[cfg(feature = "write")]
 #[derive(Debug)]
 /// Outcome of a successful [`ZfsHandle::recv_new`]: stream bytes consumed
 /// plus the kernel's property-error report (empty on full success).
@@ -1089,7 +1103,8 @@ pub struct HandleOptions {
     release grows the struct past [`DEFAULT_CMD_BUFFER_SIZE`].
     */
     pub cmd_buffer_size: usize,
-    /// Allow mutating ioctls on a kernel outside the verified ABI range.
+    /// Allow mutating ioctls on a kernel outside the verified ABI range (no
+    /// effect without the `write` feature, which has none to allow).
     pub allow_unverified_writes: bool,
 }
 
@@ -1286,7 +1301,8 @@ impl ZfsHandle {
             dst_hint: Cell::new(DST_INITIAL),
             cmd_size: opts.cmd_buffer_size.clamp(MIN_CMD_BUFFER_SIZE, MAX_CMD_BUFFER_SIZE),
             support,
-            writes_allowed: support.is_verified() || opts.allow_unverified_writes,
+            writes_allowed: cfg!(feature = "write")
+                && (support.is_verified() || opts.allow_unverified_writes),
         }
     }
 
@@ -1295,8 +1311,8 @@ impl ZfsHandle {
         self.support
     }
 
-    /// Will this handle issue mutating ioctls? (False only outside the verified
-    /// range without the opt-in.)
+    /// Will this handle issue mutating ioctls? (False outside the verified
+    /// range without the opt-in, and always without the `write` feature.)
     pub fn writes_allowed(&self) -> bool {
         self.writes_allowed
     }
@@ -1788,9 +1804,9 @@ impl ZfsHandle {
     /**
     Generate the send stream for `snapshot` and write it into `fd`
     (ZFS_IOC_SEND_NEW = `lzc_send`): the *kernel* produces every stream
-    record straight into the descriptor — a pipe feeding a local
-    [`Self::recv_new`], an ssh stdin, a file. `from` names the incremental
-    base snapshot (None = full stream).
+    record straight into the descriptor — a pipe feeding a local receive
+    (`recv_new`, `write` feature), an ssh stdin, a file. `from` names the
+    incremental base snapshot (None = full stream).
 
     BLOCKS until the whole stream is written — run it on a dedicated
     thread with its own handle. Closing the read side of the pipe fails
@@ -1841,6 +1857,7 @@ impl ZfsHandle {
     -s`); `force` is the `-F` rollback of the destination to its most
     recent snapshot before receiving.
     */
+    #[cfg(feature = "write")]
     pub fn recv_new(
         &self,
         snapname: &str,
@@ -1955,13 +1972,12 @@ impl ZfsHandle {
         }
     }
 
-    /* -------------------------------- writes ----------------------------- */
-
     /**
-    Issue a mutating ioctl. `innvl`, if present, is packed into
-    `zc_nvlist_src`; the kernel's output/errors nvlist is read back from
-    `zc_nvlist_dst` (empty if it filled none). `op` names the operation in
-    the [`ZfsError::Write`] a failure returns.
+    Issue a mutating ioctl (or SEND_NEW, a read that reports failures the
+    same way). `innvl`, if present, is packed into `zc_nvlist_src`; the
+    kernel's output/errors nvlist is read back from `zc_nvlist_dst` (empty if
+    it filled none). `op` names the operation in the [`ZfsError::Write`] a
+    failure returns.
     */
     fn write_ioctl(
         &self,
@@ -2014,7 +2030,12 @@ impl ZfsHandle {
             }
         }
     }
+}
 
+/* ================================= writes ================================= */
+
+#[cfg(feature = "write")]
+impl ZfsHandle {
     /**
     Set one or more properties on a dataset (ZFS_IOC_SET_PROP). `props` maps
     prop name → value (use an `NvList` built with `add_str`/`add_u64`).
@@ -2545,6 +2566,7 @@ mod tests {
     including the ones that bypass write_ioctl — while reads (and every ioctl
     once opted in) do: those fail with the device's ENOTTY instead.
     */
+    #[cfg(feature = "write")]
     #[test]
     fn write_gate_refuses_unverified_kernels_unless_opted_in() {
         let newer = KernelSupport::Newer(KernelVersion { major: 2, minor: 5 });
@@ -2567,6 +2589,27 @@ mod tests {
         let verified = KernelSupport::Verified(KernelVersion { major: 2, minor: 2 });
         let plain = null_handle(verified, HandleOptions::default());
         assert_eq!(plain.vdev_detach("nopool", 1).unwrap_err().errno(), enotty);
+    }
+
+    /**
+    Without the `write` feature no handle allows writes, opted in or not, and
+    the choke point itself refuses a mutating request: nothing reaches the
+    kernel even if a write path were added without its cfg.
+    */
+    #[cfg(not(feature = "write"))]
+    #[test]
+    fn read_only_build_refuses_every_mutating_ioctl() {
+        let verified = KernelSupport::Verified(KernelVersion { major: 2, minor: 2 });
+        let newer = KernelSupport::Newer(KernelVersion { major: 2, minor: 5 });
+        let opt_in = HandleOptions::default().allow_unverified_writes(true);
+        for h in [null_handle(verified, opt_in), null_handle(newer, opt_in)] {
+            assert!(!h.writes_allowed());
+            for ioc in Ioc::iter().filter(|ioc| ioc.mutates()) {
+                assert!(matches!(h.ioctl(ioc, &mut h.cmd()), Err(ZfsError::WriteRefused { .. })));
+            }
+            let enotty = Some(libc::ENOTTY);
+            assert_eq!(h.pool_configs().unwrap_err().errno(), enotty);
+        }
     }
 
     #[test]
@@ -2717,6 +2760,7 @@ mod tests {
         assert!(e.to_string().contains("16 bytes"), "{e}");
     }
 
+    #[cfg(feature = "write")]
     #[test]
     fn whokey_format_matches_kernel() {
         // mirrors zfs_deleg_whokey: <type><inherit>$<id>, everyone has no id
@@ -2727,6 +2771,7 @@ mod tests {
         assert_eq!(deleg_whokey(&DelegWho::Everyone, 'd'), "ed$");
     }
 
+    #[cfg(feature = "write")]
     #[test]
     fn resolve_who_parses_specs() {
         assert_eq!(resolve_who("everyone").unwrap(), DelegWho::Everyone);

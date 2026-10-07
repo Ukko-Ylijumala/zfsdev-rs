@@ -6,7 +6,8 @@
 SPL kstats: the counters the ZFS module exports as plain text in procfs
 (`/proc/spl/kstat/zfs/…`) — the `arc_summary` / `arcstat` data among them.
 No `/dev/zfs` ioctl is involved: the files are world-readable, so there is no
-ABI hazard and no privilege requirement. Linux only.
+ABI hazard and no privilege requirement. The procfs files (and the readers
+here) exist on Linux only; [`Kstat::parse`] itself is portable.
 
 The text format is a header line, a `name type data` column header, then
 `<name> <type> <value>` triples. Values are stored as `i64` because the kstat
@@ -32,8 +33,10 @@ use std::io;
 use strum::Display;
 
 /// The ARC's counters (`arc_summary`'s source).
+#[cfg(target_os = "linux")]
 pub const ARCSTATS_PATH: &str = "/proc/spl/kstat/zfs/arcstats";
 /// The DMU (file-level) prefetcher's counters.
+#[cfg(target_os = "linux")]
 pub const ZFETCHSTATS_PATH: &str = "/proc/spl/kstat/zfs/zfetchstats";
 
 /**
@@ -97,11 +100,13 @@ impl<S: Into<String>> FromIterator<(S, i64)> for Kstat {
 }
 
 /// The current arcstats.
+#[cfg(target_os = "linux")]
 pub fn read_arcstats() -> io::Result<Kstat> {
     Kstat::read(ARCSTATS_PATH)
 }
 
 /// The current zfetchstats.
+#[cfg(target_os = "linux")]
 pub fn read_zfetchstats() -> io::Result<Kstat> {
     Kstat::read(ZFETCHSTATS_PATH)
 }

@@ -5,9 +5,15 @@
 //! Integration tests against the live /dev/zfs interface. They skip
 //! gracefully on machines without ZFS so CI stays green.
 
+#![cfg(target_os = "linux")]
+
 use std::os::fd::AsRawFd;
-use zfsdev::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc, UserquotaProp};
-use zfsdev::ioctl::{BeginRecord, DatasetType, SendFlags, ZfsHandle};
+use zfsdev::enums::UserquotaProp;
+#[cfg(feature = "write")]
+use zfsdev::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc};
+use zfsdev::ioctl::{SendFlags, ZfsHandle};
+#[cfg(feature = "write")]
+use zfsdev::ioctl::{BeginRecord, DatasetType};
 
 fn handle() -> Option<ZfsHandle> {
     if !std::path::Path::new("/dev/zfs").exists() {
@@ -31,11 +37,13 @@ fn first_disk_guid(tree: &zfsdev::nvlist::NvList) -> Option<u64> {
 }
 
 /// A `{value, source}` property pair's numeric value.
+#[cfg(feature = "write")]
 fn prop_value_u64(props: &zfsdev::nvlist::NvList, name: &str) -> Option<u64> {
     props.get_list(name)?.get_u64("value")
 }
 
 /// A `{value, source}` property pair's string value.
+#[cfg(feature = "write")]
 fn prop_value_str(props: &zfsdev::nvlist::NvList, name: &str) -> Option<String> {
     props.get_list(name)?.get_str("value").map(str::to_string)
 }
@@ -341,18 +349,21 @@ fn send_recv_ioctls_abi() {
         .expect_err("progress of bogus send must fail");
     eprintln!("send_progress error (expected): {err}");
 
-    // a well-formed synthetic BEGIN record into a nonexistent pool: the key
-    // types and the byte-array framing are validated, the name is not found
-    let mut begin = vec![0u8; zfsdev::ioctl::DRR_RECORD_SIZE];
-    begin[8..16].copy_from_slice(&0x2F5BACBACu64.to_le_bytes());
-    let begin = BeginRecord::parse(&begin).unwrap();
-    let src = std::fs::File::open("/dev/null").unwrap();
-    let err = zfs
-        .recv_new(&snap, &begin, src.as_raw_fd(), false, false)
-        .expect_err("receive into bogus pool must fail");
-    eprintln!("receive error (expected): {err}");
-    assert!(err.to_string().starts_with("receive:"), "unmapped error: {err}");
-    assert!(err.to_string().contains("No such"), "not ENOENT: {err}");
+    #[cfg(feature = "write")]
+    {
+        // a well-formed synthetic BEGIN record into a nonexistent pool: the key
+        // types and the byte-array framing are validated, the name is not found
+        let mut begin = vec![0u8; zfsdev::ioctl::DRR_RECORD_SIZE];
+        begin[8..16].copy_from_slice(&0x2F5BACBACu64.to_le_bytes());
+        let begin = BeginRecord::parse(&begin).unwrap();
+        let src = std::fs::File::open("/dev/null").unwrap();
+        let err = zfs
+            .recv_new(&snap, &begin, src.as_raw_fd(), false, false)
+            .expect_err("receive into bogus pool must fail");
+        eprintln!("receive error (expected): {err}");
+        assert!(err.to_string().starts_with("receive:"), "unmapped error: {err}");
+        assert!(err.to_string().contains("No such"), "not ENOENT: {err}");
+    }
 
     // happy path, root-free: SEND_SPACE is an unprivileged read, so a real
     // snapshot (when the machine has one) proves the outnvl decode too
@@ -369,6 +380,7 @@ fn send_recv_ioctls_abi() {
     eprintln!("no snapshot found for the send_space happy path");
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn destroy_nonexistent_is_a_clean_mapped_error() {
     let Some(zfs) = handle() else { return };
@@ -380,6 +392,7 @@ fn destroy_nonexistent_is_a_clean_mapped_error() {
     assert!(msg.starts_with("destroy dataset:"), "unmapped error: {msg}");
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn snapshot_in_nonexistent_pool_is_a_clean_error() {
     let Some(zfs) = handle() else { return };
@@ -393,6 +406,7 @@ fn snapshot_in_nonexistent_pool_is_a_clean_error() {
     assert!(msg.starts_with("create snapshot:"), "unmapped error: {msg}");
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
     let Some(zfs) = handle() else { return };
@@ -449,6 +463,7 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
     eprintln!("pool-maintenance canaries all failed cleanly at pool lookup");
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn hold_release_in_nonexistent_pool_is_a_clean_error() {
     let Some(zfs) = handle() else { return };
@@ -483,6 +498,7 @@ the per-element errors outnvl back even when the ioctl fails, and
 exists in the delegated playground fails per-element with EEXIST inside the
 handler (dsl_dataset_snapshot_check) and changes nothing.
 */
+#[cfg(feature = "write")]
 #[test]
 fn failed_snapshot_names_the_failing_element() {
     const PLAYGROUND: &str = "data/test";
@@ -519,6 +535,7 @@ empty perm nvlist fails `zfs_deleg_verify_nvlist` with EINVAL. Only the
 child's entries are touched (inherited playground perms live on the
 parent). Needs the `allow` delegation on the playground; skips otherwise.
 */
+#[cfg(feature = "write")]
 #[test]
 fn unallow_whole_who_in_playground() {
     use zfsdev::ioctl::DelegWho;
@@ -554,6 +571,7 @@ fn unallow_whole_who_in_playground() {
     result.unwrap();
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn load_unload_key_in_nonexistent_pool_is_a_clean_error() {
     let Some(zfs) = handle() else { return };
@@ -584,6 +602,7 @@ pbkdf2salt/pbkdf2iters — including the negative case (a wrong passphrase
 must be *rejected by the kernel's MAC check*, proving the kernel really
 verified our PBKDF2 output). Skips wherever the environment is absent.
 */
+#[cfg(feature = "write")]
 #[test]
 fn load_key_roundtrip_in_playground() {
     use std::io::Write;
