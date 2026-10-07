@@ -6,7 +6,8 @@
 //! gracefully on machines without ZFS so CI stays green.
 
 use std::os::fd::AsRawFd;
-use zfs_browser::zfs::ioctl::{BeginRecord, SendFlags, ZfsHandle};
+use zfs_browser::zfs::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc, UserquotaProp};
+use zfs_browser::zfs::ioctl::{BeginRecord, DatasetType, SendFlags, ZfsHandle};
 
 fn handle() -> Option<ZfsHandle> {
     if !std::path::Path::new("/dev/zfs").exists() {
@@ -266,7 +267,7 @@ fn read_batch_ioctls() {
 
     // USERSPACE_MANY (userused = type 0): needs privilege; EPERM is fine, but
     // the raw zfs_useracct_t decode must not panic when it does succeed.
-    match zfs.userspace_many(&pool, 0) {
+    match zfs.userspace_many(&pool, UserquotaProp::UserUsed) {
         Ok(accts) => eprintln!("{pool}: {} userused entries", accts.len()),
         Err(e) => eprintln!("{pool}: userspace_many (needs root): {e}"),
     }
@@ -462,17 +463,21 @@ fn pool_maintenance_in_nonexistent_pool_is_a_clean_error() {
     innvl with a vdev-guid nvlist). Targeting a bogus pool exercises all four
     struct layouts / ioctl numbers and must fail at pool lookup, not crash.
     */
-    let scrub = zfs.pool_scan(NOPE_POOL, 1, false).expect_err("scrub of bogus pool must fail");
+    let scrub = zfs
+        .pool_scan(NOPE_POOL, PoolScanFunc::Scrub, false)
+        .expect_err("scrub of bogus pool must fail");
     assert!(scrub.to_string().starts_with("scrub:"), "unmapped: {scrub}");
 
     let clear = zfs.clear_errors(NOPE_POOL, 0).expect_err("clear of bogus pool must fail");
     assert!(clear.to_string().starts_with("clear errors:"), "unmapped: {clear}");
 
-    let trim = zfs.pool_trim(NOPE_POOL, &[0xdead], 0).expect_err("trim of bogus pool must fail");
+    let trim = zfs
+        .pool_trim(NOPE_POOL, &[0xdead], PoolTrimFunc::Start)
+        .expect_err("trim of bogus pool must fail");
     assert!(trim.to_string().starts_with("trim:"), "unmapped: {trim}");
 
     let init = zfs
-        .pool_initialize(NOPE_POOL, &[0xdead], 0)
+        .pool_initialize(NOPE_POOL, &[0xdead], PoolInitializeFunc::Start)
         .expect_err("initialize of bogus pool must fail");
     assert!(init.to_string().starts_with("initialize:"), "unmapped: {init}");
 
@@ -588,7 +593,7 @@ fn unallow_whole_who_in_playground() {
     }
     let ds = format!("{PLAYGROUND}/zb-deleg-{}", std::process::id());
     // CREATE never mounts (that's libzfs, userspace) — fine under delegation
-    if let Err(e) = zfs.create(&ds, 2, None) {
+    if let Err(e) = zfs.create(&ds, DatasetType::Filesystem, None) {
         eprintln!("skipping: cannot create {ds}: {e}");
         return;
     }

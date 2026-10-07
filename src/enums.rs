@@ -746,6 +746,54 @@ pub enum VdevTrimState {
     Complete,
 }
 
+/// pool_trim_func_t (zfs.h) - the `trim_command` of POOL_TRIM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[strum(serialize_all = "lowercase")]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum PoolTrimFunc {
+    Start = 0,
+    Cancel,
+    Suspend,
+}
+
+/// pool_initialize_func_t (zfs.h) - the `initialize_command` of
+/// POOL_INITIALIZE. `Uninit` is 2.1+ (EINVAL on older modules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[strum(serialize_all = "lowercase")]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum PoolInitializeFunc {
+    Start = 0,
+    Cancel,
+    Suspend,
+    Uninit,
+}
+
+/**
+zfs_userquota_prop_t (zfs.h) - which space-accounting table USERSPACE_MANY
+reads; Display is the property prefix (`userused` of `userused@<who>`). The
+object and project tables are 0.8+.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[strum(serialize_all = "lowercase")]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum UserquotaProp {
+    UserUsed = 0,
+    UserQuota,
+    GroupUsed,
+    GroupQuota,
+    UserObjUsed,
+    UserObjQuota,
+    GroupObjUsed,
+    GroupObjQuota,
+    ProjectUsed,
+    ProjectQuota,
+    ProjectObjUsed,
+    ProjectObjQuota,
+}
+
 impl_cenum!(
     ZioCompress,
     ZstdLevel,
@@ -801,6 +849,16 @@ mod tests {
         assert_eq!(ZioChecksum::from_repr(11), Some(ZioChecksum::Sha512));
         assert_eq!(DmuObjectType::from_repr(12), Some(DmuObjectType::DslDir));
         assert_eq!(DirentType::from_repr(4), Some(DirentType::Dir));
+    }
+
+    /// Argument enums travel as their raw C values (zfs.h order).
+    #[test]
+    fn argument_enums_match_c_values() {
+        assert_eq!(PoolTrimFunc::Suspend as u8, 2);
+        assert_eq!(PoolInitializeFunc::Uninit as u8, 3);
+        assert_eq!(UserquotaProp::GroupUsed as u8, 2);
+        assert_eq!(UserquotaProp::ProjectObjQuota as u8, 11);
+        assert_eq!(UserquotaProp::UserObjUsed.to_string(), "userobjused");
     }
 
     /// A newer kernel's unknown value survives the trip: raw kept, `?N` shown.

@@ -35,7 +35,9 @@ with [`HandleOptions::allow_unverified_writes`]. Reads stay available —
 upstream has only ever appended to the ABI since 0.8.
 */
 
-use super::enums::PoolScanFunc;
+use super::enums::{
+    Coded, ObjsetType, PoolInitializeFunc, PoolScanFunc, PoolTrimFunc, UserquotaProp,
+};
 use super::nvlist::{NvData, NvError, NvList};
 use super::props::VdevProp;
 use std::cell::Cell;
@@ -754,6 +756,23 @@ impl BeginRecord {
     }
 }
 
+/// What [`ZfsHandle::create`] makes: the two creatable `dmu_objset_type_t`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetType {
+    Filesystem,
+    /// A zvol; its creation props must include `volsize`.
+    Volume,
+}
+
+impl DatasetType {
+    pub fn objset_type(self) -> ObjsetType {
+        match self {
+            DatasetType::Filesystem => ObjsetType::Zfs,
+            DatasetType::Volume => ObjsetType::Zvol,
+        }
+    }
+}
+
 /// Stream-content options for [`ZfsHandle::send_new`] / `send_space` (the
 /// kernel innvl flags). `raw` sends an encrypted dataset as ciphertext (no
 /// loaded keys needed; the destination stays encrypted).
@@ -1125,8 +1144,7 @@ pub struct ObjsetStats {
     pub num_clones: u64,
     pub creation_txg: u64,
     pub guid: u64,
-    /// Raw dmu_objset_type_t; render via [`crate::zfs::enums::ObjsetType`].
-    pub objset_type: u32,
+    pub objset_type: Coded<ObjsetType>,
     pub is_snapshot: bool,
     pub inconsistent: bool,
     pub redacted: bool,
@@ -1157,7 +1175,7 @@ impl DmuObjsetStatsRaw {
             num_clones: self.dds_num_clones,
             creation_txg: self.dds_creation_txg,
             guid: self.dds_guid,
-            objset_type: self.dds_type,
+            objset_type: Coded::new(u64::from(self.dds_type)),
             is_snapshot: self.dds_is_snapshot != 0,
             inconsistent: self.dds_inconsistent != 0,
             redacted,
@@ -1535,15 +1553,14 @@ impl ZfsHandle {
 
     /**
     Per-user or per-group space accounting (ZFS_IOC_USERSPACE_MANY) for
-    `dataset`. `prop_type` is a `zfs_userquota_prop_t` index (0 = userused,
-    1 = userquota, 2 = groupused, …; doc/reference/zfs.h). Unlike most read
+    `dataset`: the `prop` table (`userused`, `groupquota`, …). Unlike most read
     ioctls this does *not* return an nvlist: the kernel fills `zc_nvlist_dst`
     with a packed array of `zfs_useracct_t` (`zu_domain[256]`, `zu_rid` u32,
     `zu_spare` u32, `zu_space` u64 = 272 bytes) and advances `zc_cookie` as an
     iteration cursor, so we loop until a read returns no bytes. Reading other
     users' usage needs privilege; non-root gets EPERM (surfaced to the UI).
     */
-    pub fn userspace_many(&self, dataset: &str, prop_type: u64) -> Result<Vec<UserAcct>> {
+    pub fn userspace_many(&self, dataset: &str, prop: UserquotaProp) -> Result<Vec<UserAcct>> {
         const REC: usize = 272;
         let mut out = Vec::new();
         let mut buf = vec![0u8; 64 * REC];
@@ -1551,7 +1568,7 @@ impl ZfsHandle {
         loop {
             let mut zc = self.cmd();
             zc.set_name(dataset)?;
-            zc.zc_objset_type = prop_type;
+            zc.zc_objset_type = prop as u64;
             zc.zc_cookie = cookie;
             zc.zc_nvlist_dst = buf.as_mut_ptr() as u64;
             zc.zc_nvlist_dst_size = buf.len() as u64;
@@ -2071,12 +2088,10 @@ impl ZfsHandle {
     }
 
     /**
-    Create a filesystem or volume (ZFS_IOC_CREATE). `objset_type` is a
-    `dmu_objset_type_t` (2 = ZFS filesystem, 3 = zvol; see
-    [`crate::zfs::enums::ObjsetType`]). `props` are the creation-time
-    properties (a zvol needs at least `volsize`).
+    Create a filesystem or volume (ZFS_IOC_CREATE). `props` are the
+    creation-time properties (a zvol needs at least `volsize`).
     */
-    pub fn create(&self, name: &str, objset_type: u64, props: Option<&NvList>) -> Result<()> {
+    pub fn create(&self, name: &str, kind: DatasetType, props: Option<&NvList>) -> Result<()> {
         let mut innvl = NvList::new();
         /*
         zfs_keys_create declares {"type", DATA_TYPE_INT32}, and the kernel
@@ -2085,7 +2100,7 @@ impl ZfsHandle {
         here makes every create fail; the ABI canaries can't see it because
         their nonexistent-pool ENOENT fires before input validation.
         */
-        innvl.push("type", NvData::Int32(objset_type as i32));
+        innvl.push("type", NvData::Int32(kind.objset_type() as i32));
         if let Some(p) = props {
             innvl.add_nvlist("props", p.clone());
         }
@@ -2336,11 +2351,11 @@ impl ZfsHandle {
     }
 
     /**
-    Control a pool scan (ZFS_IOC_POOL_SCAN). `func` is a `pool_scan_func_t`
-    (0 = stop the running scan, 1 = scrub, 2 = resilver); `pause` issues a
-    pause of the current scan instead (resume = call again with `func` = scrub,
-    `pause` = false). zc_cookie carries the func, zc_flags the
-    `POOL_SCRUB_PAUSE` bit.
+    Control a pool scan (ZFS_IOC_POOL_SCAN): start `func` (scrub, resilver,
+    error scrub), or stop the running scan with [`PoolScanFunc::None`];
+    `pause` issues a pause of the current scan instead (resume = call again
+    with `func` = scrub, `pause` = false). zc_cookie carries the func, zc_flags
+    the `POOL_SCRUB_PAUSE` bit.
 
     `dsl_scan` *resumes* a paused (error) scrub on a scrub-start and reports
     that by returning ECANCELED — success, as libzfs `zpool_scan` treats it.
@@ -2348,12 +2363,12 @@ impl ZfsHandle {
     ENOENT is indistinguishable from a missing pool, and the UI only offers
     pause on a running scrub.)
     */
-    pub fn pool_scan(&self, pool: &str, func: u64, pause: bool) -> Result<()> {
+    pub fn pool_scan(&self, pool: &str, func: PoolScanFunc, pause: bool) -> Result<()> {
         let mut zc = self.cmd();
         zc.set_name(pool)?;
-        zc.zc_cookie = func;
+        zc.zc_cookie = func as u64;
         zc.zc_flags = u32::from(pause); // POOL_SCRUB_PAUSE = 1, else NORMAL
-        let scrub = func == PoolScanFunc::Scrub as u64 || func == PoolScanFunc::ErrorScrub as u64;
+        let scrub = matches!(func, PoolScanFunc::Scrub | PoolScanFunc::ErrorScrub);
         match self.ioctl(Ioc::PoolScan, &mut zc)? {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::ECANCELED) && scrub && !pause => Ok(()),
@@ -2390,14 +2405,14 @@ impl ZfsHandle {
     }
 
     /**
-    Start (`cmd` = 0), cancel (1) or suspend (2) TRIM on the given vdev guids
-    (ZFS_IOC_POOL_TRIM) — typically a pool's top-level vdevs. The kernel returns
-    EINVAL if any vdev can't be trimmed (e.g. a file vdev), which surfaces as the
-    operation error.
+    Start, cancel or suspend TRIM on the given vdev guids (ZFS_IOC_POOL_TRIM),
+    which must be concrete leaves (an interior mirror/raidz guid is EINVAL).
+    The kernel also returns EINVAL if any vdev can't be trimmed (e.g. a file
+    vdev), which surfaces as the operation error.
     */
-    pub fn pool_trim(&self, pool: &str, guids: &[u64], cmd: u64) -> Result<()> {
+    pub fn pool_trim(&self, pool: &str, guids: &[u64], cmd: PoolTrimFunc) -> Result<()> {
         let mut innvl = NvList::new();
-        innvl.add_u64("trim_command", cmd);
+        innvl.add_u64("trim_command", cmd as u64);
         innvl.add_nvlist("trim_vdevs", Self::vdev_guid_nvlist(guids));
         let mut zc = self.cmd();
         zc.set_name(pool)?;
@@ -2406,13 +2421,17 @@ impl ZfsHandle {
     }
 
     /**
-    Start (`cmd` = 0), cancel (1), suspend (2) or uninit (3) INITIALIZE on the
-    given vdev guids (ZFS_IOC_POOL_INITIALIZE) — writing a pattern to all
-    unallocated space.
+    Start, cancel, suspend or uninit INITIALIZE on the given vdev guids
+    (ZFS_IOC_POOL_INITIALIZE) — writing a pattern to all unallocated space.
     */
-    pub fn pool_initialize(&self, pool: &str, guids: &[u64], cmd: u64) -> Result<()> {
+    pub fn pool_initialize(
+        &self,
+        pool: &str,
+        guids: &[u64],
+        cmd: PoolInitializeFunc,
+    ) -> Result<()> {
         let mut innvl = NvList::new();
-        innvl.add_u64("initialize_command", cmd);
+        innvl.add_u64("initialize_command", cmd as u64);
         innvl.add_nvlist("initialize_vdevs", Self::vdev_guid_nvlist(guids));
         let mut zc = self.cmd();
         zc.set_name(pool)?;
@@ -2538,7 +2557,7 @@ mod tests {
         };
         refused(gated.destroy("nopool/ds", false), Ioc::Destroy);
         refused(gated.vdev_detach("nopool", 1), Ioc::VdevDetach);
-        refused(gated.pool_scan("nopool", 1, false), Ioc::PoolScan);
+        refused(gated.pool_scan("nopool", PoolScanFunc::Scrub, false), Ioc::PoolScan);
         let enotty = Some(libc::ENOTTY);
         assert_eq!(gated.pool_configs().unwrap_err().errno(), enotty);
         assert!(gated.destroy("nopool/ds", false).unwrap_err().to_string().contains("opt-in"));
