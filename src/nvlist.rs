@@ -52,6 +52,8 @@ pub enum NvError {
     UnsupportedEncoding(u8),
     #[error("unsupported endianness {0}")]
     UnsupportedEndian(u8),
+    #[error("unsupported nvlist version {0} (only version 0 is supported)")]
+    UnsupportedVersion(i32),
     #[error("invalid nvpair size {size} at offset {at}")]
     BadPairSize { at: usize, size: i64 },
     #[error("invalid nvpair name (name_sz {0})")]
@@ -249,6 +251,7 @@ impl NvList {
                     return Err(NvError::UnsupportedEndian(hdr[1]));
                 }
                 let version = cur.read_i32()?;
+                check_version(version)?;
                 let nvflag = cur.read_u32()?;
                 let pairs = decode_pairs(&mut cur, 0)?;
                 Ok(NvList { version, nvflag, pairs })
@@ -384,6 +387,7 @@ impl NvList {
     so strip them from lists destined for write ioctls.
     */
     pub fn pack(&self) -> Result<Vec<u8>> {
+        check_version(self.version)?;
         let mut out = Vec::with_capacity(16 + self.pairs.len() * 32);
         out.extend_from_slice(&[0u8, 1, 0, 0]); // NV_ENCODE_NATIVE, little-endian
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -391,6 +395,13 @@ impl NvList {
         encode_pairs(&mut out, &self.pairs, 0)?;
         Ok(out)
     }
+}
+
+fn check_version(version: i32) -> Result<()> {
+    if version != 0 {
+        return Err(NvError::UnsupportedVersion(version));
+    }
+    Ok(())
 }
 
 /// Decode a sequence of nvpairs up to and including the zero terminator.
@@ -456,15 +467,15 @@ fn decode_value(
     depth: usize,
 ) -> Result<NvData> {
     let need = |n: usize| -> Result<&[u8]> {
-        value.get(..n).ok_or(NvError::ValueOverflow {
+        value.get(..n).ok_or_else(|| NvError::ValueOverflow {
             name: name.to_string(),
             need: n,
             have: value.len(),
         })
     };
-    let scalar_array = |elem_sz: usize| -> Result<Vec<&[u8]>> {
+    let scalar_array = |elem_sz: usize| -> Result<std::slice::ChunksExact<'_, u8>> {
         let raw = need(nelem.checked_mul(elem_sz).ok_or(NvError::Overflow(nelem))?)?;
-        Ok(raw.chunks_exact(elem_sz).collect())
+        Ok(raw.chunks_exact(elem_sz))
     };
 
     Ok(match dtype {
@@ -487,45 +498,38 @@ fn decode_value(
         DT_INT8_ARRAY => NvData::Int8Array(need(nelem)?.iter().map(|&b| b as i8).collect()),
         DT_INT16_ARRAY => NvData::Int16Array(
             scalar_array(2)?
-                .iter()
-                .map(|c| i16::from_le_bytes((*c).try_into().unwrap()))
+                .map(|c| i16::from_le_bytes(c.try_into().unwrap()))
                 .collect(),
         ),
         DT_UINT16_ARRAY => NvData::Uint16Array(
             scalar_array(2)?
-                .iter()
-                .map(|c| u16::from_le_bytes((*c).try_into().unwrap()))
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
                 .collect(),
         ),
         DT_INT32_ARRAY => NvData::Int32Array(
             scalar_array(4)?
-                .iter()
-                .map(|c| i32::from_le_bytes((*c).try_into().unwrap()))
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
                 .collect(),
         ),
         DT_UINT32_ARRAY => NvData::Uint32Array(
             scalar_array(4)?
-                .iter()
-                .map(|c| u32::from_le_bytes((*c).try_into().unwrap()))
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
                 .collect(),
         ),
         DT_INT64_ARRAY => NvData::Int64Array(
             scalar_array(8)?
-                .iter()
-                .map(|c| i64::from_le_bytes((*c).try_into().unwrap()))
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
                 .collect(),
         ),
         DT_UINT64_ARRAY => NvData::Uint64Array(
             scalar_array(8)?
-                .iter()
-                .map(|c| u64::from_le_bytes((*c).try_into().unwrap()))
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
                 .collect(),
         ),
         // boolean_t array elements are 4 bytes each
         DT_BOOLEAN_ARRAY => NvData::BooleanArray(
             scalar_array(4)?
-                .iter()
-                .map(|c| i32::from_le_bytes((*c).try_into().unwrap()) != 0)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) != 0)
                 .collect(),
         ),
         DT_STRING_ARRAY => {
@@ -543,6 +547,7 @@ fn decode_value(
         DT_NVLIST => {
             let hdr = need(NVLIST_STRUCT_SIZE)?;
             let version = i32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            check_version(version)?;
             let nvflag = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
             let pairs = decode_pairs(cur, depth + 1)?;
             NvData::List(NvList {
@@ -560,6 +565,7 @@ fn decode_value(
             for i in 0..nelem {
                 let off = nelem * 8 + i * NVLIST_STRUCT_SIZE;
                 let version = i32::from_le_bytes(hdrs[off..off + 4].try_into().unwrap());
+                check_version(version)?;
                 let nvflag = u32::from_le_bytes(hdrs[off + 4..off + 8].try_into().unwrap());
                 let pairs = decode_pairs(cur, depth + 1)?;
                 lists.push(NvList {
@@ -608,6 +614,15 @@ parent blob. `nvp_size = NV_ALIGN(16 + name_sz) + NV_ALIGN(value_sz)` per
 `NVP_SIZE_CALC`, patched into the header once the value has been written.
 */
 fn encode_pair(out: &mut Vec<u8>, name: &str, data: &NvData, depth: usize) -> Result<()> {
+    match data {
+        NvData::List(list) => check_version(list.version)?,
+        NvData::ListArray(lists) => {
+            for list in lists {
+                check_version(list.version)?;
+            }
+        }
+        _ => {}
+    }
     /*
     The wire format is NUL-delimited: an interior NUL makes the kernel's
     decoder see a shorter string (silently changing the value — its
@@ -837,6 +852,7 @@ fn decode_xdr_list(cur: &mut Cursor, depth: usize) -> Result<NvList> {
         return Err(NvError::TooDeep);
     }
     let version = cur.read_i32_be()?;
+    check_version(version)?;
     let nvflag = cur.read_u32_be()?;
     let mut pairs = Vec::new();
     loop {
@@ -1504,14 +1520,20 @@ mod tests {
 
     #[test]
     fn xdr_empty_number_arrays_and_nested_lists() {
-        // C's xdr_array returns TRUE immediately when nelem == 0 without
-        // emitting the 4-byte element count prefix, even though
-        // nvs_xdr_nvp_size adds 4 * nelem + 4 to encode_sz.
+        // Match nvs_xdr_nvp_size: every empty numeric array has encode_sz
+        // four bytes larger than its actual stream, with no count word.
         let mut inner = XdrEnc { buf: Vec::new() };
-        inner.pair("e1", DT_UINT64_ARRAY, 0, &[]);
-        inner.pair("e2", DT_INT32_ARRAY, 0, &[]);
-        inner.pair("e3", DT_UINT16_ARRAY, 0, &[]);
+        for (name, dtype) in [("e1", DT_UINT64_ARRAY), ("e2", DT_INT32_ARRAY), ("e3", DT_UINT16_ARRAY)] {
+            let start = inner.buf.len();
+            inner.pair(name, dtype, 0, &[]);
+            let encode_sz = (inner.buf.len() - start + 4) as i32;
+            inner.buf[start..start + 4].copy_from_slice(&encode_sz.to_be_bytes());
+            // The native decode size is NV_ALIGN(16 + name_sz), no value.
+            inner.buf[start + 4..start + 8].copy_from_slice(&24i32.to_be_bytes());
+        }
+        let start = inner.buf.len();
         inner.pair("after_empty", DT_UINT64, 1, &99u64.to_be_bytes());
+        inner.buf[start + 4..start + 8].copy_from_slice(&40i32.to_be_bytes());
         inner.end();
 
         let mut child_payload = Vec::new();
@@ -1519,27 +1541,37 @@ mod tests {
         child_payload.extend_from_slice(&NV_UNIQUE_NAME.to_be_bytes());
         child_payload.extend_from_slice(&inner.buf);
 
-        let mut e = XdrEnc::new();
-        // Parent's encode_sz includes +4 bytes per empty array (3 * 4 = 12 > 8)
-        let inflated_len = child_payload.len() + 12;
-        let mut body = Vec::new();
-        XdrEnc::xdr_str(&mut body, "child");
-        body.extend_from_slice(&DT_NVLIST.to_be_bytes());
-        body.extend_from_slice(&1i32.to_be_bytes());
-        body.extend_from_slice(&child_payload);
-        e.buf.extend_from_slice(&((body.len() + 8 + (inflated_len - child_payload.len())) as i32).to_be_bytes());
-        e.buf.extend_from_slice(&64i32.to_be_bytes());
-        e.buf.extend_from_slice(&body);
-        e.pair("tail", DT_UINT64, 1, &7u64.to_be_bytes());
-        e.end();
+        for dtype in [DT_NVLIST, DT_NVLIST_ARRAY] {
+            for with_tail in [false, true] {
+                let mut e = XdrEnc::new();
+                let start = e.buf.len();
+                e.pair("child", dtype, 1, &child_payload);
+                // Enclosing sizes also include each child's phantom count.
+                let encode_sz = (e.buf.len() - start + 12) as i32;
+                let decode_sz: i32 = if dtype == DT_NVLIST { 48 } else { 56 };
+                e.buf[start..start + 4].copy_from_slice(&encode_sz.to_be_bytes());
+                e.buf[start + 4..start + 8].copy_from_slice(&decode_sz.to_be_bytes());
+                if with_tail {
+                    let start = e.buf.len();
+                    e.pair("tail", DT_UINT64, 1, &7u64.to_be_bytes());
+                    e.buf[start + 4..start + 8].copy_from_slice(&32i32.to_be_bytes());
+                }
+                // Without a tail, the +12 exceeds the old +8 allowance.
+                e.end();
 
-        let l = NvList::unpack(&e.buf).unwrap();
-        let child = l.get_list("child").unwrap();
-        assert_eq!(child.get_u64_array("e1"), Some(&[][..]));
-        assert_eq!(child.get("e2"), Some(&NvData::Int32Array(vec![])));
-        assert_eq!(child.get("e3"), Some(&NvData::Uint16Array(vec![])));
-        assert_eq!(child.get_u64("after_empty"), Some(99));
-        assert_eq!(l.get_u64("tail"), Some(7));
+                let l = NvList::unpack(&e.buf).unwrap();
+                let child = if dtype == DT_NVLIST {
+                    l.get_list("child").unwrap()
+                } else {
+                    &l.get_list_array("child").unwrap()[0]
+                };
+                assert_eq!(child.get_u64_array("e1"), Some(&[][..]));
+                assert_eq!(child.get("e2"), Some(&NvData::Int32Array(vec![])));
+                assert_eq!(child.get("e3"), Some(&NvData::Uint16Array(vec![])));
+                assert_eq!(child.get_u64("after_empty"), Some(99));
+                assert_eq!(l.get_u64("tail"), with_tail.then_some(7));
+            }
+        }
     }
 
     #[test]
@@ -1587,5 +1619,43 @@ mod tests {
             list = parent;
         }
         assert!(matches!(list.pack(), Err(NvError::TooDeep)));
+    }
+
+    #[test]
+    fn unsupported_versions_are_rejected_in_roots_and_embedded_lists() {
+        let invalid = NvList { version: 1, ..NvList::new() };
+        assert!(matches!(invalid.pack(), Err(NvError::UnsupportedVersion(1))));
+        for data in [NvData::List(invalid.clone()), NvData::ListArray(vec![invalid])] {
+            let mut root = NvList::new();
+            root.push("child", data);
+            assert!(matches!(root.pack(), Err(NvError::UnsupportedVersion(1))));
+        }
+        let mut native = NvList::new().pack().unwrap();
+        native[4..8].copy_from_slice(&1i32.to_le_bytes());
+        assert!(matches!(NvList::unpack(&native), Err(NvError::UnsupportedVersion(1))));
+        for dtype in [DT_NVLIST, DT_NVLIST_ARRAY] {
+            let mut e = Enc::new();
+            let mut hdr = Vec::new();
+            if dtype == DT_NVLIST_ARRAY {
+                hdr.extend_from_slice(&[0; 8]);
+            }
+            write_nvlist_struct(&mut hdr, 1, NV_UNIQUE_NAME);
+            e.pair("child", dtype, 1, &hdr);
+            e.end(); // child terminator
+            e.end(); // root terminator
+            assert!(matches!(NvList::unpack(&e.buf), Err(NvError::UnsupportedVersion(1))));
+
+            let mut xdr = XdrEnc::new();
+            let mut child = XdrEnc::new().buf[4..].to_vec();
+            child[..4].copy_from_slice(&1i32.to_be_bytes());
+            child.extend_from_slice(&[0; 8]);
+            xdr.pair("child", dtype, 1, &child);
+            xdr.end();
+            assert!(matches!(NvList::unpack(&xdr.buf), Err(NvError::UnsupportedVersion(1))));
+        }
+        let mut xdr = XdrEnc::new();
+        xdr.end();
+        xdr.buf[4..8].copy_from_slice(&1i32.to_be_bytes());
+        assert!(matches!(NvList::unpack(&xdr.buf), Err(NvError::UnsupportedVersion(1))));
     }
 }

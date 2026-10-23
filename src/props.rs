@@ -635,6 +635,9 @@ nvlist needs. Read-only properties are rejected with a message; unknown or
 string-valued properties pass through as strings. The kernel re-validates
 every set, so a value that slips through here still fails cleanly rather
 than corrupting anything.
+
+`xattr=on` follows the loaded Linux kernel's version. If that version cannot
+be determined (including on other platforms), use the explicit `dir` or `sa`.
 */
 pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
     let input = input.trim();
@@ -765,11 +768,16 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
         P::Xattr => {
             if input == "on" {
                 // Since 2.3.0, "on" defaults to SA (2); up to 2.2.x, it mapped to DIR (1).
-                let mode = match crate::ioctl::kernel_version() {
-                    Some(v) if v < crate::ioctl::KernelVersion { major: 2, minor: 3 } => XattrMode::Dir,
-                    _ => XattrMode::Sa,
-                };
-                u64v(mode as u64)
+                #[cfg(target_os = "linux")]
+                if let Some(v) = crate::ioctl::kernel_version() {
+                    let mode = if v < (crate::ioctl::KernelVersion { major: 2, minor: 3 }) {
+                        XattrMode::Dir
+                    } else {
+                        XattrMode::Sa
+                    };
+                    return u64v(mode as u64);
+                }
+                Err("cannot resolve 'xattr=on' without a kernel version; use 'dir' or 'sa'".into())
             } else {
                 enum_val!(XattrMode, input, name)
             }
@@ -1151,11 +1159,16 @@ mod tests {
         assert_eq!(parse_prop_value("volmode", "dev").unwrap(), Uint64(2));
         assert_eq!(parse_prop_value("volmode", "none").unwrap(), Uint64(3));
         // xattr: "on" defaults to SA on 2.3+ (Dir on <2.3), "dir" and "sa" are explicit
-        let on_expected = match crate::ioctl::kernel_version() {
-            Some(v) if v < crate::ioctl::KernelVersion { major: 2, minor: 3 } => Uint64(1),
-            _ => Uint64(2),
-        };
-        assert_eq!(parse_prop_value("xattr", "on").unwrap(), on_expected);
+        #[cfg(target_os = "linux")]
+        match crate::ioctl::kernel_version() {
+            Some(v) => {
+                let on = if v < (crate::ioctl::KernelVersion { major: 2, minor: 3 }) { 1 } else { 2 };
+                assert_eq!(parse_prop_value("xattr", "on").unwrap(), Uint64(on));
+            }
+            None => assert!(parse_prop_value("xattr", "on").is_err()),
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(parse_prop_value("xattr", "on").is_err());
         assert_eq!(parse_prop_value("xattr", "dir").unwrap(), Uint64(1));
         assert_eq!(parse_prop_value("xattr", "sa").unwrap(), Uint64(2));
         // ACL policies land on the sparse ZFS_ACL_* values, aliases included
