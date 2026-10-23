@@ -13,7 +13,7 @@ APIs without losing the raw number.
 
 use std::fmt;
 use std::marker::PhantomData;
-use strum::{Display, EnumString, FromRepr};
+use strum::{Display, EnumString, FromRepr, IntoStaticStr};
 
 /**
 A C enum mirrored as a `repr(u8)` Rust enum: conversion from the raw value the
@@ -873,6 +873,81 @@ impl_cenum!(
     VdevTrimState,
 );
 
+/**
+`zfs_errno_t` (`doc/reference/2.4/zfs.h`): ZFS-specific error codes (`1024..`)
+returned by `/dev/zfs` ioctls (and per-element error nvlists) when generic
+POSIX `errno` values are not specific enough.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, FromRepr, IntoStaticStr)]
+#[repr(i32)]
+#[non_exhaustive]
+pub enum ZfsErrno {
+    #[strum(serialize = "pool already has a checkpoint")]
+    CheckpointExists = 1024,
+    #[strum(serialize = "checkpoint is being discarded")]
+    DiscardingCheckpoint,
+    #[strum(serialize = "pool has no checkpoint")]
+    NoCheckpoint,
+    #[strum(serialize = "device removal in progress")]
+    DevrmInProgress,
+    #[strum(serialize = "vdev is too big")]
+    VdevTooBig,
+    #[strum(serialize = "ioctl command not supported by kernel")]
+    IocCmdUnavail,
+    #[strum(serialize = "ioctl argument not supported by kernel")]
+    IocArgUnavail,
+    #[strum(serialize = "missing required ioctl argument")]
+    IocArgRequired,
+    #[strum(serialize = "invalid ioctl argument type")]
+    IocArgBadtype,
+    #[strum(serialize = "wrong parent dataset")]
+    WrongParent,
+    #[strum(serialize = "origin ivset guid missing")]
+    FromIvsetGuidMissing,
+    #[strum(serialize = "ivset guid mismatch")]
+    FromIvsetGuidMismatch,
+    #[strum(serialize = "spill block flag missing")]
+    SpillBlockFlagMissing,
+    #[strum(serialize = "unknown send stream feature")]
+    UnknownSendStreamFeature,
+    #[strum(serialize = "pool export in progress")]
+    ExportInProgress,
+    #[strum(serialize = "bookmark source is not an ancestor")]
+    BookmarkSourceNotAncestor,
+    #[strum(serialize = "send stream is truncated")]
+    StreamTruncated,
+    #[strum(serialize = "send stream large block mismatch")]
+    StreamLargeBlockMismatch,
+    #[strum(serialize = "resilver in progress")]
+    ResilverInProgress,
+    #[strum(serialize = "sequential rebuild in progress")]
+    RebuildInProgress,
+    #[strum(serialize = "invalid or unsupported property")]
+    Badprop,
+    #[strum(serialize = "operation not supported on this vdev type")]
+    VdevNotsup,
+    #[strum(serialize = "not in a user namespace")]
+    NotUserNamespace,
+    #[strum(serialize = "partially received state already exists")]
+    ResumeExists,
+    #[strum(serialize = "encryption algorithm not supported")]
+    CryptoNotsup,
+    #[strum(serialize = "raidz expansion in progress")]
+    RaidzExpandInProgress,
+    #[strum(serialize = "vdev ashift mismatch")]
+    AshiftMismatch,
+    #[strum(serialize = "send stream has large microzap")]
+    StreamLargeMicrozap,
+    #[strum(serialize = "too many vdevs sitting out")]
+    TooManySitouts,
+}
+
+impl CEnum for ZfsErrno {
+    fn from_raw(v: u64) -> Option<Self> {
+        i32::try_from(v).ok().and_then(Self::from_repr)
+    }
+}
+
 /* ========================================================================= */
 
 #[cfg(test)]
@@ -935,5 +1010,8 @@ mod tests {
         assert_eq!(format!("{future:?}"), "?42");
         // a value past u8 can't be any repr(u8) variant
         assert_eq!(Coded::<VdevTrimState>::new(256 + 1).get(), None);
+        assert_eq!(ZfsErrno::from_repr(1032), Some(ZfsErrno::IocArgBadtype));
+        assert_eq!(ZfsErrno::from_repr(1044), Some(ZfsErrno:: Badprop));
+        assert_eq!(ZfsErrno::from_repr(1052), Some(ZfsErrno::TooManySitouts));
     }
 }

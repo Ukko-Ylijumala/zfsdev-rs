@@ -38,12 +38,13 @@ with [`HandleOptions::allow_unverified_writes`]. Reads stay available —
 upstream has only ever appended to the ABI since 0.8.
 */
 
-use super::enums::{Coded, ObjsetType, UserquotaProp};
+use super::enums::{Coded, ObjsetType, UserquotaProp, ZfsErrno};
 #[cfg(feature = "write")]
 use super::enums::{PoolInitializeFunc, PoolScanFunc, PoolTrimFunc};
 use super::nvlist::{NvData, NvError, NvList};
 use super::props::VdevProp;
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ffi::CStr;
 #[cfg(feature = "write")]
 use std::ffi::CString;
@@ -81,6 +82,11 @@ const MAXNAMELEN: usize = 256;
 
 /// Initial nvlist output buffer; grown on ENOMEM as instructed by the kernel.
 const DST_INITIAL: usize = 256 * 1024;
+/// Upper bound on kernel-requested nvlist/error-log output buffers (128 MiB).
+const DST_MAX: usize = 128 * 1024 * 1024;
+/// Maximum string value length in a ZAP object (`ZAP_MAXVALUELEN` = 8 KiB).
+#[cfg(feature = "write")]
+const ZAP_MAXVALUELEN: usize = 8 * 1024;
 
 /// `sizeof (zfs_cmd_t)` as mirrored here: the least a command buffer can be.
 pub const MIN_CMD_BUFFER_SIZE: usize = size_of::<ZfsCmd>();
@@ -296,6 +302,12 @@ impl ZfsError {
             _ => None,
         }
     }
+
+    /// The ZFS-specific error code (`ZFS_ERR_*`, `1024..`), if the kernel
+    /// reported one.
+    pub fn zfs_errno(&self) -> Option<ZfsErrno> {
+        self.errno().and_then(ZfsErrno::from_repr)
+    }
 }
 
 type Result<T> = std::result::Result<T, ZfsError>;
@@ -370,7 +382,10 @@ pub struct ElementError {
 
 impl fmt::Display for ElementError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.name, io::Error::from_raw_os_error(self.errno))
+        match ZfsErrno::from_repr(self.errno) {
+            Some(zerr) => write!(f, "{}: {zerr} (errno {})", self.name, self.errno),
+            None => write!(f, "{}: {}", self.name, io::Error::from_raw_os_error(self.errno)),
+        }
     }
 }
 
@@ -379,8 +394,9 @@ const MAX_ELEMENT_ERRORS: usize = 4;
 
 /**
 The per-element errors in a failed write ioctl's outnvl. Errno values arrive
-as int32/int64 (both appear); a nested nvlist (trim/initialize's
-`trim_vdevs` → guid → errno) is flattened one level.
+as int32/int64/uint64; a nested nvlist (trim/initialize's `trim_vdevs` → guid
+→ errno, or `recv_new`'s `errors` sub-list) is flattened, and `VDEV_SET_PROPS`
+`{value, source}` entries unwrap `value` as the property's errno.
 */
 fn element_errors(nv: &NvList) -> Vec<ElementError> {
     let mut out = Vec::new();
@@ -390,17 +406,30 @@ fn element_errors(nv: &NvList) -> Vec<ElementError> {
 
 fn collect_element_errors(nv: &NvList, out: &mut Vec<ElementError>) {
     for p in &nv.pairs {
+        if matches!(p.name.as_str(), "read_bytes" | "error_flags" | "N_MORE_ERRORS") {
+            continue;
+        }
         let errno = match &p.data {
             NvData::Int32(e) => *e,
             NvData::Int64(e) => *e as i32,
             NvData::Uint64(e) => *e as i32,
             NvData::List(sub) => {
-                collect_element_errors(sub, out);
-                continue;
+                // VDEV_SET_PROPS wraps per-property errnos as
+                // `prop -> {value: u64(errno), source: u64(0)}`
+                if let Some(v) = sub.get_u64("value").filter(|_| {
+                    sub.pairs.iter().all(|sp| sp.name == "value" || sp.name == "source")
+                }) {
+                    v as i32
+                } else {
+                    collect_element_errors(sub, out);
+                    continue;
+                }
             }
             _ => continue,
         };
-        out.push(ElementError { name: p.name.clone(), errno });
+        if errno != 0 {
+            out.push(ElementError { name: p.name.clone(), errno });
+        }
     }
 }
 
@@ -426,22 +455,25 @@ wrong key/passphrase as EACCES (dsl_crypt.c: the unwrap MAC failed), which
 would otherwise read as a permission problem (that is EPERM), and a scrub
 start on a busy pool is EBUSY because a scan is already running.
 */
-fn errno_hint(op: WriteOp, err: &io::Error) -> &'static str {
+fn errno_hint(op: WriteOp, err: &io::Error) -> String {
+    if let Some(zerr) = err.raw_os_error().and_then(ZfsErrno::from_repr) {
+        return format!(" ({zerr})");
+    }
     match (op, err.raw_os_error()) {
-        (WriteOp::LoadKey, Some(libc::EACCES)) => " (wrong key or passphrase)",
-        (WriteOp::Scrub, Some(libc::EBUSY)) => " (a scrub or resilver is already running)",
+        (WriteOp::LoadKey, Some(libc::EACCES)) => " (wrong key or passphrase)".into(),
+        (WriteOp::Scrub, Some(libc::EBUSY)) => " (a scrub or resilver is already running)".into(),
         (_, Some(libc::EPERM) | Some(libc::EACCES)) => {
-            " (need root, or a `zfs allow` delegation for this operation)"
+            " (need root, or a `zfs allow` delegation for this operation)".into()
         }
-        (_, Some(libc::EEXIST)) => " (already exists)",
-        (_, Some(libc::ENOENT)) => " (no such pool/dataset)",
-        (_, Some(libc::EBUSY)) => " (busy — mounted, held, or has children)",
+        (_, Some(libc::EEXIST)) => " (already exists)".into(),
+        (_, Some(libc::ENOENT)) => " (no such pool/dataset)".into(),
+        (_, Some(libc::EBUSY)) => " (busy — mounted, held, or has children)".into(),
         (_, Some(libc::ETXTBSY)) => {
-            " (destination modified since its latest snapshot — roll it back first)"
+            " (destination modified since its latest snapshot — roll it back first)".into()
         }
-        (_, Some(libc::ENAMETOOLONG)) => " (name too long)",
-        (_, Some(libc::EINVAL)) => " (invalid argument — bad name or property value?)",
-        _ => "",
+        (_, Some(libc::ENAMETOOLONG)) => " (name too long)".into(),
+        (_, Some(libc::EINVAL)) => " (invalid argument — bad name or property value?)".into(),
+        _ => String::new(),
     }
 }
 
@@ -1221,7 +1253,7 @@ A `zbookmark_phys_t` from the pool error log: the block (objset, object, level,
 blkid) of a permanent data error. `objset` is a dataset object id (resolve via
 [`ZfsHandle::dsobj_to_dsname`]); `object` is an object within that dataset.
 */
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Zbookmark {
     pub objset: u64,
     pub object: u64,
@@ -1390,10 +1422,14 @@ impl ZfsHandle {
                     }
                     return Ok(NvList::unpack(&dst[..len])?);
                 }
-                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
-                    // kernel wrote the required size into zc_nvlist_dst_size
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ENOMEM)
+                        && (zc.zc_nvlist_dst_size as usize) > dst.len()
+                        && (zc.zc_nvlist_dst_size as usize) <= DST_MAX =>
+                {
+                    // put_nvlist wrote the required size into zc_nvlist_dst_size
                     let need = zc.zc_nvlist_dst_size as usize;
-                    dst.resize(need.max(dst.len() * 2), 0);
+                    dst.resize(need.checked_next_power_of_two().unwrap_or(need).min(DST_MAX), 0);
                     zc.zc_name = orig_name;
                     zc.zc_cookie = orig_cookie;
                 }
@@ -1459,17 +1495,23 @@ impl ZfsHandle {
             let consumed = unpack_history(&buf[..bytes_read], &mut records)?;
             if consumed == 0 {
                 /*
-                A record larger than the whole buffer: grow and re-read the
-                same offset rather than silently truncating the history.
-                Real records are small; the cap keeps a corrupt on-disk
-                length from ballooning the allocation before the record is
-                dismissed as garbage.
+                A record larger than the whole buffer: inspect its 8-byte
+                length prefix and grow directly to fit, rather than silently
+                truncating the history or repeatedly doubling on a corrupt
+                on-disk length (0 or > 16 MiB).
                 */
-                if bytes_read == buf.len() && buf.len() < 16 * 1024 * 1024 {
-                    buf.resize(buf.len() * 2, 0);
+                const MAX_HISTORY_REC: usize = 16 * 1024 * 1024;
+                let reclen = (bytes_read >= 8)
+                    .then(|| u64::from_le_bytes(buf[..8].try_into().unwrap()))
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|&n| (1..=MAX_HISTORY_REC).contains(&n));
+                if let Some(need) =
+                    reclen.filter(|_| bytes_read == buf.len() && buf.len() < MAX_HISTORY_REC)
+                {
+                    buf.resize((need + 8).next_power_of_two().min(MAX_HISTORY_REC), 0);
                     continue;
                 }
-                break; // short read or cap reached: corrupt trailing record
+                break; // short read or corrupt/oversized trailing record
             }
             let leftover = (bytes_read - consumed) as u64;
             offset = zc.zc_history_offset.saturating_sub(leftover);
@@ -1511,7 +1553,16 @@ impl ZfsHandle {
     pub fn objset_recvd_props(&self, dataset: &str) -> Result<NvList> {
         let mut zc = self.cmd();
         zc.set_name(dataset)?;
-        self.ioctl_nv(Ioc::ObjsetRecvdProps, &mut zc)
+        match self.ioctl_nv(Ioc::ObjsetRecvdProps, &mut zc) {
+            Ok(props) => Ok(props),
+            Err(ZfsError::Ioctl { err, .. })
+                if err.raw_os_error() == Some(libc::ENOTSUP)
+                    || err.raw_os_error() == Some(libc::EOPNOTSUPP) =>
+            {
+                Ok(NvList::new())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /**
@@ -1646,9 +1697,13 @@ impl ZfsHandle {
                 // cursor caught up (only in non-blocking mode)
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
                 // event larger than the buffer: kernel set the needed size; grow
-                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ENOMEM)
+                        && (zc.zc_nvlist_dst_size as usize) > dst.len()
+                        && (zc.zc_nvlist_dst_size as usize) <= DST_MAX =>
+                {
                     let need = zc.zc_nvlist_dst_size as usize;
-                    dst.resize(need.max(dst.len() * 2), 0);
+                    dst.resize(need.checked_next_power_of_two().unwrap_or(need).min(DST_MAX), 0);
                 }
                 // a signal interrupted the blocking wait — just retry
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
@@ -1686,9 +1741,11 @@ impl ZfsHandle {
             match self.ioctl(Ioc::ErrorLog, &mut zc)? {
                 Ok(()) => {
                     // entries occupy [remaining, cap); `remaining` is the unused
-                    // leading slots the kernel left after back-filling
+                    // leading slots the kernel left after back-filling. Deduplicate
+                    // bookmarks that appear in both spa_errlog_scrub and spa_errlog_last.
                     let remaining = zc.zc_nvlist_dst_size.min(cap) as usize;
                     let rd = |o: usize| u64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+                    let mut seen = HashSet::new();
                     let entries = (remaining..cap as usize)
                         .map(|i| {
                             let b = i * ENT;
@@ -1699,10 +1756,16 @@ impl ZfsHandle {
                                 blkid: rd(b + 24),
                             }
                         })
+                        .filter(|bm| seen.insert(*bm))
                         .collect();
                     return Ok(entries);
                 }
-                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => cap = cap.saturating_mul(2),
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ENOMEM)
+                        && (cap as usize).saturating_mul(ENT) < DST_MAX =>
+                {
+                    cap = cap.saturating_mul(2);
+                }
                 Err(err) => {
                     return Err(ZfsError::Ioctl { ioc: Ioc::ErrorLog, name: pool.to_string(), err });
                 }
@@ -1872,14 +1935,7 @@ impl ZfsHandle {
         let target = if self.objset_stats(fsname).is_ok() {
             fsname
         } else {
-            match fsname.rsplit_once('/') {
-                Some((parent, _)) => parent,
-                None => {
-                    return Err(ZfsError::Invalid(format!(
-                        "receive: pool '{fsname}' does not exist"
-                    )));
-                }
-            }
+            fsname.rsplit_once('/').map_or(fsname, |(parent, _)| parent)
         };
         let mut innvl = NvList::new();
         innvl.add_str("snapname", snapname);
@@ -1961,9 +2017,10 @@ impl ZfsHandle {
                         props,
                     });
                 }
-                // ESRCH: end of iteration. ENOENT: parent went away mid-walk.
+                // ESRCH: end of iteration (or 0 children/snapshots).
+                // ENOENT (nonexistent pool/dataset) is propagated as Err.
                 Err(ZfsError::Ioctl { err, .. })
-                    if matches!(err.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) =>
+                    if err.raw_os_error() == Some(libc::ESRCH) =>
                 {
                     return Ok(out);
                 }
@@ -1978,6 +2035,12 @@ impl ZfsHandle {
     kernel's output/errors nvlist is read back from `zc_nvlist_dst` (empty if
     it filled none). `op` names the operation in the [`ZfsError::Write`] a
     failure returns.
+
+    Unlike read ioctls, a mutating ioctl is **never** retried on `ENOMEM`:
+    `put_nvlist` runs *after* `vec->zvec_func` has already mutated pool or
+    dataset state, so a retry would execute a non-idempotent operation twice.
+    Instead, `dst` is sized upfront to `max(DST_INITIAL, src_len * 2)` (matching
+    `lzc_ioctl` in `libzfs_core.c`).
     */
     fn write_ioctl(
         &self,
@@ -1986,50 +2049,68 @@ impl ZfsHandle {
         zc: &mut CmdBuf,
         innvl: Option<&NvList>,
     ) -> Result<NvList> {
-        // The packed source must outlive the ioctl call(s); hold it here.
+        // The packed source must outlive the ioctl call; hold it here.
         let src = innvl.map(|nv| nv.pack()).transpose()?;
-        if let Some(s) = &src {
-            zc.zc_nvlist_src = s.as_ptr() as u64;
-            zc.zc_nvlist_src_size = s.len() as u64;
-        }
-        let mut dst: Vec<u8> = vec![0; DST_INITIAL];
-        loop {
-            zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
-            zc.zc_nvlist_dst_size = dst.len() as u64;
-            zc.zc_nvlist_dst_filled = 0;
-            match self.ioctl(ioc, zc)? {
-                Ok(()) => {
-                    // Only some ioctls return an nvlist; honor the filled flag.
-                    let len = zc.zc_nvlist_dst_size as usize;
-                    if zc.zc_nvlist_dst_filled != 0 && len <= dst.len() {
-                        return Ok(NvList::unpack(&dst[..len])?);
-                    }
-                    return Ok(NvList::default());
+        let dst_cap = match &src {
+            Some(s) => {
+                zc.zc_nvlist_src = s.as_ptr() as u64;
+                zc.zc_nvlist_src_size = s.len() as u64;
+                DST_INITIAL.max(s.len().saturating_mul(2)).min(DST_MAX)
+            }
+            None => DST_INITIAL,
+        };
+        let mut dst: Vec<u8> = vec![0; dst_cap];
+        zc.zc_nvlist_dst = dst.as_mut_ptr() as u64;
+        zc.zc_nvlist_dst_size = dst.len() as u64;
+        zc.zc_nvlist_dst_filled = 0;
+        match self.ioctl(ioc, zc)? {
+            Ok(()) => {
+                // Only some ioctls return an nvlist; honor the filled flag.
+                let len = zc.zc_nvlist_dst_size as usize;
+                let out = if zc.zc_nvlist_dst_filled != 0 && len <= dst.len() {
+                    NvList::unpack(&dst[..len])?
+                } else {
+                    NvList::default()
+                };
+                if matches!(op, WriteOp::Hold | WriteOp::Release) {
+                    return check_element_errors(op, out);
                 }
-                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
-                    let need = zc.zc_nvlist_dst_size as usize;
-                    dst.resize(need.max(dst.len() * 2), 0);
-                }
-                Err(err) => {
-                    /*
-                    New-style handlers fill the outnvl with per-element errors
-                    (snapshot/destroy_snaps/hold/release: name → errno; trim/
-                    initialize: guid → errno under a sub-list) and fail the
-                    whole ioctl when any element failed — the kernel still
-                    copies that outnvl back (zfsdev_ioctl_common put_nvlist's
-                    whenever a dst buffer was given), so say *which* failed.
-                    */
-                    let len = zc.zc_nvlist_dst_size as usize;
-                    let elements = (zc.zc_nvlist_dst_filled != 0 && len <= dst.len())
-                        .then(|| NvList::unpack(&dst[..len]).ok())
-                        .flatten()
-                        .map(|nv| element_errors(&nv))
-                        .unwrap_or_default();
-                    return Err(ZfsError::Write { op, err, elements });
-                }
+                Ok(out)
+            }
+            Err(err) => {
+                /*
+                New-style handlers fill the outnvl with per-element errors
+                (snapshot/destroy_snaps/hold/release: name → errno; trim/
+                initialize: guid → errno under a sub-list) and fail the
+                whole ioctl when any element failed — the kernel still
+                copies that outnvl back (zfsdev_ioctl_common put_nvlist's
+                whenever a dst buffer was given), so say *which* failed.
+                */
+                let len = zc.zc_nvlist_dst_size as usize;
+                let elements = (zc.zc_nvlist_dst_filled != 0 && len <= dst.len())
+                    .then(|| NvList::unpack(&dst[..len]).ok())
+                    .flatten()
+                    .map(|nv| element_errors(&nv))
+                    .unwrap_or_default();
+                Err(ZfsError::Write { op, err, elements })
             }
         }
     }
+}
+
+/// Convert an `outnvl` containing per-element errors into `Err(ZfsError::Write)`
+/// for ioctls (`ZFS_IOC_HOLD`, `ZFS_IOC_RELEASE`) where the kernel handler can
+/// return `0` while recording per-snapshot failures (such as `ENOENT`) in `outnvl`.
+fn check_element_errors(op: WriteOp, out: NvList) -> Result<NvList> {
+    let elements = element_errors(&out);
+    if let Some(first) = elements.first() {
+        return Err(ZfsError::Write {
+            op,
+            err: io::Error::from_raw_os_error(first.errno),
+            elements,
+        });
+    }
+    Ok(out)
 }
 
 /* ================================= writes ================================= */
@@ -2049,7 +2130,12 @@ impl ZfsHandle {
     }
 
     /// Set pool properties (ZFS_IOC_POOL_SET_PROPS).
+    ///
+    /// Property names and value types are validated client-side before
+    /// issuing the ioctl to guard against kernel `VERIFY` assertions in
+    /// `spa_prop_set`.
     pub fn pool_set_props(&self, pool: &str, props: &NvList) -> Result<NvList> {
+        validate_pool_props_set(props)?;
         let mut zc = self.cmd();
         zc.set_name(pool)?;
         self.write_ioctl(Ioc::PoolSetProps, WriteOp::PoolSetProps, &mut zc, Some(props))
@@ -2308,8 +2394,14 @@ impl ZfsHandle {
     nvlist names the target vdev by guid (`vdevprops_set_vdev`) and the props to
     set (`vdevprops_set_props`, name → typed value). Returns the kernel's
     per-element errors nvlist (empty on success).
+
+    `(prop, value)` is validated client-side before issuing the ioctl because
+    `vdev_prop_set` (`module/zfs/vdev.c`) uses `VERIFY0` on `nvpair_value_*`
+    type extractions and panics the kernel on a mismatched `NvData` variant or
+    out-of-range boolean index.
     */
     pub fn vdev_set_props(&self, pool: &str, guid: u64, prop: &str, value: &NvData) -> Result<NvList> {
+        validate_vdev_prop_set(prop, value)?;
         let mut set = NvList::new();
         set.push(prop, value.clone());
         let mut innvl = NvList::new();
@@ -2457,6 +2549,164 @@ impl ZfsHandle {
         zc.set_name(pool)?;
         self.write_ioctl(Ioc::PoolInitialize, WriteOp::Initialize, &mut zc, Some(&innvl))?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "write")]
+fn validate_pool_props_set(props: &NvList) -> Result<()> {
+    if props.pairs.is_empty() {
+        return Err(ZfsError::Invalid("pool_set_props: no properties given".into()));
+    }
+    for p in &props.pairs {
+        let name = p.name.as_str();
+        if !crate::props::is_editable(name) {
+            return Err(ZfsError::Invalid(format!("pool_set_props: '{name}' is read-only")));
+        }
+        if name.contains(':') {
+            let Some((ns, prop)) = name.split_once(':') else {
+                return Err(ZfsError::Invalid(format!("pool_set_props: invalid user property '{name}'")));
+            };
+            if ns.is_empty() || prop.is_empty() || name.len() >= MAXNAMELEN {
+                return Err(ZfsError::Invalid(format!("pool_set_props: invalid user property '{name}'")));
+            }
+            match &p.data {
+                NvData::Str(s) if s.len() < ZAP_MAXVALUELEN => {}
+                NvData::Str(_) => {
+                    return Err(ZfsError::Invalid(format!(
+                        "pool_set_props: value for '{name}' exceeds {ZAP_MAXVALUELEN} bytes"
+                    )));
+                }
+                _ => {
+                    return Err(ZfsError::Invalid(format!(
+                        "pool_set_props: user property '{name}' requires a string value"
+                    )));
+                }
+            }
+        } else if let Some(feat) = name.strip_prefix("feature@") {
+            if feat.is_empty() {
+                return Err(ZfsError::Invalid("pool_set_props: empty feature name".into()));
+            }
+            match &p.data {
+                NvData::Uint64(0) => {}
+                _ => {
+                    return Err(ZfsError::Invalid(format!(
+                        "pool_set_props: feature '{name}' can only be enabled with uint64(0)"
+                    )));
+                }
+            }
+        } else if matches!(name, "comment" | "cachefile" | "bootfs" | "compatibility" | "altroot" | "tname") {
+            match &p.data {
+                NvData::Str(s) if s.len() < ZAP_MAXVALUELEN => {}
+                NvData::Str(_) => {
+                    return Err(ZfsError::Invalid(format!(
+                        "pool_set_props: value for '{name}' exceeds {ZAP_MAXVALUELEN} bytes"
+                    )));
+                }
+                _ => {
+                    return Err(ZfsError::Invalid(format!(
+                        "pool_set_props: '{name}' requires a string value"
+                    )));
+                }
+            }
+        } else if matches!(
+            name,
+            "ashift"
+                | "autoexpand"
+                | "autoreplace"
+                | "autotrim"
+                | "delegation"
+                | "failmode"
+                | "listsnapshots"
+                | "multihost"
+                | "readonly"
+                | "version"
+                | "dedupditto"
+        ) {
+            match &p.data {
+                NvData::Uint64(_) => {}
+                _ => {
+                    return Err(ZfsError::Invalid(format!(
+                        "pool_set_props: '{name}' requires a numeric (uint64) value"
+                    )));
+                }
+            }
+        } else {
+            return Err(ZfsError::Invalid(format!(
+                "pool_set_props: unknown or unsupported pool property '{name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "write")]
+fn validate_vdev_prop_set(prop: &str, value: &NvData) -> Result<()> {
+    if prop.contains(':') {
+        let Some((ns, p)) = prop.split_once(':') else {
+            return Err(ZfsError::Invalid(format!("vdev_set_props: invalid user property '{prop}'")));
+        };
+        if ns.is_empty() || p.is_empty() || prop.len() >= MAXNAMELEN {
+            return Err(ZfsError::Invalid(format!("vdev_set_props: invalid user property '{prop}'")));
+        }
+        match value {
+            NvData::Str(s) if s.len() < ZAP_MAXVALUELEN => Ok(()),
+            NvData::Str(_) => Err(ZfsError::Invalid(format!(
+                "vdev_set_props: value for '{prop}' exceeds {ZAP_MAXVALUELEN} bytes"
+            ))),
+            _ => Err(ZfsError::Invalid(format!(
+                "vdev_set_props: user property '{prop}' requires a string value"
+            ))),
+        }
+    } else if prop == "comment" {
+        match value {
+            NvData::Str(s) if s.len() < ZAP_MAXVALUELEN => Ok(()),
+            NvData::Str(_) => Err(ZfsError::Invalid(format!(
+                "vdev_set_props: value for 'comment' exceeds {ZAP_MAXVALUELEN} bytes"
+            ))),
+            _ => Err(ZfsError::Invalid(
+                "vdev_set_props: 'comment' requires a string value".into(),
+            )),
+        }
+    } else if prop == "path" {
+        match value {
+            NvData::Str(s) if s.starts_with("/dev/") && s.len() < ZAP_MAXVALUELEN => Ok(()),
+            NvData::Str(_) => Err(ZfsError::Invalid(
+                "vdev_set_props: 'path' must start with '/dev/' and be under 8192 bytes".into(),
+            )),
+            _ => Err(ZfsError::Invalid(
+                "vdev_set_props: 'path' requires a string value".into(),
+            )),
+        }
+    } else if prop == "failfast" {
+        match value {
+            NvData::Uint64(0..=2) => Ok(()),
+            _ => Err(ZfsError::Invalid(
+                "vdev_set_props: 'failfast' must be uint64 0, 1, or 2".into(),
+            )),
+        }
+    } else if matches!(
+        prop,
+        "checksum_n"
+            | "checksum_t"
+            | "io_n"
+            | "io_t"
+            | "slow_io_n"
+            | "slow_io_t"
+            | "slow_io_events"
+            | "allocating"
+            | "sit_out"
+            | "autosit"
+    ) {
+        match value {
+            NvData::Uint64(_) => Ok(()),
+            _ => Err(ZfsError::Invalid(format!(
+                "vdev_set_props: '{prop}' requires a numeric (uint64) value"
+            ))),
+        }
+    } else {
+        Err(ZfsError::Invalid(format!(
+            "vdev_set_props: read-only or unsupported vdev property '{prop}'"
+        )))
     }
 }
 
@@ -2829,5 +3079,63 @@ mod tests {
         assert_eq!(out[0].get_str("history command"), Some("zfs snapshot tank@x"));
         assert_eq!(out[0].get_u64("history time"), Some(1000));
         assert_eq!(out[1].get_str("history command"), Some("zfs destroy tank@x"));
+    }
+
+    #[test]
+    fn zfs_errno_rendering() {
+        let err = ZfsError::Write {
+            op: WriteOp::Create,
+            err: io::Error::from_raw_os_error(1032), // ZFS_ERR_IOC_ARG_BADTYPE
+            elements: vec![ElementError { name: "type".into(), errno: 1032 }],
+        };
+        assert_eq!(err.zfs_errno(), Some(ZfsErrno::IocArgBadtype));
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ioctl argument type"), "{msg}");
+        assert!(msg.contains("type: invalid ioctl argument type (errno 1032)"), "{msg}");
+    }
+
+    #[test]
+    fn check_element_errors_converts_hold_release_enoent() {
+        let mut out = NvList::new();
+        out.push("tank/snap@tag", NvData::Int32(libc::ENOENT));
+        let res = check_element_errors(WriteOp::Hold, out);
+        assert!(matches!(res, Err(ZfsError::Write { op: WriteOp::Hold, elements, .. }) if elements.len() == 1));
+
+        let empty = NvList::new();
+        assert!(check_element_errors(WriteOp::Hold, empty).is_ok());
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn validate_property_mutations() {
+        // vdev props
+        assert!(validate_vdev_prop_set("comment", &NvData::Str("my comment".into())).is_ok());
+        assert!(validate_vdev_prop_set("comment", &NvData::Uint64(1)).is_err());
+        assert!(validate_vdev_prop_set("failfast", &NvData::Uint64(1)).is_ok());
+        assert!(validate_vdev_prop_set("failfast", &NvData::Uint64(3)).is_err());
+        assert!(validate_vdev_prop_set("failfast", &NvData::Str("on".into())).is_err());
+        assert!(validate_vdev_prop_set("path", &NvData::Str("/dev/sda".into())).is_ok());
+        assert!(validate_vdev_prop_set("path", &NvData::Str("/tmp/file".into())).is_err());
+        assert!(validate_vdev_prop_set("read_errors", &NvData::Uint64(0)).is_err());
+
+        // pool props
+        let mut good = NvList::new();
+        good.add_u64("ashift", 12).add_str("comment", "production");
+        assert!(validate_pool_props_set(&good).is_ok());
+
+        let mut ro = NvList::new();
+        ro.add_u64("size", 1000);
+        assert!(validate_pool_props_set(&ro).is_err());
+
+        let mut bad_type = NvList::new();
+        bad_type.add_u64("comment", 42);
+        assert!(validate_pool_props_set(&bad_type).is_err());
+
+        let mut user_prop = NvList::new();
+        user_prop.add_str("org.example:tag", "value");
+        assert!(validate_pool_props_set(&user_prop).is_ok());
+        let mut bad_user_prop = NvList::new();
+        bad_user_prop.add_u64("org.example:tag", 42);
+        assert!(validate_pool_props_set(&bad_user_prop).is_err());
     }
 }
