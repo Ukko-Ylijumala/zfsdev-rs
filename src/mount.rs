@@ -68,7 +68,16 @@ pub fn dataset_of(path: impl AsRef<Path>) -> io::Result<Option<ZfsMount>> {
     }
     let dev = fs::metadata(path)?.dev();
     let real = fs::canonicalize(path)?;
-    let mountinfo = fs::read_to_string(MOUNTINFO_PATH)?;
+    let mountinfo = {
+        use std::io::Read;
+        let mut file = fs::File::open(MOUNTINFO_PATH)?;
+        let mut buf = Vec::with_capacity(8 * 1024);
+        file.read_to_end(&mut buf)?;
+        match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }
+    };
     match find_mount(&mountinfo, (libc::major(dev), libc::minor(dev)), &real) {
         Some(mount) => Ok(Some(mount)),
         None => {
@@ -99,7 +108,7 @@ struct MountLine<'a> {
     /// `major:minor`, the `st_dev` of files on the mount.
     dev: &'a str,
     root: &'a str,
-    mount_point: PathBuf,
+    mount_point: &'a str,
     fstype: &'a str,
     source: &'a str,
 }
@@ -115,7 +124,7 @@ fn parse_line(line: &str) -> Option<MountLine<'_>> {
     let (dev, root, mount_point) = (fields.next()?, fields.next()?, fields.next()?);
     let mut tail = fields.skip_while(|&f| f != OPTIONAL_FIELDS_END).skip(1);
     let (fstype, source) = (tail.next()?, tail.next()?);
-    Some(MountLine { dev, root, mount_point: unescape_path(mount_point), fstype, source })
+    Some(MountLine { dev, root, mount_point, fstype, source })
 }
 
 /**
@@ -126,14 +135,18 @@ two at the same point the later, which covers the earlier.
 */
 fn find_mount(mountinfo: &str, dev: (u32, u32), path: &Path) -> Option<ZfsMount> {
     let dev = format!("{}:{}", dev.0, dev.1);
-    let line = mountinfo
+    let (line, mount_point) = mountinfo
         .lines()
         .filter_map(parse_line)
         .filter(|m| m.dev == dev && m.fstype == ZFS_FSTYPE)
-        .max_by_key(|m| (path.starts_with(&m.mount_point), m.mount_point.as_os_str().len()))?;
+        .map(|m| {
+            let mp = unescape_path(m.mount_point);
+            (m, mp)
+        })
+        .max_by_key(|(_, mp)| (path.starts_with(mp), mp.as_os_str().len()))?;
     Some(ZfsMount {
         dataset: String::from_utf8_lossy(&unescape(line.source)).into_owned(),
-        mount_point: line.mount_point,
+        mount_point,
         root: unescape_path(line.root),
     })
 }
@@ -222,5 +235,13 @@ mod tests {
     fn non_zfs_paths_are_none() {
         assert_eq!(dataset_of("/proc").unwrap(), None);
         assert!(dataset_of("/no/such/path").is_err());
+    }
+
+    #[test]
+    fn non_utf8_mount_info_resilience() {
+        // Line with invalid UTF-8 octal escape \377 (0xFF) in source and path
+        let info = "50 22 0:70 / /mnt/bad_\\377 rw - zfs tank/bad_\\377 rw\n";
+        let m = find_mount(info, (0, 70), Path::new("/mnt/bad_\u{FFFD}")).unwrap();
+        assert!(m.dataset.contains("tank/bad_"));
     }
 }

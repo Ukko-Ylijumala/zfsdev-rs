@@ -128,7 +128,11 @@ impl Kstat {
                     k.strs.insert(name.to_string(), value.to_string());
                 }
                 _ => {
-                    if let Ok(v) = value.trim().parse::<i64>() {
+                    let parsed = value
+                        .trim()
+                        .parse::<i64>()
+                        .or_else(|_| value.trim().parse::<u64>().map(|v| v.min(i64::MAX as u64) as i64));
+                    if let Ok(v) = parsed {
                         k.nums.insert(name.to_string(), v);
                     }
                 }
@@ -139,7 +143,8 @@ impl Kstat {
 
     /// Read and parse a kstat file from procfs.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
-        Ok(Kstat::parse(&fs::read_to_string(path)?))
+        let text = read_proc_lossy(path, 16 * 1024)?;
+        Ok(Kstat::parse(&text))
     }
 
     /// Raw signed value (`None` if the field is absent on this kernel).
@@ -169,6 +174,17 @@ impl Kstat {
     }
 }
 
+fn read_proc_lossy(path: impl AsRef<Path>, initial_capacity: usize) -> io::Result<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(initial_capacity);
+    file.read_to_end(&mut buf)?;
+    Ok(match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
+
 impl<S: Into<String>> FromIterator<(S, i64)> for Kstat {
     fn from_iter<I: IntoIterator<Item = (S, i64)>>(iter: I) -> Self {
         let nums = iter.into_iter().map(|(k, v)| (k.into(), v)).collect();
@@ -185,10 +201,30 @@ numeric token after the name's first word. A value keeps its exact text
 after the SPL's type padding; a compact line (`name 4 17`) works too.
 */
 fn named_line(line: &str) -> Option<(&str, u8, &str)> {
-    let mut tokens = token_spans(line);
-    tokens.next()?;
-    let (ty_start, ty_end, ty) =
-        tokens.find_map(|(s, e)| line[s..e].parse::<u8>().ok().map(|ty| (s, e, ty)))?;
+    // SPL prints `%-31s %-4d <value>`. When the name fits in the 31-byte
+    // column, column 31 is a space and the type column starts at byte 32.
+    let spl_ty = line
+        .get(31..32)
+        .filter(|&sep| sep == " ")
+        .and_then(|_| token_spans(&line[32..]).next())
+        .filter(|&(s, _)| s == 0)
+        .and_then(|(_, e)| line[32..32 + e].parse::<u8>().ok().map(|ty| (32, 32 + e, ty)))
+        .filter(|&(s, e, ty)| ty <= 8 && !line[..s].trim_end().is_empty() && e < line.len());
+
+    let (ty_start, ty_end, ty) = match spl_ty {
+        Some(hit) => hit,
+        None => {
+            let mut tokens = token_spans(line);
+            tokens.next()?;
+            tokens.find_map(|(s, e)| {
+                line[s..e]
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|&ty| ty <= 8 && e < line.len())
+                    .map(|ty| (s, e, ty))
+            })?
+        }
+    };
     let after = &line[ty_end..];
     let pad = TYPE_WIDTH.saturating_sub(ty_end - ty_start) + 1;
     let value = match after.get(..pad) {
@@ -246,6 +282,34 @@ pub enum ArcClass {
     PrefetchMetadata,
 }
 
+impl ArcClass {
+    const fn counters(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            ArcClass::All => ("hits", "iohits", "misses"),
+            ArcClass::DemandData => (
+                "demand_data_hits",
+                "demand_data_iohits",
+                "demand_data_misses",
+            ),
+            ArcClass::DemandMetadata => (
+                "demand_metadata_hits",
+                "demand_metadata_iohits",
+                "demand_metadata_misses",
+            ),
+            ArcClass::PrefetchData => (
+                "prefetch_data_hits",
+                "prefetch_data_iohits",
+                "prefetch_data_misses",
+            ),
+            ArcClass::PrefetchMetadata => (
+                "prefetch_metadata_hits",
+                "prefetch_metadata_iohits",
+                "prefetch_metadata_misses",
+            ),
+        }
+    }
+}
+
 /**
 `hits / (hits + iohits + misses)` for an access class, summing only the
 fields that exist (2.1 has no `iohits`, so it reduces to `hits/(hits+miss)`).
@@ -253,19 +317,25 @@ Returns `None` when there were no accesses at all (avoids 0/0).
 */
 pub fn hit_ratio(arc: &Kstat, class: ArcClass) -> Option<f64> {
     let total = accesses(arc, class);
-    (total > 0).then(|| arc.u(&format!("{class}hits")) as f64 / total as f64)
+    let (hits, _, _) = class.counters();
+    (total > 0).then(|| arc.u(hits) as f64 / total as f64)
 }
 
 /// Total accesses for a class (`hits + iohits + misses`).
 pub fn accesses(arc: &Kstat, class: ArcClass) -> u64 {
-    ["hits", "iohits", "misses"].iter().map(|c| arc.u(&format!("{class}{c}"))).sum()
+    let (hits, iohits, misses) = class.counters();
+    arc.u(hits) + arc.u(iohits) + arc.u(misses)
 }
 
 /// DMU (file-level) prefetch stream hit ratio, from zfetchstats
-/// (`hits/(hits+misses)`); `None` if the prefetcher has seen no streams.
+/// (`hits / (hits + misses + future + stride + past)`); `None` if the prefetcher
+/// has seen no streams. On 2.2.4+, `future`, `stride` and `past` are included
+/// in the total when present (matching `arc_summary`).
 pub fn dmu_prefetch_ratio(zfetch: &Kstat) -> Option<f64> {
-    let (h, m) = (zfetch.u("hits"), zfetch.u("misses"));
-    (h + m > 0).then(|| h as f64 / (h + m) as f64)
+    let hits = zfetch.u("hits");
+    let other = zfetch.u("misses") + zfetch.u("future") + zfetch.u("stride") + zfetch.u("past");
+    let total = hits + other;
+    (total > 0).then(|| hits as f64 / total as f64)
 }
 
 /// ARC health: the kernel sets `arc_no_grow` when it has stopped growing the
@@ -290,11 +360,18 @@ pub fn pool_dir(pool: &str) -> io::Result<PathBuf> {
     Ok(Path::new(KSTAT_DIR).join(pool))
 }
 
-/// Whether `name` could be a pool's: pool names begin with a letter and hold
+/// Whether `name` could be a pool's: pool names begin with a letter, use only
+/// alphanumeric or `-_. :` characters, are not reserved vdev keywords, and hold
 /// no `/` (which also rules out the transient `$import` of `zpool import`).
 #[cfg(target_os = "linux")]
 fn is_pool_name(name: &str) -> bool {
-    name.starts_with(|c: char| c.is_ascii_alphabetic()) && !name.contains('/')
+    let valid_chars = name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'));
+    let reserved = name == "log"
+        || ["mirror", "raidz", "draid", "spare"].iter().any(|kw| name.starts_with(kw));
+    valid_chars && !reserved
 }
 
 /**
@@ -572,7 +649,7 @@ Objset `objset`'s kstat in pool `pool`: the cheap re-read once
 #[cfg(target_os = "linux")]
 pub fn read_objset_kstat(pool: &str, objset: u64) -> io::Result<ObjsetKstat> {
     let path = pool_dir(pool)?.join(format!("{OBJSET_PREFIX}{objset:x}"));
-    let text = fs::read_to_string(&path)?;
+    let text = read_proc_lossy(&path, 4 * 1024)?;
     ObjsetKstat::parse(objset, &text).ok_or_else(|| {
         let msg = format!("{}: no dataset_name", path.display());
         io::Error::new(io::ErrorKind::InvalidData, msg)
@@ -698,7 +775,7 @@ impl TxAssignHistogram {
 /// Pool `pool`'s tx-assign delay histogram.
 #[cfg(target_os = "linux")]
 pub fn read_tx_assign(pool: &str) -> io::Result<TxAssignHistogram> {
-    let text = fs::read_to_string(pool_dir(pool)?.join("dmu_tx_assign"))?;
+    let text = read_proc_lossy(pool_dir(pool)?.join("dmu_tx_assign"), 4 * 1024)?;
     Ok(TxAssignHistogram::parse(&text))
 }
 
@@ -764,7 +841,7 @@ pub fn parse_import_progress(text: &str) -> Vec<ImportProgress> {
 /// The pool loads in progress on this host ([`parse_import_progress`]).
 #[cfg(target_os = "linux")]
 pub fn read_import_progress() -> io::Result<Vec<ImportProgress>> {
-    Ok(parse_import_progress(&fs::read_to_string(IMPORT_PROGRESS_PATH)?))
+    Ok(parse_import_progress(&read_proc_lossy(IMPORT_PROGRESS_PATH, 4 * 1024)?))
 }
 
 /**
@@ -793,13 +870,14 @@ pub fn parse_dbgmsg(text: &str) -> Vec<DbgMsg> {
     let mut out: Vec<DbgMsg> = Vec::new();
     for line in text.lines().skip(1) {
         let (first, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        match (first.parse::<u64>(), out.last_mut()) {
-            (Ok(time), _) => out.push(DbgMsg { time, message: rest.trim_start().to_string() }),
-            (Err(_), Some(last)) => {
+        let min_ts = out.first().map_or(1, |m| m.time.min(1_000_000_000));
+        match (first.parse::<u64>().ok().filter(|&t| t >= min_ts), out.last_mut()) {
+            (Some(time), _) => out.push(DbgMsg { time, message: rest.trim_start().to_string() }),
+            (None, Some(last)) => {
                 last.message.push('\n');
                 last.message.push_str(line);
             }
-            (Err(_), None) => {}
+            (None, None) => {}
         }
     }
     out
@@ -809,7 +887,7 @@ pub fn parse_dbgmsg(text: &str) -> Vec<DbgMsg> {
 /// unless root.
 #[cfg(target_os = "linux")]
 pub fn read_dbgmsg() -> io::Result<Vec<DbgMsg>> {
-    Ok(parse_dbgmsg(&fs::read_to_string(DBGMSG_PATH)?))
+    Ok(parse_dbgmsg(&read_proc_lossy(DBGMSG_PATH, 64 * 1024)?))
 }
 
 /* ================================ tests ================================== */
@@ -866,6 +944,18 @@ mod tests {
         assert_eq!(pct(dmu_prefetch_ratio(&Kstat::parse(ZF_21)).unwrap()), 73.6);
         assert_eq!(pct(dmu_prefetch_ratio(&Kstat::parse(ZF_22)).unwrap()), 6.4);
 
+        // 2.2.4+ zfetchstats with future, stride, and past
+        let zf_modern: Kstat = [
+            ("hits", 50),
+            ("misses", 20),
+            ("future", 10),
+            ("stride", 10),
+            ("past", 10),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(pct(dmu_prefetch_ratio(&zf_modern).unwrap()), 50.0);
+
         // health: 2.1 was THROTTLED (arc_no_grow=1), 2.2 HEALTHY
         assert!(is_throttled(&k21));
         assert!(!is_throttled(&k22));
@@ -898,6 +988,9 @@ mod tests {
         // a name with a space, and a string value with spaces
         let bucket = spl_line("1024 ns", 4, "17");
         assert_eq!(named_line(&bucket), Some(("1024 ns", 4, "17")));
+        // a name whose second token is a valid u8 (0..=255) still splits at column 32
+        let small_bucket = spl_line("stage 4 count", 4, "99");
+        assert_eq!(named_line(&small_bucket), Some(("stage 4 count", 4, "99")));
         let name = spl_line("dataset_name", 7, "tank/my data ");
         assert_eq!(named_line(&name), Some(("dataset_name", 7, "tank/my data ")));
         // a name longer than the padded column runs on
@@ -907,9 +1000,14 @@ mod tests {
         assert_eq!(named_line("memory_available_bytes 3 -2147483648"),
                    Some(("memory_available_bytes", 3, "-2147483648")));
         assert_eq!(named_line("dataset_name 7 tank/x y"), Some(("dataset_name", 7, "tank/x y")));
-        // a CHAR value is padded; parse trims it
-        let k = Kstat::parse(&format!("hdr\nname type data\n{}\n", spl_line("c", 0, "abc   ")));
+        // a CHAR value is padded; parse trims it, and u64 values > i64::MAX saturate
+        let k = Kstat::parse(&format!(
+            "hdr\nname type data\n{}\n{}\n",
+            spl_line("c", 0, "abc   "),
+            spl_line("sentinel", 4, &u64::MAX.to_string()),
+        ));
         assert_eq!(k.str("c"), Some("abc"));
+        assert_eq!(k.u("sentinel"), i64::MAX as u64);
         // the column header is no field (parse skips both header lines anyway)
         assert_eq!(named_line("name                            type data"), None);
         assert_eq!(named_line("short"), None);
@@ -1060,7 +1158,10 @@ mod tests {
     #[test]
     fn pool_dir_stays_inside_the_kstat_tree() {
         assert_eq!(pool_dir("tank").unwrap(), Path::new("/proc/spl/kstat/zfs/tank"));
-        for bad in ["", "..", ".", "a/../b", "9pool", "/etc"] {
+        for bad in [
+            "", "..", ".", "a/../b", "9pool", "/etc", "mirror", "raidz1", "draid2", "spare",
+            "log", "bad$pool", "bad pool",
+        ] {
             assert!(pool_dir(bad).is_err(), "{bad:?}");
         }
     }
@@ -1117,12 +1218,16 @@ mod tests {
                     1696000000   spa.c:6624:spa_import(): spa_import: importing tank\n\
                     1696000001   a message with\n\
                     a second line\n\
+                    42 vdevs scanned on continuation line\n\
                     1696000002   \n";
         let msgs = parse_dbgmsg(text);
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].time, 1696000000);
         assert_eq!(msgs[0].message, "spa.c:6624:spa_import(): spa_import: importing tank");
-        assert_eq!(msgs[1].message, "a message with\na second line");
+        assert_eq!(
+            msgs[1].message,
+            "a message with\na second line\n42 vdevs scanned on continuation line"
+        );
         assert_eq!(msgs[2].message, "");
         assert!(parse_dbgmsg("timestamp    message \n").is_empty());
     }
