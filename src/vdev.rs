@@ -11,9 +11,9 @@ device or a hot spare. The role is what tells a SLOG from a data disk; the
 config spreads it over `is_log` and `alloc_bias` on the top-level vdev, and
 the root's separate `l2cache` and `spares` arrays.
 
-Each [`VdevEntry`] borrows the vdev's own config nvlist, so the stat
-decoders ([`crate::stats::VdevStats::from_vdev`] and the rest) apply to it
-directly.
+Each [`VdevEntry`] borrows the vdev's own config nvlist. [`VdevEntry::stats`]
+decodes its stats with tree-position information (including whether
+fragmentation is available); the other stat decoders apply to its config.
 */
 
 use crate::enums::{AllocBias, VdevType};
@@ -161,14 +161,17 @@ impl<'a> VdevEntry<'a> {
     /**
     Decode this vdev's [`crate::stats::VdevStats`].
 
-    Fragmentation is reported as `None` for non-top-level vdevs (depth > 0 or
+    Fragmentation is reported only for concrete top-level vdevs (excluding
     auxiliary cache/spare devices), matching the behavior of `zpool list -v`
     and avoiding the misleading 0% figures the kernel places in `vs_fragmentation`
     for leaf and interior vdevs.
     */
     pub fn stats(&self) -> Option<crate::stats::VdevStats> {
         let mut s = crate::stats::VdevStats::from_vdev(self.config)?;
-        if self.depth > 0 || matches!(self.role, VdevRole::Spare | VdevRole::Cache) {
+        if self.depth > 0
+            || matches!(self.role, VdevRole::Spare | VdevRole::Cache)
+            || matches!(self.vdev_type(), Some(VdevType::Root | VdevType::Hole | VdevType::Missing | VdevType::Indirect))
+        {
             s.fragmentation = None;
         }
         Some(s)
@@ -347,5 +350,18 @@ mod tests {
         assert_eq!(entries[0].stats().unwrap().fragmentation, Some(42));
         // leaf disk has fragmentation masked to None
         assert_eq!(entries[1].stats().unwrap().fragmentation, None);
+    }
+
+    #[test]
+    fn fragmentation_is_available_only_for_concrete_top_level_vdevs() {
+        let stats = |mut nv: NvList| {
+            nv.push("vdev_stats", NvData::Uint64Array(vec![0; 47]));
+            nv
+        };
+        let mut root = vdev("root", Some(0), vec![stats(disk("/dev/a")), stats(vdev("hole", Some(1), vec![]))]);
+        root.push("l2cache", NvData::ListArray(vec![stats(disk("/dev/cache"))]));
+        root.push("spares", NvData::ListArray(vec![stats(disk("/dev/spare"))]));
+        let figures: Vec<_> = walk(&root).map(|v| v.stats().unwrap().fragmentation).collect();
+        assert_eq!(figures, [Some(0), None, None, None]);
     }
 }

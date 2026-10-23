@@ -24,9 +24,9 @@ const ZFS_SUPER_MAGIC: u64 = 0x2fc12fc1;
 /// The caller's mount table, in its own mount namespace.
 const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 /// The filesystem type of a ZFS mount in the mount table.
-const ZFS_FSTYPE: &str = "zfs";
+const ZFS_FSTYPE: &[u8] = b"zfs";
 /// Ends a mount table line's optional fields; the filesystem type follows.
-const OPTIONAL_FIELDS_END: &str = "-";
+const OPTIONAL_FIELDS_END: &[u8] = b"-";
 /// A mount table escape: a backslash and three octal digits.
 const ESCAPE_LEN: usize = 4;
 
@@ -73,10 +73,7 @@ pub fn dataset_of(path: impl AsRef<Path>) -> io::Result<Option<ZfsMount>> {
         let mut file = fs::File::open(MOUNTINFO_PATH)?;
         let mut buf = Vec::with_capacity(8 * 1024);
         file.read_to_end(&mut buf)?;
-        match String::from_utf8(buf) {
-            Ok(s) => s,
-            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-        }
+        buf
     };
     match find_mount(&mountinfo, (libc::major(dev), libc::minor(dev)), &real) {
         Some(mount) => Ok(Some(mount)),
@@ -106,11 +103,11 @@ fn is_zfs(path: &Path) -> io::Result<bool> {
 /// The fields of a mount table line that [`find_mount`] needs.
 struct MountLine<'a> {
     /// `major:minor`, the `st_dev` of files on the mount.
-    dev: &'a str,
-    root: &'a str,
-    mount_point: &'a str,
-    fstype: &'a str,
-    source: &'a str,
+    dev: &'a [u8],
+    root: &'a [u8],
+    mount_point: &'a [u8],
+    fstype: &'a [u8],
+    source: &'a [u8],
 }
 
 /**
@@ -118,8 +115,8 @@ A `mountinfo` line: `id parent major:minor root mount-point options
 [optional fields…] - fstype source super-options`, space-separated, with
 spaces and the like inside a field escaped in octal.
 */
-fn parse_line(line: &str) -> Option<MountLine<'_>> {
-    let mut fields = line.split(' ');
+fn parse_line(line: &[u8]) -> Option<MountLine<'_>> {
+    let mut fields = line.split(|&b| b == b' ');
     let (_id, _parent) = (fields.next()?, fields.next()?);
     let (dev, root, mount_point) = (fields.next()?, fields.next()?, fields.next()?);
     let mut tail = fields.skip_while(|&f| f != OPTIONAL_FIELDS_END).skip(1);
@@ -133,17 +130,18 @@ filesystem on device `dev`. When it is mounted more than once (bind mounts),
 the mount whose mount point holds `path` wins, the deepest such one, and of
 two at the same point the later, which covers the earlier.
 */
-fn find_mount(mountinfo: &str, dev: (u32, u32), path: &Path) -> Option<ZfsMount> {
+fn find_mount(mountinfo: &[u8], dev: (u32, u32), path: &Path) -> Option<ZfsMount> {
     let dev = format!("{}:{}", dev.0, dev.1);
     let (line, mount_point) = mountinfo
-        .lines()
+        .split(|&b| b == b'\n')
         .filter_map(parse_line)
-        .filter(|m| m.dev == dev && m.fstype == ZFS_FSTYPE)
+        .filter(|m| m.dev == dev.as_bytes() && m.fstype == ZFS_FSTYPE)
         .map(|m| {
             let mp = unescape_path(m.mount_point);
             (m, mp)
         })
-        .max_by_key(|(_, mp)| (path.starts_with(mp), mp.as_os_str().len()))?;
+        .filter(|(_, mp)| path.starts_with(mp))
+        .max_by_key(|(_, mp)| mp.as_os_str().len())?;
     Some(ZfsMount {
         dataset: String::from_utf8_lossy(&unescape(line.source)).into_owned(),
         mount_point,
@@ -151,14 +149,13 @@ fn find_mount(mountinfo: &str, dev: (u32, u32), path: &Path) -> Option<ZfsMount>
     })
 }
 
-fn unescape_path(field: &str) -> PathBuf {
+fn unescape_path(field: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(unescape(field)))
 }
 
 /// A mount table field with its octal escapes (`\040` for a space, `\134`
 /// for a backslash) undone.
-fn unescape(field: &str) -> Vec<u8> {
-    let bytes = field.as_bytes();
+fn unescape(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -187,13 +184,14 @@ fn unescape(field: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     /**
     The root on ext4, `tank/data` mounted twice (and a subdirectory of it
     bind-mounted at /srv/www), an automounted snapshot, and a dataset whose
     name and mount point hold a space.
     */
-    const MOUNTINFO: &str = "\
+    const MOUNTINFO: &[u8] = b"\
 22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
 40 22 0:51 / /tank/data rw,noatime shared:20 - zfs tank/data rw,xattr,posixacl
 41 22 0:51 /www /srv/www rw,noatime shared:20 - zfs tank/data rw,xattr,posixacl
@@ -221,14 +219,14 @@ mod tests {
 
     #[test]
     fn escapes_and_short_lines() {
-        assert_eq!(unescape(r"a\040b\134c"), b"a b\\c");
+        assert_eq!(unescape(br"a\040b\134c"), b"a b\\c");
         // not an escape: too short, not octal, or past a byte
-        assert_eq!(unescape(r"x\04"), br"x\04");
-        assert_eq!(unescape(r"\08x"), br"\08x");
-        assert_eq!(unescape(r"\+12"), br"\+12");
-        assert_eq!(unescape(r"\777"), br"\777");
-        assert!(parse_line("1 2 0:1 / /x rw shared:1").is_none());
-        assert!(parse_line("").is_none());
+        assert_eq!(unescape(br"x\04"), br"x\04");
+        assert_eq!(unescape(br"\08x"), br"\08x");
+        assert_eq!(unescape(br"\+12"), br"\+12");
+        assert_eq!(unescape(br"\777"), br"\777");
+        assert!(parse_line(b"1 2 0:1 / /x rw shared:1").is_none());
+        assert!(parse_line(b"").is_none());
     }
 
     #[test]
@@ -239,9 +237,17 @@ mod tests {
 
     #[test]
     fn non_utf8_mount_info_resilience() {
-        // Line with invalid UTF-8 octal escape \377 (0xFF) in source and path
-        let info = "50 22 0:70 / /mnt/bad_\\377 rw - zfs tank/bad_\\377 rw\n";
-        let m = find_mount(info, (0, 70), Path::new("/mnt/bad_\u{FFFD}")).unwrap();
-        assert!(m.dataset.contains("tank/bad_"));
+        // mountinfo escapes whitespace, but emits other non-UTF-8 bytes raw.
+        let info = b"50 22 0:70 / /mnt/bad_\xff rw - zfs tank/data rw\n\
+51 22 0:70 /sub_\xfe /srv/bind_\xff rw - zfs tank/data rw\n\
+52 22 0:71 / /other_\xff rw - tmpfs tmpfs rw\n";
+        let path = Path::new(OsStr::from_bytes(b"/srv/bind_\xff/file"));
+        let m = find_mount(info, (0, 70), path).unwrap();
+        assert_eq!(m.dataset, "tank/data");
+        assert_eq!(m.mount_point.as_os_str().as_bytes(), b"/srv/bind_\xff");
+        assert_eq!(m.root.as_os_str().as_bytes(), b"/sub_\xfe");
+        let raw_path = Path::new(OsStr::from_bytes(b"/mnt/bad_\xff/file"));
+        assert_eq!(find_mount(info, (0, 70), raw_path).unwrap().root, Path::new("/"));
+        assert!(find_mount(info, (0, 70), Path::new("/unrelated")).is_none());
     }
 }

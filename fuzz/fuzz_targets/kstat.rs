@@ -16,7 +16,8 @@ as `q` rises; the debug log has no more entries than lines.
 
 use libfuzzer_sys::fuzz_target;
 use zfsdev::kstat::{
-    Kstat, ObjsetKstat, TxAssignHistogram, parse_dbgmsg, parse_import_progress, parse_txgs,
+    ArcClass, Kstat, ObjsetKstat, TxAssignHistogram, accesses, dmu_prefetch_ratio, hit_ratio,
+    parse_dbgmsg, parse_import_progress, parse_txgs,
 };
 
 /// The quantiles checked for order, ascending.
@@ -28,6 +29,15 @@ fuzz_target!(|data: &[u8]| {
     let k = Kstat::parse(&text);
     for (name, _) in k.iter() {
         let _ = (k.get(name), k.u(name), k.has(name));
+    }
+    for class in [ArcClass::All, ArcClass::DemandData, ArcClass::DemandMetadata, ArcClass::PrefetchData, ArcClass::PrefetchMetadata] {
+        let _ = accesses(&k, class);
+        if let Some(ratio) = hit_ratio(&k, class) {
+            assert!((0.0..=1.0).contains(&ratio), "ARC ratio out of bounds");
+        }
+    }
+    if let Some(ratio) = dmu_prefetch_ratio(&k) {
+        assert!((0.0..=1.0).contains(&ratio), "prefetch ratio out of bounds");
     }
     let _ = ObjsetKstat::parse(1, &text);
 

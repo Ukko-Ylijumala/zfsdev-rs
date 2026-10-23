@@ -237,8 +237,9 @@ pub struct VdevStats {
     pub scan_removing: bool,
     /// Bytes this vdev has resilvered/scrubbed in the current scan.
     pub scan_processed: u64,
-    /// Percent; None when the kernel has no figure (ZFS_FRAG_INVALID — e.g.
-    /// a leaf or interior vdev).
+    /// Raw kernel percentage; None for ZFS_FRAG_INVALID. The kernel leaves
+    /// this as 0 below the top level. Use [`crate::vdev::VdevEntry::stats`]
+    /// to mask those unavailable figures using the vdev's tree position.
     pub fragmentation: Option<u64>,
     pub initialize: LeafOpProgress<VdevInitializeState>,
     pub checkpoint_space: u64,
@@ -262,7 +263,10 @@ pub struct VdevStats {
 }
 
 impl VdevStats {
-    /// The stats of a vdev config nvlist (any vdev of a POOL_STATS tree).
+    /// Raw stats of a vdev config nvlist (any vdev of a POOL_STATS tree).
+    /// Without its tree position this cannot distinguish an unavailable
+    /// fragmentation figure from a measured 0%; prefer
+    /// [`crate::vdev::VdevEntry::stats`] when walking a tree.
     pub fn from_vdev(vdev: &NvList) -> Option<VdevStats> {
         vdev.get_u64_array(VDEV_STATS_KEY).and_then(VdevStats::decode)
     }

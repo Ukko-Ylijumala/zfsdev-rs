@@ -114,7 +114,8 @@ pub struct Kstat {
 impl Kstat {
     /**
     Parse a named kstat's text. The two header lines are skipped; a numeric
-    field whose value doesn't parse as an `i64` is ignored (forward-compat).
+    field whose value doesn't parse as an integer is ignored (forward-compat).
+    Unsigned values above `i64::MAX` saturate there, preserving field presence.
     String fields are kept apart, for [`Kstat::str`].
     */
     pub fn parse(text: &str) -> Self {
@@ -316,15 +317,19 @@ fields that exist (2.1 has no `iohits`, so it reduces to `hits/(hits+miss)`).
 Returns `None` when there were no accesses at all (avoids 0/0).
 */
 pub fn hit_ratio(arc: &Kstat, class: ArcClass) -> Option<f64> {
-    let total = accesses(arc, class);
+    let total = arc_accesses(arc, class);
     let (hits, _, _) = class.counters();
     (total > 0).then(|| arc.u(hits) as f64 / total as f64)
 }
 
-/// Total accesses for a class (`hits + iohits + misses`).
-pub fn accesses(arc: &Kstat, class: ArcClass) -> u64 {
+fn arc_accesses(arc: &Kstat, class: ArcClass) -> u128 {
     let (hits, iohits, misses) = class.counters();
-    arc.u(hits) + arc.u(iohits) + arc.u(misses)
+    [hits, iohits, misses].into_iter().map(|name| u128::from(arc.u(name))).sum()
+}
+
+/// Total accesses for a class (`hits + iohits + misses`), saturated at `u64::MAX`.
+pub fn accesses(arc: &Kstat, class: ArcClass) -> u64 {
+    arc_accesses(arc, class).min(u128::from(u64::MAX)) as u64
 }
 
 /// DMU (file-level) prefetch stream hit ratio, from zfetchstats
@@ -333,8 +338,10 @@ pub fn accesses(arc: &Kstat, class: ArcClass) -> u64 {
 /// in the total when present (matching `arc_summary`).
 pub fn dmu_prefetch_ratio(zfetch: &Kstat) -> Option<f64> {
     let hits = zfetch.u("hits");
-    let other = zfetch.u("misses") + zfetch.u("future") + zfetch.u("stride") + zfetch.u("past");
-    let total = hits + other;
+    let total: u128 = ["hits", "misses", "future", "stride", "past"]
+        .into_iter()
+        .map(|name| u128::from(zfetch.u(name)))
+        .sum();
     (total > 0).then(|| hits as f64 / total as f64)
 }
 
@@ -361,16 +368,18 @@ pub fn pool_dir(pool: &str) -> io::Result<PathBuf> {
 }
 
 /// Whether `name` could be a pool's: pool names begin with a letter, use only
-/// alphanumeric or `-_. :` characters, are not reserved vdev keywords, and hold
-/// no `/` (which also rules out the transient `$import` of `zpool import`).
+/// alphanumeric or `-_.:` characters, and are not exactly `mirror`, `raidz`
+/// or `draid` (`pool_namecheck`). Creation/import has stricter prefix rules;
+/// readers must still accept legacy pools such as `mirrorpool` and `spare`.
 #[cfg(target_os = "linux")]
 fn is_pool_name(name: &str) -> bool {
     let valid_chars = name.starts_with(|c: char| c.is_ascii_alphabetic())
+        // pool_namecheck reserves room for /$ORIGIN@$ORIGIN in a 256-byte name.
+        && name.len() < 240
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'));
-    let reserved = name == "log"
-        || ["mirror", "raidz", "draid", "spare"].iter().any(|kw| name.starts_with(kw));
+    let reserved = matches!(name, "mirror" | "raidz" | "draid");
     valid_chars && !reserved
 }
 
@@ -869,10 +878,18 @@ doesn't start with a timestamp continues the message before it.
 pub fn parse_dbgmsg(text: &str) -> Vec<DbgMsg> {
     let mut out: Vec<DbgMsg> = Vec::new();
     for line in text.lines().skip(1) {
-        let (first, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        let min_ts = out.first().map_or(1, |m| m.time.min(1_000_000_000));
-        match (first.parse::<u64>().ok().filter(|&t| t >= min_ts), out.last_mut()) {
-            (Some(time), _) => out.push(DbgMsg { time, message: rest.trim_start().to_string() }),
+        // zfs_dbgmsg_show prints "%-12llu %s". Remove exactly that padding,
+        // preserving the message's own indentation. A number in a multiline
+        // message is not an entry unless it also has a plausible Unix time
+        // and the kernel's column layout.
+        let entry = line.find(' ').and_then(|end| {
+            let time = line[..end].parse::<u64>().ok().filter(|&t| t >= 1_000_000_000)?;
+            let start = end.max(12) + 1;
+            let padding = line.get(end..start)?;
+            padding.bytes().all(|b| b == b' ').then(|| (time, &line[start..]))
+        });
+        match (entry, out.last_mut()) {
+            (Some((time, message)), _) => out.push(DbgMsg { time, message: message.to_string() }),
             (None, Some(last)) => {
                 last.message.push('\n');
                 last.message.push_str(line);
@@ -967,6 +984,20 @@ mod tests {
         assert!(hit_ratio(&empty, ArcClass::All).is_none());
         assert!(dmu_prefetch_ratio(&empty).is_none());
         assert_eq!(accesses(&empty, ArcClass::All), 0);
+    }
+
+    #[test]
+    fn ratios_do_not_overflow_large_counters() {
+        let text = format!(
+            "header\nname type data\nhits 4 {0}\niohits 4 {0}\nmisses 4 {0}\nfuture 4 {0}\nstride 4 {0}\npast 4 {0}\n",
+            u64::MAX
+        );
+        let k = Kstat::parse(&text);
+        assert!(k.has("hits"));
+        assert_eq!(k.get("hits"), Some(i64::MAX));
+        assert_eq!(accesses(&k, ArcClass::All), u64::MAX);
+        assert_eq!(hit_ratio(&k, ArcClass::All), Some(1.0 / 3.0));
+        assert_eq!(dmu_prefetch_ratio(&k), Some(0.2));
     }
 
     #[test]
@@ -1159,11 +1190,16 @@ mod tests {
     fn pool_dir_stays_inside_the_kstat_tree() {
         assert_eq!(pool_dir("tank").unwrap(), Path::new("/proc/spl/kstat/zfs/tank"));
         for bad in [
-            "", "..", ".", "a/../b", "9pool", "/etc", "mirror", "raidz1", "draid2", "spare",
-            "log", "bad$pool", "bad pool",
+            "", "..", ".", "a/../b", "9pool", "/etc", "mirror", "raidz", "draid",
+            "bad$pool", "bad pool",
         ] {
             assert!(pool_dir(bad).is_err(), "{bad:?}");
         }
+        for legacy in ["mirrorpool", "raidz1", "draid2", "spare", "log"] {
+            assert!(pool_dir(legacy).is_ok(), "{legacy:?}");
+        }
+        assert!(pool_dir(&"a".repeat(239)).is_ok());
+        assert!(pool_dir(&"a".repeat(240)).is_err());
     }
 
     /**
@@ -1175,7 +1211,7 @@ mod tests {
     #[test]
     fn pool_names_are_the_dirs_with_a_state() {
         let dir = std::env::temp_dir().join(format!("zfsdev-pool-names-{}", std::process::id()));
-        for pool in ["tank", "rpool", "$import"] {
+        for pool in ["tank", "rpool", "mirrorpool", "spare", "$import"] {
             fs::create_dir_all(dir.join(pool)).unwrap();
             fs::write(dir.join(pool).join("state"), "ONLINE\n").unwrap();
         }
@@ -1183,7 +1219,7 @@ mod tests {
         fs::write(dir.join("arcstats"), ARC_22).unwrap();
         let names = pool_names_in(&dir);
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(names.unwrap(), ["rpool", "tank"]);
+        assert_eq!(names.unwrap(), ["mirrorpool", "rpool", "spare", "tank"]);
     }
 
     /// Both table eras, as spa_import_progress_show prints them: the 2.4 one
@@ -1230,5 +1266,22 @@ mod tests {
         );
         assert_eq!(msgs[2].message, "");
         assert!(parse_dbgmsg("timestamp    message \n").is_empty());
+    }
+
+    #[test]
+    fn dbgmsg_keeps_indentation_and_numeric_continuations() {
+        let text = concat!(
+            "timestamp    message\n",
+            "42            not a timestamp\n",
+            "1696000000     mirror-0\n",
+            "    child disk\n",
+            "1696000001 one space is not the timestamp column\n",
+            "12345 continuation\n",
+            "1696000002   next entry\n",
+        );
+        let msgs = parse_dbgmsg(text);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].message, "  mirror-0\n    child disk\n1696000001 one space is not the timestamp column\n12345 continuation");
+        assert_eq!(msgs[1].message, "next entry");
     }
 }
