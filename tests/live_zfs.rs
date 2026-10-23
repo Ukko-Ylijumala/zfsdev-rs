@@ -331,12 +331,10 @@ fn read_batch_ioctls() {
     assert!(zpl.get_u64("version").is_some(), "ZPL props missing version");
     eprintln!("{pool}: ZPL version {:?}", zpl.get_u64("version"));
 
-    // OBJSET_RECVD_PROPS: valid nvlist (often empty) when supported; old-format
-    // pools predating SPA_VERSION_RECVD_PROPS return EOPNOTSUPP, which is fine.
-    match zfs.objset_recvd_props(&pool) {
-        Ok(recvd) => eprintln!("{pool}: {} received props", recvd.pairs.len()),
-        Err(e) => eprintln!("{pool}: recvd props unsupported: {e}"),
-    }
+    // OBJSET_RECVD_PROPS maps ENOTSUP to an empty list for datasets that
+    // have never received properties (including on modern pools).
+    let recvd = zfs.objset_recvd_props(&pool).expect("ZFS_IOC_OBJSET_RECVD_PROPS");
+    eprintln!("{pool}: {} received props", recvd.pairs.len());
 
     // GET_BOOKMARKS: new-style read with a packed innvl; valid nvlist.
     let bms = zfs.get_bookmarks(&pool).expect("ZFS_IOC_GET_BOOKMARKS");

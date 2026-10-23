@@ -264,7 +264,7 @@ pub enum ZfsError {
     #[error("cannot open {ZFS_DEV}: {0}")]
     Open(io::Error),
     /// A read (GET/LIST) ioctl failed; `name` is the pool/dataset it targeted.
-    #[error("zfs ioctl {ioc} ({name}): {err}")]
+    #[error("zfs ioctl {ioc} ({name}): {}", errno_message(.err))]
     Ioctl { ioc: Ioc, name: String, err: io::Error },
     /**
     A mutating ioctl the handle refused without issuing it: the loaded module
@@ -278,7 +278,7 @@ pub enum ZfsError {
     elements that failed (snapshots, holds, vdevs, …) with their own errno;
     Display adds a hint for the common errnos and the first few elements.
     */
-    #[error("{op}: {err}{}{}", errno_hint(*.op, .err), elements_suffix(.elements))]
+    #[error("{op}: {}{}{}", errno_message(.err), errno_hint(*.op, .err), elements_suffix(.elements))]
     Write { op: WriteOp, err: io::Error, elements: Vec<ElementError> },
     #[error("decoding nvlist from kernel: {0}")]
     Nv(#[from] NvError),
@@ -448,6 +448,14 @@ fn elements_suffix(elements: &[ElementError]) -> String {
     format!(" — {}", items.join("; "))
 }
 
+/// strerror does not know OpenZFS's private errno range.
+fn errno_message(err: &io::Error) -> String {
+    match err.raw_os_error().and_then(ZfsErrno::from_repr) {
+        Some(zerr) => format!("{zerr} (os error {})", zerr as i32),
+        None => err.to_string(),
+    }
+}
+
 /**
 A human hint for the errnos write ioctls commonly return. `op` disambiguates
 the few errnos whose meaning depends on the operation: LOAD_KEY reports a
@@ -456,9 +464,6 @@ would otherwise read as a permission problem (that is EPERM), and a scrub
 start on a busy pool is EBUSY because a scan is already running.
 */
 fn errno_hint(op: WriteOp, err: &io::Error) -> String {
-    if let Some(zerr) = err.raw_os_error().and_then(ZfsErrno::from_repr) {
-        return format!(" ({zerr})");
-    }
     match (op, err.raw_os_error()) {
         (WriteOp::LoadKey, Some(libc::EACCES)) => " (wrong key or passphrase)".into(),
         (WriteOp::Scrub, Some(libc::EBUSY)) => " (a scrub or resilver is already running)".into(),
@@ -1418,7 +1423,7 @@ impl ZfsHandle {
                     // remember a big reply (+1/8 headroom for growth) so the
                     // next one fits first time
                     if len + len / 8 > self.dst_hint.get() {
-                        self.dst_hint.set(len + len / 8);
+                        self.dst_hint.set((len + len / 8).min(DST_MAX));
                     }
                     return Ok(NvList::unpack(&dst[..len])?);
                 }
@@ -1448,11 +1453,13 @@ impl ZfsHandle {
     }
 
     /// Detailed config for one pool, including the vdev tree with stats
-    /// (ZFS_IOC_POOL_STATS).
+    /// (ZFS_IOC_POOL_STATS). An unavailable pool's errno is returned even
+    /// when the kernel supplies a partial config alongside it.
     pub fn pool_stats(&self, pool: &str) -> Result<NvList> {
         let mut zc = self.cmd();
         zc.set_name(pool)?;
-        self.ioctl_nv(Ioc::PoolStats, &mut zc)
+        let config = self.ioctl_nv(Ioc::PoolStats, &mut zc)?;
+        pool_stats_result(pool, zc.zc_cookie, config)
     }
 
     /// Pool properties (ZFS_IOC_POOL_GET_PROPS).
@@ -1579,7 +1586,8 @@ impl ZfsHandle {
     /**
     Vdev properties (ZFS_IOC_VDEV_GET_PROPS) for the vdev `guid` within `pool`,
     keyed by prop name → `{value, source}`. Vdev props are an OpenZFS 2.2+
-    feature; older kernels reject the unknown ioctl with EINVAL.
+    feature; older kernels reject the unknown ioctl with
+    [`ZfsErrno::IocCmdUnavail`] (1029).
 
     The input nvlist names the target vdev by guid (`ZPOOL_VDEV_PROPS_GET_VDEV`)
     and the properties to fetch (`ZPOOL_VDEV_PROPS_GET_PROPS`, an nvlist whose
@@ -2114,6 +2122,19 @@ fn check_element_errors(op: WriteOp, out: NvList) -> Result<NvList> {
     Ok(out)
 }
 
+/// POOL_STATS can return a partial config with a successful ioctl while
+/// preserving spa_get_stats's actual error in zc_cookie.
+fn pool_stats_result(pool: &str, errno: u64, config: NvList) -> Result<NvList> {
+    if errno != 0 {
+        return Err(ZfsError::Ioctl {
+            ioc: Ioc::PoolStats,
+            name: pool.to_string(),
+            err: io::Error::from_raw_os_error(errno as i32),
+        });
+    }
+    Ok(config)
+}
+
 /* ================================= writes ================================= */
 
 #[cfg(feature = "write")]
@@ -2560,29 +2581,16 @@ fn validate_pool_props_set(props: &NvList) -> Result<()> {
     }
     for p in &props.pairs {
         let name = p.name.as_str();
-        if !crate::props::is_editable(name) {
-            return Err(ZfsError::Invalid(format!("pool_set_props: '{name}' is read-only")));
-        }
+        // Use a pool-specific allowlist below: dataset properties share
+        // names such as "version" but have different editability rules.
         if name.contains(':') {
             let Some((ns, prop)) = name.split_once(':') else {
                 return Err(ZfsError::Invalid(format!("pool_set_props: invalid user property '{name}'")));
             };
-            if ns.is_empty() || prop.is_empty() || name.len() >= MAXNAMELEN {
+            if ns.is_empty() || prop.is_empty() || !valid_user_prop_name(name) {
                 return Err(ZfsError::Invalid(format!("pool_set_props: invalid user property '{name}'")));
             }
-            match &p.data {
-                NvData::Str(s) if s.len() < ZAP_MAXVALUELEN => {}
-                NvData::Str(_) => {
-                    return Err(ZfsError::Invalid(format!(
-                        "pool_set_props: value for '{name}' exceeds {ZAP_MAXVALUELEN} bytes"
-                    )));
-                }
-                _ => {
-                    return Err(ZfsError::Invalid(format!(
-                        "pool_set_props: user property '{name}' requires a string value"
-                    )));
-                }
-            }
+            validate_prop_string("pool_set_props", name, &p.data)?;
         } else if let Some(feat) = name.strip_prefix("feature@") {
             if feat.is_empty() {
                 return Err(ZfsError::Invalid("pool_set_props: empty feature name".into()));
@@ -2595,20 +2603,12 @@ fn validate_pool_props_set(props: &NvList) -> Result<()> {
                     )));
                 }
             }
-        } else if matches!(name, "comment" | "cachefile" | "bootfs" | "compatibility" | "altroot" | "tname") {
-            match &p.data {
-                NvData::Str(s) if s.len() < ZAP_MAXVALUELEN => {}
-                NvData::Str(_) => {
-                    return Err(ZfsError::Invalid(format!(
-                        "pool_set_props: value for '{name}' exceeds {ZAP_MAXVALUELEN} bytes"
-                    )));
-                }
-                _ => {
-                    return Err(ZfsError::Invalid(format!(
-                        "pool_set_props: '{name}' requires a string value"
-                    )));
-                }
-            }
+        } else if matches!(name, "altroot" | "readonly" | "tname") {
+            return Err(ZfsError::Invalid(format!(
+                "pool_set_props: '{name}' can only be set during creation or import"
+            )));
+        } else if matches!(name, "comment" | "cachefile" | "bootfs" | "compatibility") {
+            validate_prop_string("pool_set_props", name, &p.data)?;
         } else if matches!(
             name,
             "ashift"
@@ -2619,12 +2619,25 @@ fn validate_pool_props_set(props: &NvList) -> Result<()> {
                 | "failmode"
                 | "listsnapshots"
                 | "multihost"
-                | "readonly"
                 | "version"
                 | "dedupditto"
+                | "dedup_table_quota"
         ) {
             match &p.data {
-                NvData::Uint64(_) => {}
+                NvData::Uint64(v) => {
+                    let valid = match name {
+                        "ashift" => *v == 0 || (9..=16).contains(v),
+                        "failmode" => *v <= 2,
+                        "version" => (1..=28).contains(v),
+                        "dedupditto" | "dedup_table_quota" => true,
+                        _ => *v <= 1,
+                    };
+                    if !valid {
+                        return Err(ZfsError::Invalid(format!(
+                            "pool_set_props: invalid numeric value {v} for '{name}'"
+                        )));
+                    }
+                }
                 _ => {
                     return Err(ZfsError::Invalid(format!(
                         "pool_set_props: '{name}' requires a numeric (uint64) value"
@@ -2641,49 +2654,52 @@ fn validate_pool_props_set(props: &NvList) -> Result<()> {
 }
 
 #[cfg(feature = "write")]
+fn valid_user_prop_name(name: &str) -> bool {
+    // zprop_valid_char: user property names use lowercase ASCII only.
+    name.len() < MAXNAMELEN
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.:".contains(&b))
+}
+
+#[cfg(feature = "write")]
+fn validate_prop_string<'a>(op: &str, prop: &str, value: &'a NvData) -> Result<&'a str> {
+    let NvData::Str(s) = value else {
+        return Err(ZfsError::Invalid(format!("{op}: '{prop}' requires a string value")));
+    };
+    if s.len() >= ZAP_MAXVALUELEN || s.contains('\0') {
+        return Err(ZfsError::Invalid(format!(
+            "{op}: '{prop}' must be under {ZAP_MAXVALUELEN} bytes and contain no NUL"
+        )));
+    }
+    Ok(s)
+}
+
+#[cfg(feature = "write")]
 fn validate_vdev_prop_set(prop: &str, value: &NvData) -> Result<()> {
     if prop.contains(':') {
         let Some((ns, p)) = prop.split_once(':') else {
             return Err(ZfsError::Invalid(format!("vdev_set_props: invalid user property '{prop}'")));
         };
-        if ns.is_empty() || p.is_empty() || prop.len() >= MAXNAMELEN {
+        if ns.is_empty() || p.is_empty() || !valid_user_prop_name(prop) {
             return Err(ZfsError::Invalid(format!("vdev_set_props: invalid user property '{prop}'")));
         }
-        match value {
-            NvData::Str(s) if s.len() < ZAP_MAXVALUELEN => Ok(()),
-            NvData::Str(_) => Err(ZfsError::Invalid(format!(
-                "vdev_set_props: value for '{prop}' exceeds {ZAP_MAXVALUELEN} bytes"
-            ))),
-            _ => Err(ZfsError::Invalid(format!(
-                "vdev_set_props: user property '{prop}' requires a string value"
-            ))),
-        }
+        validate_prop_string("vdev_set_props", prop, value).map(|_| ())
     } else if prop == "comment" {
-        match value {
-            NvData::Str(s) if s.len() < ZAP_MAXVALUELEN => Ok(()),
-            NvData::Str(_) => Err(ZfsError::Invalid(format!(
-                "vdev_set_props: value for 'comment' exceeds {ZAP_MAXVALUELEN} bytes"
-            ))),
-            _ => Err(ZfsError::Invalid(
-                "vdev_set_props: 'comment' requires a string value".into(),
-            )),
-        }
+        validate_prop_string("vdev_set_props", prop, value).map(|_| ())
     } else if prop == "path" {
-        match value {
-            NvData::Str(s) if s.starts_with("/dev/") && s.len() < ZAP_MAXVALUELEN => Ok(()),
-            NvData::Str(_) => Err(ZfsError::Invalid(
-                "vdev_set_props: 'path' must start with '/dev/' and be under 8192 bytes".into(),
-            )),
-            _ => Err(ZfsError::Invalid(
-                "vdev_set_props: 'path' requires a string value".into(),
-            )),
+        let path = validate_prop_string("vdev_set_props", prop, value)?;
+        if path.starts_with("/dev/") {
+            Ok(())
+        } else {
+            Err(ZfsError::Invalid("vdev_set_props: 'path' must start with '/dev/'".into()))
         }
-    } else if prop == "failfast" {
+    } else if matches!(prop, "failfast" | "allocating" | "sit_out" | "autosit" | "slow_io_events") {
         match value {
-            NvData::Uint64(0..=2) => Ok(()),
-            _ => Err(ZfsError::Invalid(
-                "vdev_set_props: 'failfast' must be uint64 0, 1, or 2".into(),
-            )),
+            // On the verified 2.2–2.4 releases, failfast is a boolean too.
+            // The value 2 shown for allocating is a read-only N/A sentinel.
+            NvData::Uint64(0..=1) => Ok(()),
+            _ => Err(ZfsError::Invalid(format!(
+                "vdev_set_props: '{prop}' must be uint64 0 or 1"
+            ))),
         }
     } else if matches!(
         prop,
@@ -2693,10 +2709,6 @@ fn validate_vdev_prop_set(prop: &str, value: &NvData) -> Result<()> {
             | "io_t"
             | "slow_io_n"
             | "slow_io_t"
-            | "slow_io_events"
-            | "allocating"
-            | "sit_out"
-            | "autosit"
     ) {
         match value {
             NvData::Uint64(_) => Ok(()),
@@ -3093,17 +3105,46 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("invalid ioctl argument type"), "{msg}");
         assert!(msg.contains("type: invalid ioctl argument type (errno 1032)"), "{msg}");
+        assert!(!msg.contains("Unknown error"), "{msg}");
+
+        let read = ZfsError::Ioctl {
+            ioc: Ioc::VdevGetProps,
+            name: "tank".into(),
+            err: io::Error::from_raw_os_error(1029),
+        };
+        assert_eq!(read.zfs_errno(), Some(ZfsErrno::IocCmdUnavail));
+        assert_eq!(read.to_string(),
+            "zfs ioctl VDEV_GET_PROPS (tank): ioctl command not supported by kernel (os error 1029)");
+        let unknown = ZfsError::Ioctl {
+            ioc: Ioc::VdevGetProps,
+            name: "tank".into(),
+            err: io::Error::from_raw_os_error(9999),
+        };
+        assert_eq!(unknown.zfs_errno(), None);
+        assert!(unknown.to_string().contains("9999"));
+    }
+
+    #[test]
+    fn pool_stats_preserves_cookie_error_even_with_config() {
+        let mut config = NvList::new();
+        config.add_str("name", "tank");
+        assert_eq!(pool_stats_result("tank", 0, config.clone()).unwrap(), config);
+        let err = pool_stats_result("tank", libc::EIO as u64, config).unwrap_err();
+        assert_eq!(err.errno(), Some(libc::EIO));
+        assert!(matches!(err, ZfsError::Ioctl { ioc: Ioc::PoolStats, name, .. } if name == "tank"));
     }
 
     #[test]
     fn check_element_errors_converts_hold_release_enoent() {
-        let mut out = NvList::new();
-        out.push("tank/snap@tag", NvData::Int32(libc::ENOENT));
-        let res = check_element_errors(WriteOp::Hold, out);
-        assert!(matches!(res, Err(ZfsError::Write { op: WriteOp::Hold, elements, .. }) if elements.len() == 1));
-
-        let empty = NvList::new();
-        assert!(check_element_errors(WriteOp::Hold, empty).is_ok());
+        for op in [WriteOp::Hold, WriteOp::Release] {
+            let mut out = NvList::new();
+            out.push("tank/ds@snap#tag", NvData::Int32(libc::ENOENT));
+            let err = check_element_errors(op, out).unwrap_err();
+            assert_eq!(err.errno(), Some(libc::ENOENT));
+            assert!(matches!(err, ZfsError::Write { op: actual, elements, .. }
+                if actual == op && elements.len() == 1));
+            assert!(check_element_errors(op, NvList::new()).is_ok());
+        }
     }
 
     #[cfg(feature = "write")]
@@ -3138,5 +3179,81 @@ mod tests {
         let mut bad_user_prop = NvList::new();
         bad_user_prop.add_u64("org.example:tag", 42);
         assert!(validate_pool_props_set(&bad_user_prop).is_err());
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn property_index_bounds_and_string_limits() {
+        for prop in ["failfast", "allocating", "sit_out", "autosit", "slow_io_events"] {
+            for n in [0, 1] {
+                assert!(validate_vdev_prop_set(prop, &NvData::Uint64(n)).is_ok(), "{prop}={n}");
+            }
+            for value in [NvData::Uint64(2), NvData::Uint64(u64::MAX), NvData::Boolean(true)] {
+                assert!(matches!(validate_vdev_prop_set(prop, &value), Err(ZfsError::Invalid(_))),
+                    "{prop}={value:?}");
+            }
+        }
+        for prop in ["autoexpand", "autoreplace", "autotrim", "delegation", "listsnapshots", "multihost", "failmode", "ashift", "version"] {
+            let mut props = NvList::new();
+            props.add_u64(prop, u64::MAX);
+            assert!(matches!(validate_pool_props_set(&props), Err(ZfsError::Invalid(_))), "{prop}");
+        }
+        for (prop, good, bad) in [("ashift", 16, 17), ("failmode", 2, 3), ("version", 28, 29)] {
+            let mut props = NvList::new();
+            props.add_u64(prop, good);
+            assert!(validate_pool_props_set(&props).is_ok(), "{prop}={good}");
+            props.add_u64(prop, bad);
+            assert!(validate_pool_props_set(&props).is_err(), "{prop}={bad}");
+        }
+        for prop in ["comment", "org.example:tag"] {
+            for (len, valid) in [(ZAP_MAXVALUELEN - 1, true), (ZAP_MAXVALUELEN, false)] {
+                let value = NvData::Str("x".repeat(len));
+                assert_eq!(validate_vdev_prop_set(prop, &value).is_ok(), valid);
+                let mut props = NvList::new();
+                props.push(prop, value);
+                assert_eq!(validate_pool_props_set(&props).is_ok(), valid);
+            }
+            let mut props = NvList::new();
+            props.add_str(prop, "embedded\0nul");
+            assert!(validate_pool_props_set(&props).is_err());
+            assert!(validate_vdev_prop_set(prop, props.get(prop).unwrap()).is_err());
+        }
+        for prop in ["readonly", "altroot", "tname", "size", "health"] {
+            let mut props = NvList::new();
+            props.add_str(prop, "value");
+            assert!(matches!(validate_pool_props_set(&props), Err(ZfsError::Invalid(_))), "{prop}");
+        }
+        for prop in ["Bad:tag", "bad@:tag", "bad:ta g"] {
+            let mut props = NvList::new();
+            props.add_str(prop, "value");
+            assert!(validate_pool_props_set(&props).is_err());
+            assert!(validate_vdev_prop_set(prop, props.get(prop).unwrap()).is_err());
+        }
+        // Verify that the public setters reject bad input before issuing
+        // an ioctl: /dev/null would otherwise return ENOTTY.
+        let h = null_handle(
+            KernelSupport::Verified(KernelVersion { major: 2, minor: 4 }),
+            HandleOptions::default(),
+        );
+        assert!(matches!(h.vdev_set_props("tank", 1, "failfast", &NvData::Uint64(2)),
+            Err(ZfsError::Invalid(_))));
+        let mut props = NvList::new();
+        props.add_u64("autoexpand", 42);
+        assert!(matches!(h.pool_set_props("tank", &props), Err(ZfsError::Invalid(_))));
+    }
+
+    #[test]
+    fn element_errors_ignore_counters_and_preserve_property_names() {
+        let mut out = NvList::new();
+        out.add_u64("read_bytes", 312).add_u64("error_flags", 1).add_i32("N_MORE_ERRORS", 3);
+        let mut errors = NvList::new();
+        errors.add_i32("tank/ds", libc::EINVAL).add_i32("tank/ok", 0);
+        out.add_nvlist("errors", errors);
+        let mut property = NvList::new();
+        property.add_u64("value", libc::ENOTSUP as u64).add_u64("source", 0);
+        out.add_nvlist("comment", property);
+        let elements = element_errors(&out);
+        assert_eq!(elements.iter().map(|e| (e.name.as_str(), e.errno)).collect::<Vec<_>>(),
+            [("tank/ds", libc::EINVAL), ("comment", libc::ENOTSUP)]);
     }
 }
