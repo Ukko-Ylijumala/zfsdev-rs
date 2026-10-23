@@ -121,11 +121,18 @@ pub struct NvPair {
     pub data: NvData,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NvList {
     pub version: i32,
     pub nvflag: u32,
     pub pairs: Vec<NvPair>,
+}
+
+impl Default for NvList {
+    /// An empty nvlist carrying `NV_UNIQUE_NAME`, matching [`NvList::new`].
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // data_type_t constants (doc/reference/nvpair.h)
@@ -215,6 +222,9 @@ impl<'a> Cursor<'a> {
     fn read_xdr_string(&mut self) -> Result<String> {
         let len = self.read_u32_be()? as usize;
         let bytes = self.take(len)?;
+        if bytes.contains(&0) {
+            return Err(NvError::EmbeddedNul(String::from_utf8_lossy(bytes).into_owned()));
+        }
         let s = String::from_utf8_lossy(bytes).into_owned();
         self.take(xdr_pad(len))?;
         Ok(s)
@@ -304,15 +314,21 @@ impl NvList {
     /**
     An empty nvlist carrying `NV_UNIQUE_NAME` — the flag the kernel
     expects on lists handed in through the `/dev/zfs` ioctl interface.
-    (Derived `default()` leaves `nvflag` zero, which is for decode output.)
     */
     pub fn new() -> NvList {
         NvList { version: 0, nvflag: NV_UNIQUE_NAME, pairs: Vec::new() }
     }
 
-    /// Append a raw pair. Returns `&mut self` for chaining.
+    /// Append a pair. When `NV_UNIQUE_NAME` is set (the default from
+    /// [`NvList::new`]), any earlier pair with the same name is removed
+    /// first, matching `nvlist_add_common` (`doc/reference/nvpair.c`).
+    /// Returns `&mut self` for chaining.
     pub fn push(&mut self, name: impl Into<String>, data: NvData) -> &mut Self {
-        self.pairs.push(NvPair { name: name.into(), data });
+        let name = name.into();
+        if self.nvflag & NV_UNIQUE_NAME != 0 {
+            self.pairs.retain(|p| p.name != name);
+        }
+        self.pairs.push(NvPair { name, data });
         self
     }
 
@@ -368,10 +384,11 @@ impl NvList {
     so strip them from lists destined for write ioctls.
     */
     pub fn pack(&self) -> Result<Vec<u8>> {
-        let mut out = vec![0u8, 1, 0, 0]; // NV_ENCODE_NATIVE, little-endian
+        let mut out = Vec::with_capacity(16 + self.pairs.len() * 32);
+        out.extend_from_slice(&[0u8, 1, 0, 0]); // NV_ENCODE_NATIVE, little-endian
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.nvflag.to_le_bytes());
-        encode_pairs(&mut out, &self.pairs)?;
+        encode_pairs(&mut out, &self.pairs, 0)?;
         Ok(out)
     }
 }
@@ -400,7 +417,8 @@ fn decode_pairs(cur: &mut Cursor, depth: usize) -> Result<Vec<NvPair>> {
         let dtype = i32::from_le_bytes(blob[12..16].try_into().unwrap());
 
         // the name is `name_sz` bytes including a trailing NUL; require it
-        // to fit and to actually be NUL-terminated.
+        // to fit, be NUL-terminated, and carry no interior NULs
+        // (i_validate_nvpair_name: strlen(NVP_NAME(nvp)) == nvp_name_sz - 1).
         if name_sz < 1
             || NVPAIR_HDR_SIZE + name_sz as usize > blob.len()
             || blob[NVPAIR_HDR_SIZE + name_sz as usize - 1] != 0
@@ -408,6 +426,9 @@ fn decode_pairs(cur: &mut Cursor, depth: usize) -> Result<Vec<NvPair>> {
             return Err(NvError::BadName(name_sz));
         }
         let name_bytes = &blob[NVPAIR_HDR_SIZE..NVPAIR_HDR_SIZE + name_sz as usize - 1];
+        if name_bytes.contains(&0) {
+            return Err(NvError::BadName(name_sz));
+        }
         let name = String::from_utf8_lossy(name_bytes).into_owned();
 
         // nvp_value_elem is a count; negative is malformed (was silently
@@ -569,17 +590,24 @@ fn read_cstr(buf: &[u8], pair_name: &str) -> Result<(String, usize)> {
 
 /// Encode a pair sequence and its 4-byte zero terminator (used for the root
 /// list and for every embedded child stream).
-fn encode_pairs(out: &mut Vec<u8>, pairs: &[NvPair]) -> Result<()> {
+fn encode_pairs(out: &mut Vec<u8>, pairs: &[NvPair], depth: usize) -> Result<()> {
+    if depth > MAX_DEPTH {
+        return Err(NvError::TooDeep);
+    }
     for p in pairs {
-        encode_pair(out, &p.name, &p.data)?;
+        encode_pair(out, &p.name, &p.data, depth)?;
     }
     out.extend_from_slice(&0i32.to_le_bytes()); // terminator
     Ok(())
 }
 
-/// Encode one nvpair blob, then — for embedded nvlists — its child pair
-/// stream, which the kernel format places immediately after the parent blob.
-fn encode_pair(out: &mut Vec<u8>, name: &str, data: &NvData) -> Result<()> {
+/**
+Encode one nvpair blob directly into `out`, then — for embedded nvlists —
+its child pair stream, which the kernel format places immediately after the
+parent blob. `nvp_size = NV_ALIGN(16 + name_sz) + NV_ALIGN(value_sz)` per
+`NVP_SIZE_CALC`, patched into the header once the value has been written.
+*/
+fn encode_pair(out: &mut Vec<u8>, name: &str, data: &NvData, depth: usize) -> Result<()> {
     /*
     The wire format is NUL-delimited: an interior NUL makes the kernel's
     decoder see a shorter string (silently changing the value — its
@@ -595,13 +623,47 @@ fn encode_pair(out: &mut Vec<u8>, name: &str, data: &NvData) -> Result<()> {
     if has_nul(name) || value_nul {
         return Err(NvError::EmbeddedNul(name.to_string()));
     }
-    let (dtype, nelem, value) = encode_value(data);
-    write_pair(out, name, dtype, nelem, &value)?;
+    let name_sz = name.len() + 1;
+    if name_sz > i16::MAX as usize {
+        return Err(NvError::TooBigToPack(name.to_string()));
+    }
+    let val_off = align8(NVPAIR_HDR_SIZE + name_sz);
+    let pair_start = out.len();
+
+    // Reserve header + NUL-terminated name padded to 8-byte alignment;
+    // nvp_size, nvp_value_elem, and nvp_type are patched once the value is written.
+    out.extend_from_slice(&0i32.to_le_bytes()); // nvp_size placeholder
+    out.extend_from_slice(&(name_sz as i16).to_le_bytes());
+    out.extend_from_slice(&0i16.to_le_bytes()); // nvp_reserve
+    out.extend_from_slice(&0i32.to_le_bytes()); // nvp_value_elem placeholder
+    out.extend_from_slice(&0i32.to_le_bytes()); // nvp_type placeholder
+    out.extend_from_slice(name.as_bytes());
+    out.resize(pair_start + val_off, 0); // trailing NUL + name padding
+
+    let val_start = out.len();
+    let (dtype, nelem) = write_value(out, data);
+    let val_len = out.len() - val_start;
+    let aligned_val_len = align8(val_len);
+    out.resize(val_start + aligned_val_len, 0); // value padding
+
+    let size = val_off + aligned_val_len;
+    /*
+    nvp_name_sz is i16, nvp_size and nvp_value_elem i32: an oversized name
+    or value must error here, not wrap on the cast — a wrapped nvp_size can
+    turn small-positive and desync the kernel's framing of the whole stream.
+    */
+    if size > i32::MAX as usize || nelem > i32::MAX as usize {
+        return Err(NvError::TooBigToPack(name.to_string()));
+    }
+    out[pair_start..pair_start + 4].copy_from_slice(&(size as i32).to_le_bytes());
+    out[pair_start + 8..pair_start + 12].copy_from_slice(&(nelem as i32).to_le_bytes());
+    out[pair_start + 12..pair_start + 16].copy_from_slice(&dtype.to_le_bytes());
+
     match data {
-        NvData::List(l) => encode_pairs(out, &l.pairs)?,
+        NvData::List(l) => encode_pairs(out, &l.pairs, depth + 1)?,
         NvData::ListArray(a) => {
             for l in a {
-                encode_pairs(out, &l.pairs)?;
+                encode_pairs(out, &l.pairs, depth + 1)?;
             }
         }
         _ => {}
@@ -610,111 +672,151 @@ fn encode_pair(out: &mut Vec<u8>, name: &str, data: &NvData) -> Result<()> {
 }
 
 /**
-Map an [`NvData`] to its `(data_type_t, nvp_value_elem, value bytes)`.
-The value region is the unpadded natural size; [`write_pair`] applies the
+Append the unpadded wire representation of `data` directly to `out` and
+return `(data_type_t, nvp_value_elem)`. [`encode_pair`] applies the
 `NV_ALIGN` padding that `NVP_SIZE_CALC` accounts for.
 */
-fn encode_value(data: &NvData) -> (i32, usize, Vec<u8>) {
-    fn flat<T: Copy, const N: usize>(v: &[T], f: impl Fn(T) -> [u8; N]) -> Vec<u8> {
-        v.iter().flat_map(|&x| f(x)).collect()
+fn write_value(out: &mut Vec<u8>, data: &NvData) -> (i32, usize) {
+    fn flat<T: Copy, const N: usize>(out: &mut Vec<u8>, v: &[T], f: impl Fn(T) -> [u8; N]) {
+        out.reserve(v.len() * N);
+        for &x in v {
+            out.extend_from_slice(&f(x));
+        }
     }
     match data {
-        NvData::BooleanFlag => (DT_BOOLEAN, 0, Vec::new()),
+        NvData::BooleanFlag => (DT_BOOLEAN, 0),
         // boolean_t is a 4-byte int on the wire
-        NvData::Boolean(b) => (DT_BOOLEAN_VALUE, 1, (*b as i32).to_le_bytes().to_vec()),
-        NvData::Byte(v) => (DT_BYTE, 1, vec![*v]),
-        NvData::Int8(v) => (DT_INT8, 1, vec![*v as u8]),
-        NvData::Uint8(v) => (DT_UINT8, 1, vec![*v]),
-        NvData::Int16(v) => (DT_INT16, 1, v.to_le_bytes().to_vec()),
-        NvData::Uint16(v) => (DT_UINT16, 1, v.to_le_bytes().to_vec()),
-        NvData::Int32(v) => (DT_INT32, 1, v.to_le_bytes().to_vec()),
-        NvData::Uint32(v) => (DT_UINT32, 1, v.to_le_bytes().to_vec()),
-        NvData::Int64(v) => (DT_INT64, 1, v.to_le_bytes().to_vec()),
-        NvData::Uint64(v) => (DT_UINT64, 1, v.to_le_bytes().to_vec()),
-        NvData::HrTime(v) => (DT_HRTIME, 1, v.to_le_bytes().to_vec()),
-        NvData::Double(v) => (DT_DOUBLE, 1, v.to_le_bytes().to_vec()),
-        NvData::Str(s) => {
-            let mut b = s.as_bytes().to_vec();
-            b.push(0);
-            (DT_STRING, 1, b)
+        NvData::Boolean(b) => {
+            out.extend_from_slice(&(*b as i32).to_le_bytes());
+            (DT_BOOLEAN_VALUE, 1)
         }
-        NvData::ByteArray(v) => (DT_BYTE_ARRAY, v.len(), v.clone()),
-        NvData::Uint8Array(v) => (DT_UINT8_ARRAY, v.len(), v.clone()),
-        NvData::Int8Array(v) => (DT_INT8_ARRAY, v.len(), v.iter().map(|&x| x as u8).collect()),
-        NvData::Int16Array(v) => (DT_INT16_ARRAY, v.len(), flat(v, i16::to_le_bytes)),
-        NvData::Uint16Array(v) => (DT_UINT16_ARRAY, v.len(), flat(v, u16::to_le_bytes)),
-        NvData::Int32Array(v) => (DT_INT32_ARRAY, v.len(), flat(v, i32::to_le_bytes)),
-        NvData::Uint32Array(v) => (DT_UINT32_ARRAY, v.len(), flat(v, u32::to_le_bytes)),
-        NvData::Int64Array(v) => (DT_INT64_ARRAY, v.len(), flat(v, i64::to_le_bytes)),
-        NvData::Uint64Array(v) => (DT_UINT64_ARRAY, v.len(), flat(v, u64::to_le_bytes)),
+        NvData::Byte(v) => {
+            out.push(*v);
+            (DT_BYTE, 1)
+        }
+        NvData::Int8(v) => {
+            out.push(*v as u8);
+            (DT_INT8, 1)
+        }
+        NvData::Uint8(v) => {
+            out.push(*v);
+            (DT_UINT8, 1)
+        }
+        NvData::Int16(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            (DT_INT16, 1)
+        }
+        NvData::Uint16(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            (DT_UINT16, 1)
+        }
+        NvData::Int32(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            (DT_INT32, 1)
+        }
+        NvData::Uint32(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            (DT_UINT32, 1)
+        }
+        NvData::Int64(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            (DT_INT64, 1)
+        }
+        NvData::Uint64(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            (DT_UINT64, 1)
+        }
+        NvData::HrTime(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            (DT_HRTIME, 1)
+        }
+        NvData::Double(v) => {
+            out.extend_from_slice(&v.to_le_bytes());
+            (DT_DOUBLE, 1)
+        }
+        NvData::Str(s) => {
+            out.extend_from_slice(s.as_bytes());
+            out.push(0);
+            (DT_STRING, 1)
+        }
+        NvData::ByteArray(v) => {
+            out.extend_from_slice(v);
+            (DT_BYTE_ARRAY, v.len())
+        }
+        NvData::Uint8Array(v) => {
+            out.extend_from_slice(v);
+            (DT_UINT8_ARRAY, v.len())
+        }
+        NvData::Int8Array(v) => {
+            out.extend(v.iter().map(|&x| x as u8));
+            (DT_INT8_ARRAY, v.len())
+        }
+        NvData::Int16Array(v) => {
+            flat(out, v, i16::to_le_bytes);
+            (DT_INT16_ARRAY, v.len())
+        }
+        NvData::Uint16Array(v) => {
+            flat(out, v, u16::to_le_bytes);
+            (DT_UINT16_ARRAY, v.len())
+        }
+        NvData::Int32Array(v) => {
+            flat(out, v, i32::to_le_bytes);
+            (DT_INT32_ARRAY, v.len())
+        }
+        NvData::Uint32Array(v) => {
+            flat(out, v, u32::to_le_bytes);
+            (DT_UINT32_ARRAY, v.len())
+        }
+        NvData::Int64Array(v) => {
+            flat(out, v, i64::to_le_bytes);
+            (DT_INT64_ARRAY, v.len())
+        }
+        NvData::Uint64Array(v) => {
+            flat(out, v, u64::to_le_bytes);
+            (DT_UINT64_ARRAY, v.len())
+        }
         // boolean_t array elements are 4 bytes each
-        NvData::BooleanArray(v) => (
-            DT_BOOLEAN_ARRAY,
-            v.len(),
-            v.iter().flat_map(|&b| (b as i32).to_le_bytes()).collect(),
-        ),
+        NvData::BooleanArray(v) => {
+            flat(out, v, |b| (b as i32).to_le_bytes());
+            (DT_BOOLEAN_ARRAY, v.len())
+        }
         NvData::StrArray(v) => {
             // nelem 8-byte pointer placeholders, then packed NUL-terminated strings
-            let mut buf = vec![0u8; v.len() * 8];
+            out.resize(out.len() + v.len() * 8, 0);
             for s in v {
-                buf.extend_from_slice(s.as_bytes());
-                buf.push(0);
+                out.extend_from_slice(s.as_bytes());
+                out.push(0);
             }
-            (DT_STRING_ARRAY, v.len(), buf)
+            (DT_STRING_ARRAY, v.len())
         }
-        NvData::List(l) => (DT_NVLIST, 1, nvlist_struct(l.version, l.nvflag)),
+        NvData::List(l) => {
+            write_nvlist_struct(out, l.version, l.nvflag);
+            (DT_NVLIST, 1)
+        }
         NvData::ListArray(a) => {
             // nelem pointer placeholders, then nelem nvlist_t struct copies;
             // each child's pair stream is appended after the blob by encode_pair.
             let n = a.len();
-            let mut buf = vec![0u8; n * 8];
+            out.resize(out.len() + n * 8, 0);
             for l in a {
-                buf.extend_from_slice(&nvlist_struct(l.version, l.nvflag));
+                write_nvlist_struct(out, l.version, l.nvflag);
             }
-            (DT_NVLIST_ARRAY, n, buf)
+            (DT_NVLIST_ARRAY, n)
         }
         // Best-effort: round-trips type+bytes but not the original nvp_value_elem.
-        NvData::Unknown { dtype, raw } => (*dtype, 0, raw.clone()),
+        NvData::Unknown { dtype, raw } => {
+            out.extend_from_slice(raw);
+            (*dtype, 0)
+        }
     }
 }
 
-/// A 24-byte in-memory `nvlist_t` copy as it appears in an embedded value
+/// Write a 24-byte in-memory `nvlist_t` copy as it appears in an embedded value
 /// region; only the leading version/nvflag words are meaningful on the wire.
-fn nvlist_struct(version: i32, nvflag: u32) -> Vec<u8> {
-    let mut s = vec![0u8; NVLIST_STRUCT_SIZE];
-    s[0..4].copy_from_slice(&version.to_le_bytes());
-    s[4..8].copy_from_slice(&nvflag.to_le_bytes());
-    s
-}
-
-/**
-Write one nvpair blob: header, NUL-terminated name, then the value padded
-to the `NV_ALIGN` boundary. `nvp_size = NV_ALIGN(16 + name_sz) +
-NV_ALIGN(value_sz)` per `NVP_SIZE_CALC`.
-*/
-fn write_pair(out: &mut Vec<u8>, name: &str, dtype: i32, nelem: usize, value: &[u8]) -> Result<()> {
-    let name_sz = name.len() + 1;
-    let val_off = align8(NVPAIR_HDR_SIZE + name_sz);
-    let size = val_off + align8(value.len());
-    /*
-    nvp_name_sz is i16, nvp_size and nvp_value_elem i32: an oversized name
-    or value must error here, not wrap on the cast — a wrapped nvp_size can
-    turn small-positive and desync the kernel's framing of the whole stream.
-    */
-    if name_sz > i16::MAX as usize || size > i32::MAX as usize || nelem > i32::MAX as usize {
-        return Err(NvError::TooBigToPack(name.to_string()));
-    }
-    out.extend_from_slice(&(size as i32).to_le_bytes());
-    out.extend_from_slice(&(name_sz as i16).to_le_bytes());
-    out.extend_from_slice(&0i16.to_le_bytes()); // nvp_reserve
-    out.extend_from_slice(&(nelem as i32).to_le_bytes());
-    out.extend_from_slice(&dtype.to_le_bytes());
-    out.extend_from_slice(name.as_bytes());
-    out.push(0);
-    out.resize(out.len() + (val_off - NVPAIR_HDR_SIZE - name_sz), 0); // name padding
-    out.extend_from_slice(value);
-    out.resize(out.len() + (align8(value.len()) - value.len()), 0); // value padding
-    Ok(())
+fn write_nvlist_struct(out: &mut Vec<u8>, version: i32, nvflag: u32) {
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&nvflag.to_le_bytes());
+    out.resize(out.len() + (NVLIST_STRUCT_SIZE - 8), 0);
 }
 
 /* ------------------------------ XDR decoding ----------------------------- */
@@ -744,8 +846,11 @@ fn decode_xdr_list(cur: &mut Cursor, depth: usize) -> Result<NvList> {
         if encode_sz == 0 && decode_sz == 0 {
             return Ok(NvList { version, nvflag, pairs });
         }
-        // encoded size covers the whole pair, the two size words included
-        if encode_sz < 20 || (encode_sz as usize) > cur.remaining() + 8 {
+        // encoded size covers the whole pair, the two size words included;
+        // note that nvs_xdr_nvp_size over-counts empty number arrays by 4 bytes
+        // per array (which also inflates enclosing DT_NVLIST encode_sz), so
+        // encode_sz is checked as an upper bound after decoding known types.
+        if encode_sz < 20 || decode_sz <= 0 {
             return Err(NvError::BadPairSize { at: pair_start, size: encode_sz as i64 });
         }
         let name = cur.read_xdr_string()?;
@@ -756,16 +861,16 @@ fn decode_xdr_list(cur: &mut Cursor, depth: usize) -> Result<NvList> {
         }
         let data = decode_xdr_value(cur, dtype, nelem as usize, pair_start, encode_sz, depth)?;
         /*
-        Each nvpair is self-describing via encode_sz; a known value's decode
-        must land within it. Reject an overrun and skip any trailing pad so
-        the next pair starts at the right offset — previously unenforced for
-        known types, so a malformed value could desync the following pairs.
+        Each nvpair is self-describing; a known value's decode must not overrun
+        its declared encode_sz. Do not advance `cur.pos` to `pair_end`: every
+        XDR primitive already pads to 4 bytes, and `nvs_xdr_nvp_size` adds 4
+        bytes for the `xdr_array` count word even when `nelem == 0` causes
+        `nvs_xdr_nvp_op` to skip `xdr_array` entirely.
         */
-        let pair_end = pair_start + encode_sz as usize;
+        let pair_end = pair_start.saturating_add(encode_sz as usize);
         if cur.pos > pair_end {
             return Err(NvError::BadPairSize { at: pair_start, size: encode_sz as i64 });
         }
-        cur.pos = pair_end;
         pairs.push(NvPair { name, data });
     }
 }
@@ -783,8 +888,13 @@ fn decode_xdr_value(
     for stream framing and must agree with the declared nelem (count > nelem
     would under-read and desync the following pairs; count < nelem would
     silently drop elements). Require equality, then bound it.
+    When nelem == 0, `nvs_xdr_nvp_op` returns before calling `xdr_array`, so
+    there is no count word on the wire (`doc/reference/nvpair.c:3337-3339`).
     */
     fn array_count(cur: &mut Cursor, nelem: usize, elem_sz: usize) -> Result<usize> {
+        if nelem == 0 {
+            return Ok(0);
+        }
         let count = cur.read_u32_be()? as usize;
         if count != nelem {
             return Err(NvError::ArrayCountMismatch { count, nelem });
@@ -907,19 +1017,12 @@ fn decode_xdr_value(
         }
         _ => {
             // skip to the end of the pair using its encoded size
-            let end = pair_start + encode_sz as usize;
-            /*
-            the name may already have overrun the declared pair size —
-            rewinding the cursor to `end` would re-parse consumed bytes and
-            silently accept a self-contradictory pair the known-type path
-            rejects (the `cur.pos > pair_end` check in decode_xdr_list runs
-            after this arm has already moved the cursor)
-            */
-            if cur.pos > end {
-                return Err(NvError::BadPairSize { at: pair_start, size: encode_sz as i64 });
-            }
-            let raw = cur.buf.get(cur.pos..end).unwrap_or(&[]).to_vec();
-            cur.pos = end.min(cur.buf.len());
+            let end = pair_start
+                .checked_add(encode_sz as usize)
+                .filter(|&end| cur.pos <= end && end <= cur.buf.len())
+                .ok_or(NvError::BadPairSize { at: pair_start, size: encode_sz as i64 })?;
+            let raw = cur.buf[cur.pos..end].to_vec();
+            cur.pos = end;
             NvData::Unknown { dtype, raw }
         }
     })
@@ -1397,5 +1500,92 @@ mod tests {
         for cut in 0..e.buf.len() - 1 {
             assert!(NvList::unpack(&e.buf[..cut]).is_err(), "cut at {cut}");
         }
+    }
+
+    #[test]
+    fn xdr_empty_number_arrays_and_nested_lists() {
+        // C's xdr_array returns TRUE immediately when nelem == 0 without
+        // emitting the 4-byte element count prefix, even though
+        // nvs_xdr_nvp_size adds 4 * nelem + 4 to encode_sz.
+        let mut inner = XdrEnc { buf: Vec::new() };
+        inner.pair("e1", DT_UINT64_ARRAY, 0, &[]);
+        inner.pair("e2", DT_INT32_ARRAY, 0, &[]);
+        inner.pair("e3", DT_UINT16_ARRAY, 0, &[]);
+        inner.pair("after_empty", DT_UINT64, 1, &99u64.to_be_bytes());
+        inner.end();
+
+        let mut child_payload = Vec::new();
+        child_payload.extend_from_slice(&0i32.to_be_bytes());
+        child_payload.extend_from_slice(&NV_UNIQUE_NAME.to_be_bytes());
+        child_payload.extend_from_slice(&inner.buf);
+
+        let mut e = XdrEnc::new();
+        // Parent's encode_sz includes +4 bytes per empty array (3 * 4 = 12 > 8)
+        let inflated_len = child_payload.len() + 12;
+        let mut body = Vec::new();
+        XdrEnc::xdr_str(&mut body, "child");
+        body.extend_from_slice(&DT_NVLIST.to_be_bytes());
+        body.extend_from_slice(&1i32.to_be_bytes());
+        body.extend_from_slice(&child_payload);
+        e.buf.extend_from_slice(&((body.len() + 8 + (inflated_len - child_payload.len())) as i32).to_be_bytes());
+        e.buf.extend_from_slice(&64i32.to_be_bytes());
+        e.buf.extend_from_slice(&body);
+        e.pair("tail", DT_UINT64, 1, &7u64.to_be_bytes());
+        e.end();
+
+        let l = NvList::unpack(&e.buf).unwrap();
+        let child = l.get_list("child").unwrap();
+        assert_eq!(child.get_u64_array("e1"), Some(&[][..]));
+        assert_eq!(child.get("e2"), Some(&NvData::Int32Array(vec![])));
+        assert_eq!(child.get("e3"), Some(&NvData::Uint16Array(vec![])));
+        assert_eq!(child.get_u64("after_empty"), Some(99));
+        assert_eq!(l.get_u64("tail"), Some(7));
+    }
+
+    #[test]
+    fn unpack_rejects_embedded_nul_in_names_and_xdr_strings() {
+        // Native pair name with interior NUL
+        let mut e = Enc::new();
+        e.pair("a\0b", DT_UINT64, 1, &1u64.to_le_bytes());
+        e.end();
+        assert!(matches!(NvList::unpack(&e.buf), Err(NvError::BadName { .. })));
+
+        // XDR string with interior NUL
+        let mut xe = XdrEnc::new();
+        let mut sval = Vec::new();
+        XdrEnc::xdr_str(&mut sval, "a\0b");
+        xe.pair("prop", DT_STRING, 1, &sval);
+        xe.end();
+        assert!(matches!(NvList::unpack(&xe.buf), Err(NvError::EmbeddedNul(_))));
+    }
+
+    #[test]
+    fn push_deduplicates_when_nv_unique_name_set() {
+        let mut unique = NvList::new();
+        unique.add_u64("k", 1).add_u64("other", 2).add_u64("k", 3);
+        assert_eq!(unique.pairs.len(), 2);
+        assert_eq!(unique.pairs[0].name, "other");
+        assert_eq!(unique.pairs[1].name, "k");
+        assert_eq!(unique.get_u64("k"), Some(3));
+
+        // Lists with nvflag == 0 keep duplicate keys
+        let mut non_unique = NvList { version: 0, nvflag: 0, pairs: Vec::new() };
+        non_unique.add_u64("k", 1).add_u64("k", 2);
+        assert_eq!(non_unique.pairs.len(), 2);
+        assert_eq!(non_unique.get_u64("k"), Some(2));
+
+        // Default nvlist has NV_UNIQUE_NAME
+        assert_eq!(NvList::default().nvflag, NV_UNIQUE_NAME);
+    }
+
+    #[test]
+    fn pack_rejects_excessive_nesting_depth() {
+        let mut list = NvList::new();
+        for _ in 0..=MAX_DEPTH {
+            let mut parent = NvList::new();
+            parent.add_nvlist("child", list);
+            list = parent;
+        }
+        assert!(matches!(list.pack(), Err(NvError::TooDeep)));
     }
 }
