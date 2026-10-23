@@ -54,7 +54,7 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{LazyLock, PoisonError, RwLock};
-use strum::{Display, EnumIter};
+use strum::{Display, EnumIter, IntoEnumIterator};
 use thiserror::Error;
 
 const ZFS_DEV: &str = "/dev/zfs";
@@ -1590,8 +1590,9 @@ impl ZfsHandle {
     */
     pub fn vdev_get_props(&self, pool: &str, guid: u64) -> Result<NvList> {
         let mut want = NvList::new();
-        for p in VdevProp::request_names() {
-            want.add_bool_flag(p);
+        for p in VdevProp::iter() {
+            let name: &'static str = p.into();
+            want.add_bool_flag(name);
         }
         let mut innvl = NvList::new();
         innvl.add_u64("vdevprops_get_vdev", guid);

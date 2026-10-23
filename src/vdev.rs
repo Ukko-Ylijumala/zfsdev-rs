@@ -157,6 +157,22 @@ impl<'a> VdevEntry<'a> {
             (None, None) => kind,
         }
     }
+
+    /**
+    Decode this vdev's [`crate::stats::VdevStats`].
+
+    Fragmentation is reported as `None` for non-top-level vdevs (depth > 0 or
+    auxiliary cache/spare devices), matching the behavior of `zpool list -v`
+    and avoiding the misleading 0% figures the kernel places in `vs_fragmentation`
+    for leaf and interior vdevs.
+    */
+    pub fn stats(&self) -> Option<crate::stats::VdevStats> {
+        let mut s = crate::stats::VdevStats::from_vdev(self.config)?;
+        if self.depth > 0 || matches!(self.role, VdevRole::Spare | VdevRole::Cache) {
+            s.fragmentation = None;
+        }
+        Some(s)
+    }
 }
 
 /**
@@ -311,5 +327,25 @@ mod tests {
         slog.add_u64(IS_LOG_KEY, 1);
         let got: Vec<(usize, VdevRole)> = walk(&slog).map(|v| (v.depth, v.role)).collect();
         assert_eq!(got, [(0, VdevRole::Log), (1, VdevRole::Log), (1, VdevRole::Log)]);
+    }
+
+    #[test]
+    fn vdev_entry_stats_masks_non_top_level_fragmentation() {
+        let mut top_raw = vec![0u64; 47];
+        top_raw[27] = 42; // fragmentation
+        let mut leaf_raw = vec![0u64; 47];
+        leaf_raw[27] = 0; // kernel 0
+        let mut leaf_disk = disk("/dev/a");
+        leaf_disk.push("vdev_stats", NvData::Uint64Array(leaf_raw));
+        let mut mirror = vdev("mirror", Some(0), vec![leaf_disk]);
+        mirror.push("vdev_stats", NvData::Uint64Array(top_raw));
+        let root = vdev("root", Some(0), vec![mirror]);
+
+        let entries: Vec<_> = walk(&root).collect();
+        assert_eq!(entries.len(), 2);
+        // top-level mirror retains fragmentation
+        assert_eq!(entries[0].stats().unwrap().fragmentation, Some(42));
+        // leaf disk has fragmentation masked to None
+        assert_eq!(entries[1].stats().unwrap().fragmentation, None);
     }
 }

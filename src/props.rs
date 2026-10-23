@@ -23,7 +23,7 @@ use crate::enums::{CEnum, Coded, ZioChecksum, ZioCompress, ZpropSource, ZstdLeve
 use crate::nvlist::{NvData, NvList, NvPair};
 use std::fmt;
 use std::str::FromStr;
-use strum::{Display, EnumIter, EnumString, FromRepr, IntoEnumIterator};
+use strum::{Display, EnumIter, EnumString, FromRepr, IntoEnumIterator, IntoStaticStr};
 
 /// The value key of a `{value, source}` property pair (`ZPROP_VALUE`).
 const ZPROP_VALUE: &str = "value";
@@ -142,7 +142,7 @@ cases. [`request_names`](VdevProp::request_names) yields the full set for the
 input nvlist. Values decode via [`decode_prop_value`] where the names overlap
 pool/dataset props (size/free/allocated/fragmentation), raw otherwise.
 */
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumIter, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum VdevProp {
     Name,
@@ -237,11 +237,10 @@ value_enum!(AclType {
 });
 value_enum!(XattrMode {
     Off = 0,
-    // displays as "on (dir)"; the kernel accepts (and libzfs prints) both
-    // "on" and "dir" for value 1, so both parse
-    #[strum(to_string = "on (dir)", serialize = "on", serialize = "dir")]
-    Dir,
-    Sa,
+    #[strum(serialize = "dir")]
+    Dir = 1,
+    #[strum(serialize = "sa")]
+    Sa = 2,
 });
 value_enum!(SyncMode { Standard = 0, Always, Disabled });
 value_enum!(LogBias { Latency = 0, Throughput });
@@ -574,7 +573,14 @@ impl<'a> PropEntry<'a> {
             Some(NvData::Str(s)) if s.is_empty() => PropSource::Default,
             Some(NvData::Str(s)) if s.contains(ZPROP_SOURCE_VAL_RECVD) => PropSource::Received,
             Some(NvData::Str(s)) if s == owner => PropSource::Local,
-            Some(NvData::Str(s)) => PropSource::Inherited(Some(s.clone())),
+            Some(NvData::Str(s))
+                if !s.starts_with('$')
+                    && owner.starts_with(s.as_str())
+                    && matches!(owner.as_bytes().get(s.len()), Some(b'/' | b'@')) =>
+            {
+                PropSource::Inherited(Some(s.clone()))
+            }
+            Some(NvData::Str(_)) => PropSource::None,
             Some(NvData::Uint64(v)) => match ZpropSource::from_raw(*v) {
                 Some(ZpropSource::None) => PropSource::None,
                 Some(ZpropSource::Default) => PropSource::Default,
@@ -756,7 +762,18 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
         P::AclMode => enum_val!(AclMode, input, name),
         P::AclInherit => enum_val!(AclInherit, input, name),
         P::AclType => enum_val!(AclType, input, name),
-        P::Xattr => enum_val!(XattrMode, input, name),
+        P::Xattr => {
+            if input == "on" {
+                // Since 2.3.0, "on" defaults to SA (2); up to 2.2.x, it mapped to DIR (1).
+                let mode = match crate::ioctl::kernel_version() {
+                    Some(v) if v < crate::ioctl::KernelVersion { major: 2, minor: 3 } => XattrMode::Dir,
+                    _ => XattrMode::Sa,
+                };
+                u64v(mode as u64)
+            } else {
+                enum_val!(XattrMode, input, name)
+            }
+        }
         P::Sync => enum_val!(SyncMode, input, name),
         P::LogBias => enum_val!(LogBias, input, name),
         P::PrimaryCache | P::SecondaryCache => enum_val!(CacheMode, input, name),
@@ -995,6 +1012,7 @@ mod tests {
         assert_eq!(d("compression", 15 | (3 << 7)), name(&format!("?{}", 15 | (3 << 7))));
         assert_eq!(d("compression", 99), name("?99"));
         assert_eq!(d("checksum", 14), name("blake3"));
+        assert_eq!(d("xattr", 1), name("dir"));
         assert_eq!(d("xattr", 2), name("sa"));
         assert_eq!(d("atime", 0), name("off"));
         assert_eq!(d("mounted", 1), name("yes"));
@@ -1132,8 +1150,12 @@ mod tests {
         assert_eq!(parse_prop_value("volmode", "geom").unwrap(), Uint64(1));
         assert_eq!(parse_prop_value("volmode", "dev").unwrap(), Uint64(2));
         assert_eq!(parse_prop_value("volmode", "none").unwrap(), Uint64(3));
-        // xattr: "on" and "dir" both mean the directory implementation
-        assert_eq!(parse_prop_value("xattr", "on").unwrap(), Uint64(1));
+        // xattr: "on" defaults to SA on 2.3+ (Dir on <2.3), "dir" and "sa" are explicit
+        let on_expected = match crate::ioctl::kernel_version() {
+            Some(v) if v < crate::ioctl::KernelVersion { major: 2, minor: 3 } => Uint64(1),
+            _ => Uint64(2),
+        };
+        assert_eq!(parse_prop_value("xattr", "on").unwrap(), on_expected);
         assert_eq!(parse_prop_value("xattr", "dir").unwrap(), Uint64(1));
         assert_eq!(parse_prop_value("xattr", "sa").unwrap(), Uint64(2));
         // ACL policies land on the sparse ZFS_ACL_* values, aliases included
@@ -1195,6 +1217,15 @@ mod tests {
         assert_eq!(source("recordsize"), PropSource::Default);
         assert_eq!(source("quota"), PropSource::Received);
         assert_eq!(source("used"), PropSource::None);
+        // Non-ancestor or sentinel "$" string sources report PropSource::None
+        let mut bogus = NvList::new();
+        bogus
+            .add_nvlist("sentinel", wrapped(Uint64(1), src("$")))
+            .add_nvlist("unrelated", wrapped(Uint64(1), src("otherpool")))
+            .add_nvlist("prefix_not_parent", wrapped(Uint64(1), src("tan")));
+        for k in ["sentinel", "unrelated", "prefix_not_parent"] {
+            assert_eq!(prop_entry(&bogus, k).unwrap().source("tank/a"), PropSource::None);
+        }
         assert_eq!(prop_u64(&props, "compression"), Some(15));
         assert_eq!(prop_str(&props, "mountpoint"), Some("/a"));
         assert_eq!(prop_u64(&props, "mountpoint"), None);

@@ -160,8 +160,10 @@ pub(crate) fn quantile_bucket(counts: &[u64], q: f64) -> Option<usize> {
 /* ------------------------------ vdev_stat_t ------------------------------ */
 
 /**
-Per-ZIO-type counters (`vs_ops` / `vs_bytes`, indexed by `zio_type_t`;
-`VS_ZIO_TYPES` = 6, so TRIM has no slot here).
+Per-ZIO-type counters (`vs_ops` / `vs_bytes`, indexed by `zio_type_t`).
+In `vdev_stat_update`, TRIM operations/bytes are recorded in the `ZIO_TYPE_IOCTL`
+slot (renamed `ZIO_TYPE_FLUSH` in OpenZFS 2.3) to preserve the `vdev_stat_t` ABI layout.
+Flush ZIOs run at `ZIO_PRIORITY_NOW` and are never counted.
 */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -171,14 +173,18 @@ pub struct ZioCounters {
     pub write: u64,
     pub free: u64,
     pub claim: u64,
-    /// ZIO_TYPE_IOCTL, renamed ZIO_TYPE_FLUSH in OpenZFS 2.3.
+    /// TRIM operations / bytes (recorded in the kernel's ZIO_TYPE_IOCTL/FLUSH slot).
+    pub trim: u64,
+    /// Deprecated alias for [`Self::trim`].
+    #[deprecated(note = "the kernel records TRIM operations in this slot; use .trim")]
     pub flush: u64,
 }
 
 impl ZioCounters {
     fn from_words(w: [u64; 6]) -> Self {
-        let [null, read, write, free, claim, flush] = w;
-        ZioCounters { null, read, write, free, claim, flush }
+        let [null, read, write, free, claim, trim] = w;
+        #[allow(deprecated)]
+        ZioCounters { null, read, write, free, claim, trim, flush: trim }
     }
 }
 
@@ -481,7 +487,11 @@ impl ScanStats {
     pass has run for a second. `now` is the current unix time.
     */
     pub fn pass_rate(&self, now: u64) -> Option<u64> {
-        let clock = if self.pass_scrub_pause > 0 { self.pass_scrub_pause } else { now };
+        let clock = if self.is_paused() && self.pass_scrub_pause >= self.pass_start {
+            self.pass_scrub_pause
+        } else {
+            now
+        };
         let elapsed = clock.saturating_sub(self.pass_start).saturating_sub(self.pass_scrub_spent_paused);
         self.pass_issued.checked_div(elapsed)
     }
@@ -530,9 +540,9 @@ pub struct RebuildStats {
     pub start_time: u64,
     pub end_time: u64,
     pub scan_time_ms: u64,
-    /// Allocated bytes scanned.
+    /// Allocated bytes scanned — what progress keys off (matches `zpool status`).
     pub bytes_scanned: u64,
-    /// Bytes read (issued) — what progress keys off.
+    /// Bytes read (issued).
     pub bytes_issued: u64,
     pub bytes_rebuilt: u64,
     /// Total bytes to scan.
@@ -583,19 +593,19 @@ impl RebuildStats {
         self.state.is(VdevRebuildState::Active)
     }
 
-    /// Fraction of the estimate issued (0 while the estimate is unknown).
+    /// Fraction of the estimate scanned (0 while the estimate is unknown).
     pub fn progress(&self) -> f64 {
-        fraction(self.bytes_issued, self.bytes_est)
+        fraction(self.bytes_scanned, self.bytes_est)
     }
 
-    /// The current pass's average issue rate, bytes/s; None before it has run.
+    /// The current pass's average scan rate, bytes/s; None before it has run.
     pub fn pass_rate(&self) -> Option<u64> {
-        self.pass_bytes_issued.saturating_mul(1000).checked_div(self.pass_time_ms)
+        self.pass_bytes_scanned.saturating_mul(1000).checked_div(self.pass_time_ms)
     }
 
     /// Seconds left at the pass rate; None at a standstill or when done.
     pub fn eta(&self) -> Option<u64> {
-        eta(self.bytes_est.saturating_sub(self.bytes_issued), self.pass_rate())
+        eta(self.bytes_est.saturating_sub(self.bytes_scanned), self.pass_rate())
     }
 }
 
@@ -809,9 +819,8 @@ impl VdevStatsEx {
                 Some(QueueDepth { class, active, pending })
             })
             .collect();
-        let pairs: Vec<&NvPair> = nv.iter().collect();
         let mut seen = HashSet::new();
-        let mut last: Vec<&NvPair> = pairs.into_iter().rev().filter(|p| seen.insert(&p.name)).collect();
+        let mut last: Vec<&NvPair> = nv.pairs.iter().rev().filter(|p| seen.insert(&p.name)).collect();
         last.reverse();
         let histograms = last
             .into_iter()
@@ -902,7 +911,11 @@ mod tests {
         let s = VdevStats::decode(&vs).unwrap();
         assert_eq!((s.state.raw(), s.aux.raw(), s.alloc), (1, 2, 3));
         assert_eq!((s.replaceable_size, s.expandable_size), (6, 7));
-        assert_eq!((s.ops.null, s.ops.read, s.ops.write, s.ops.flush), (8, 9, 10, 13));
+        assert_eq!((s.ops.null, s.ops.read, s.ops.write, s.ops.trim), (8, 9, 10, 13));
+        #[allow(deprecated)]
+        {
+            assert_eq!(s.ops.flush, 13);
+        }
         assert_eq!((s.bytes.read, s.bytes.write), (15, 16));
         assert_eq!((s.read_errors, s.write_errors, s.checksum_errors), (20, 21, 22));
         assert_eq!((s.initialize.errors, s.self_healed, s.scan_processed), (23, 24, 26));
@@ -1001,10 +1014,12 @@ mod tests {
     fn rebuild_progress_rate_and_eta() {
         let mut w = [0u64; 13];
         w[0] = 1; // ACTIVE
-        w[5] = 512 << 20; // issued
+        w[4] = 512 << 20; // scanned
+        w[5] = 64 << 20; // issued (ranges outside DTL skipped)
         w[7] = 2 << 30; // est
         w[9] = 128_000; // pass_time_ms
-        w[11] = 128 << 20; // pass_bytes_issued
+        w[10] = 128 << 20; // pass_bytes_scanned
+        w[11] = 16 << 20; // pass_bytes_issued
         w[12] = 7; // pass_bytes_skipped (2.2)
         let r = RebuildStats::decode(&w).unwrap();
         assert!(r.has_run() && r.is_active());
@@ -1079,7 +1094,7 @@ mod tests {
     /// twin. The last pair stands for the name, as in the kernel.
     #[test]
     fn stats_ex_duplicate_keys_count_once() {
-        let mut nv = NvList::new();
+        let mut nv = NvList::default();
         nv.push("vdev_tot_w_lat_histo", NvData::Uint64Array(latency(&[(3, 9)]).buckets));
         nv.push("vdev_tot_r_lat_histo", NvData::Uint64Array(latency(&[(4, 1)]).buckets));
         nv.push("vdev_tot_w_lat_histo", NvData::Uint64Array(latency(&[(5, 2)]).buckets));
