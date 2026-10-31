@@ -482,6 +482,110 @@ fn errno_hint(op: WriteOp, err: &io::Error) -> String {
     }
 }
 
+/**
+The subject of a `zfs allow` who-key (`zfs_deleg_who_type_t` in
+doc/reference/zfs.h, with the base/set case folded into [`DelegKey::sets`]):
+a user or group by numeric id, everyone, the `zfs allow -c` create-time
+grants, or a named permission set's definition (`zfs allow -s @name`).
+*/
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegSubject {
+    User(u64),
+    Group(u64),
+    Everyone,
+    Create,
+    NamedSet(String),
+}
+
+/// Where a delegation applies: the second character of a who-key.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegLocality {
+    /// `l` (ZFS_DELEG_LOCAL): the dataset itself.
+    Local,
+    /// `d` (ZFS_DELEG_DESCENDENT): its descendents.
+    Descendent,
+    /// `-` (ZFS_DELEG_NA): create-time grants and set definitions.
+    NotApplicable,
+}
+
+impl DelegLocality {
+    fn as_char(self) -> char {
+        match self {
+            DelegLocality::Local => 'l',
+            DelegLocality::Descendent => 'd',
+            DelegLocality::NotApplicable => '-',
+        }
+    }
+}
+
+/**
+A decoded `zfs allow` who-key, the keys of the per-dataset nvlists
+[`ZfsHandle::get_fsacl`] returns and `set_fsacl` writes:
+`<type><locality>$<id|setname>` (`zfs_deleg_whokey`, doc/reference/zfs_deleg.c).
+`sets` is the uppercase type char (`U`/`G`/`E`/`C`/`S`): the key's perm
+nvlist holds `@set` names to expand, not plain permissions. `Display`
+encodes it back to the kernel's spelling.
+*/
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegKey {
+    pub subject: DelegSubject,
+    pub sets: bool,
+    pub locality: DelegLocality,
+}
+
+impl DelegKey {
+    /**
+    Decode a who-key, accepting exactly what the kernel's `zfs_validate_who`
+    does (doc/reference/zfs_deleg.c): user/group/everyone keys take `l`/`d`,
+    create and named-set keys `-`; user/group ids are decimal, everyone and
+    create carry nothing after the `$`. Anything else is `None`. Set names
+    aren't re-checked against `permset_namecheck`, only required non-empty.
+    */
+    pub fn parse(key: &str) -> Option<DelegKey> {
+        let mut chars = key.chars();
+        let (ty, loc) = (chars.next()?, chars.next()?);
+        let rest = chars.as_str().strip_prefix('$')?;
+        let locality = match loc {
+            'l' => DelegLocality::Local,
+            'd' => DelegLocality::Descendent,
+            '-' => DelegLocality::NotApplicable,
+            _ => return None,
+        };
+        // decimal digits only: u64's FromStr alone would also take a leading `+`
+        let id = || rest.bytes().all(|b| b.is_ascii_digit()).then(|| rest.parse().ok()).flatten();
+        let subject = match ty.to_ascii_lowercase() {
+            'u' => DelegSubject::User(id()?),
+            'g' => DelegSubject::Group(id()?),
+            'e' if rest.is_empty() => DelegSubject::Everyone,
+            'c' if rest.is_empty() => DelegSubject::Create,
+            's' if !rest.is_empty() => DelegSubject::NamedSet(rest.to_owned()),
+            _ => return None,
+        };
+        let na = matches!(subject, DelegSubject::Create | DelegSubject::NamedSet(_));
+        if na != (locality == DelegLocality::NotApplicable) {
+            return None;
+        }
+        Some(DelegKey { subject, sets: ty.is_ascii_uppercase(), locality })
+    }
+}
+
+impl fmt::Display for DelegKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (ty, rest) = match &self.subject {
+            DelegSubject::User(id) => ('u', id.to_string()),
+            DelegSubject::Group(id) => ('g', id.to_string()),
+            DelegSubject::Everyone => ('e', String::new()),
+            DelegSubject::Create => ('c', String::new()),
+            DelegSubject::NamedSet(name) => ('s', name.clone()),
+        };
+        let ty = if self.sets { ty.to_ascii_uppercase() } else { ty };
+        write!(f, "{ty}{}${rest}", self.locality.as_char())
+    }
+}
+
 /// A `zfs allow` subject: a user/group (by numeric id) or everyone.
 #[cfg(feature = "write")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -616,16 +720,48 @@ fn resolve_id(name: &str, group: bool) -> Option<u64> {
 Build a delegation key: `<type><inherit>$<id>` for a user/group, `e<inherit>$`
 for everyone. Mirrors `zfs_deleg_whokey` (doc/reference/zfs_deleg.c); `$` is
 ZFS_DELEG_FIELD_SEP_CHR and `inherit` is `l` (ZFS_DELEG_LOCAL) or `d`
-(ZFS_DELEG_DESCENDENT), per doc/reference/zfs_deleg.h. A bare `zfs allow`
-writes both, which `set_fsacl` does.
+(ZFS_DELEG_DESCENDENT), per doc/reference/zfs_deleg.h. `sets` picks the
+uppercase type char (ZFS_DELEG_USER_SETS / GROUP_SETS / EVERYONE_SETS), the
+key whose perm nvlist holds `@set` names: the kernel expands sets only from
+those (`dsl_load_user_sets`, doc/reference/dsl_deleg.c). A bare `zfs allow`
+writes both localities, which `set_fsacl` does.
 */
 #[cfg(feature = "write")]
-fn deleg_whokey(who: &DelegWho, inherit: char) -> String {
-    match who {
-        DelegWho::User(id) => format!("u{inherit}${id}"),
-        DelegWho::Group(id) => format!("g{inherit}${id}"),
-        DelegWho::Everyone => format!("e{inherit}$"),
+fn deleg_whokey(who: &DelegWho, inherit: DelegLocality, sets: bool) -> String {
+    let subject = match who {
+        DelegWho::User(id) => DelegSubject::User(*id),
+        DelegWho::Group(id) => DelegSubject::Group(*id),
+        DelegWho::Everyone => DelegSubject::Everyone,
+    };
+    DelegKey { subject, sets, locality: inherit }.to_string()
+}
+
+/**
+The SET_FSACL nvlist for `set_fsacl`, as libzfs's `store_allow_perm` builds
+it (cmd/zfs/zfs_main.c): `perms` split on a leading `@` into permission
+sets and plain permissions, each non-empty half under its own key (set /
+base type char) for both localities. With no `perms` (a whole-who revoke)
+every one of the four keys gets a boolean, so the who's set grants go too.
+*/
+#[cfg(feature = "write")]
+fn fsacl_nvlist(who: &DelegWho, perms: &[String]) -> NvList {
+    let (sets, base): (Vec<&String>, Vec<&String>) = perms.iter().partition(|p| p.starts_with('@'));
+    let mut fsacl = NvList::new();
+    for inherit in [DelegLocality::Local, DelegLocality::Descendent] {
+        for (is_set, names) in [(false, &base), (true, &sets)] {
+            let whokey = deleg_whokey(who, inherit, is_set);
+            if perms.is_empty() {
+                fsacl.add_bool_flag(whokey);
+            } else if !names.is_empty() {
+                let mut permnv = NvList::new();
+                for p in names {
+                    permnv.add_bool_flag(p.as_str());
+                }
+                fsacl.add_nvlist(whokey, permnv);
+            }
+        }
     }
+    fsacl
 }
 
 /**
@@ -1530,7 +1666,8 @@ impl ZfsHandle {
     Delegated permissions for `dataset` — the `zfs allow` table
     (ZFS_IOC_GET_FSACL). The returned nvlist is keyed by the dataset and each
     ancestor that carries permissions; each maps to an nvlist of encoded
-    "who" keys → the granted permission set.
+    "who" keys ([`DelegKey::parse`] decodes them) → the granted permissions
+    (`@set` names under a set key).
     */
     pub fn get_fsacl(&self, dataset: &str) -> Result<NvList> {
         let mut zc = self.cmd();
@@ -2268,8 +2405,12 @@ impl ZfsHandle {
     i.e. local + descendent. The fsacl nvlist is keyed by the per-inheritance
     "who" key, each mapping to an nvlist of permission-name → boolean flag.
     Permission names are validated by the kernel (a bad one is a clean EINVAL).
+    A `@set` name in `perms` goes under the who's set key (`U`/`G`/`E`, see
+    [`DelegKey`]), the rest under its base key (`u`/`g`/`e`), as libzfs does;
+    a set granted under the base key would be stored but never expanded.
 
-    Revoking with no `perms` removes the who entirely (`zfs unallow <who>`):
+    Revoking with no `perms` removes the who entirely (`zfs unallow <who>`),
+    its set grants included (all four keys are flagged):
     that is encoded as a *non-nvlist* value (libzfs adds a boolean) —
     `dsl_deleg_unset_sync` drops the whole who only when the value isn't an
     nvlist, while an empty perm nvlist fails `zfs_deleg_verify_nvlist`
@@ -2287,19 +2428,7 @@ impl ZfsHandle {
         if perms.is_empty() && !unset {
             return Err(ZfsError::Invalid("zfs allow: no permissions given".into()));
         }
-        let mut fsacl = NvList::new();
-        for inherit in ['l', 'd'] {
-            let whokey = deleg_whokey(who, inherit);
-            if perms.is_empty() {
-                fsacl.add_bool_flag(whokey);
-                continue;
-            }
-            let mut permnv = NvList::new();
-            for p in perms {
-                permnv.add_bool_flag(p.clone());
-            }
-            fsacl.add_nvlist(whokey, permnv);
-        }
+        let fsacl = fsacl_nvlist(who, perms);
         let mut zc = self.cmd();
         zc.set_name(dataset)?;
         zc.zc_perm_action = unset as u64; // 0 = allow, 1 = unallow
@@ -3023,15 +3152,95 @@ mod tests {
         assert!(e.to_string().contains("16 bytes"), "{e}");
     }
 
+    #[test]
+    fn deleg_key_decodes_and_round_trips() {
+        use DelegLocality::{Descendent as D, Local as L, NotApplicable as Na};
+        let key = |subject, sets, locality| DelegKey { subject, sets, locality };
+        for (s, want) in [
+            ("ul$1000", key(DelegSubject::User(1000), false, L)),
+            ("Ud$1000", key(DelegSubject::User(1000), true, D)),
+            ("gl$0", key(DelegSubject::Group(0), false, L)),
+            ("Gd$50", key(DelegSubject::Group(50), true, D)),
+            ("el$", key(DelegSubject::Everyone, false, L)),
+            ("Ed$", key(DelegSubject::Everyone, true, D)),
+            ("c-$", key(DelegSubject::Create, false, Na)),
+            ("C-$", key(DelegSubject::Create, true, Na)),
+            ("s-$@t", key(DelegSubject::NamedSet("@t".into()), false, Na)),
+            ("S-$@t", key(DelegSubject::NamedSet("@t".into()), true, Na)),
+        ] {
+            assert_eq!(DelegKey::parse(s).as_ref(), Some(&want), "{s}");
+            assert_eq!(want.to_string(), s);
+        }
+        // what zfs_validate_who rejects
+        for bad in ["", "u", "ul", "ul1000", "ul$", "ul$x1", "ul$+1", "u-$1", "el$1", "e-$",
+                    "cl$", "c-$x", "s-$", "sl$@t", "xl$1", "ux$1", "ül$1"] {
+            assert_eq!(DelegKey::parse(bad), None, "{bad}");
+        }
+    }
+
     #[cfg(feature = "write")]
     #[test]
     fn whokey_format_matches_kernel() {
+        use DelegLocality::{Descendent as D, Local as L};
         // mirrors zfs_deleg_whokey: <type><inherit>$<id>, everyone has no id
-        assert_eq!(deleg_whokey(&DelegWho::User(1000), 'l'), "ul$1000");
-        assert_eq!(deleg_whokey(&DelegWho::User(1000), 'd'), "ud$1000");
-        assert_eq!(deleg_whokey(&DelegWho::Group(50), 'l'), "gl$50");
-        assert_eq!(deleg_whokey(&DelegWho::Everyone, 'l'), "el$");
-        assert_eq!(deleg_whokey(&DelegWho::Everyone, 'd'), "ed$");
+        assert_eq!(deleg_whokey(&DelegWho::User(1000), L, false), "ul$1000");
+        assert_eq!(deleg_whokey(&DelegWho::User(1000), D, false), "ud$1000");
+        assert_eq!(deleg_whokey(&DelegWho::Group(50), L, false), "gl$50");
+        assert_eq!(deleg_whokey(&DelegWho::Everyone, L, false), "el$");
+        assert_eq!(deleg_whokey(&DelegWho::Everyone, D, false), "ed$");
+        // the *_SETS keys: uppercase type char, same shape
+        assert_eq!(deleg_whokey(&DelegWho::User(1000), L, true), "Ul$1000");
+        assert_eq!(deleg_whokey(&DelegWho::Group(50), D, true), "Gd$50");
+        assert_eq!(deleg_whokey(&DelegWho::Everyone, L, true), "El$");
+    }
+
+    /// Unpack the packed SET_FSACL nvlist into (key, Some(perms) | None for a flag).
+    #[cfg(feature = "write")]
+    fn fsacl_shape(who: &DelegWho, perms: &[&str]) -> Vec<(String, Option<Vec<String>>)> {
+        let perms: Vec<String> = perms.iter().map(|p| p.to_string()).collect();
+        let nv = NvList::unpack(&fsacl_nvlist(who, &perms).pack().unwrap()).unwrap();
+        nv.iter()
+            .map(|p| {
+                let perms = match &p.data {
+                    NvData::List(l) => Some(l.iter().map(|q| q.name.clone()).collect()),
+                    NvData::BooleanFlag => None,
+                    other => panic!("{}: unexpected {}", p.name, other.type_name()),
+                };
+                (p.name.clone(), perms)
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn fsacl_splits_sets_from_perms() {
+        let v = |names: &[&str]| Some(names.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+        let k = |s: &str| s.to_string();
+        // store_allow_perm: base keys get the plain perms, set keys the @names
+        assert_eq!(
+            fsacl_shape(&DelegWho::User(1000), &["@a", "create"]),
+            [(k("ul$1000"), v(&["create"])), (k("Ul$1000"), v(&["@a"])),
+             (k("ud$1000"), v(&["create"])), (k("Ud$1000"), v(&["@a"]))]
+        );
+        // only one half present: the other key is left out entirely (an empty
+        // perm nvlist would fail zfs_deleg_verify_nvlist)
+        assert_eq!(
+            fsacl_shape(&DelegWho::Group(50), &["snapshot", "mount"]),
+            [(k("gl$50"), v(&["snapshot", "mount"])), (k("gd$50"), v(&["snapshot", "mount"]))]
+        );
+        assert_eq!(
+            fsacl_shape(&DelegWho::Everyone, &["@t"]),
+            [(k("El$"), v(&["@t"])), (k("Ed$"), v(&["@t"]))]
+        );
+        // whole-who revoke: a boolean under all four keys
+        assert_eq!(
+            fsacl_shape(&DelegWho::User(1000), &[]),
+            [(k("ul$1000"), None), (k("Ul$1000"), None), (k("ud$1000"), None), (k("Ud$1000"), None)]
+        );
+        assert_eq!(
+            fsacl_shape(&DelegWho::Everyone, &[]),
+            [(k("el$"), None), (k("El$"), None), (k("ed$"), None), (k("Ed$"), None)]
+        );
     }
 
     #[cfg(feature = "write")]

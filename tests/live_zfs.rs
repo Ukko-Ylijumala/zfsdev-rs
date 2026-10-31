@@ -664,6 +664,32 @@ fn hold_release_in_nonexistent_pool_is_a_clean_error() {
     eprintln!("hold/release canaries failed cleanly");
 }
 
+/**
+SET_FSACL on a dataset that cannot exist fails cleanly, for a grant mixing
+a `@set` and a plain permission (base and set keys) and for a whole-who
+revoke (four boolean keys) alike. `zfs_secpolicy_set_fsacl`'s zone check
+looks the dataset up before the handler verifies the nvlist, so this pins
+the ioctl number, the request path and the error mapping with no side
+effects; that the kernel accepts the key shapes is the playground
+round-trip's job (`unallow_whole_who_in_playground`).
+*/
+#[cfg(feature = "write")]
+#[test]
+fn set_fsacl_in_nonexistent_pool_is_a_clean_error() {
+    use zfsdev::ioctl::DelegWho;
+
+    let Some(zfs) = handle() else { return };
+    let ds = format!("{NOPE_POOL}/ds");
+    let who = DelegWho::User(unsafe { libc::getuid() } as u64);
+    let grant = zfs
+        .set_fsacl(&ds, &who, &["@canary".into(), "snapshot".into()], false)
+        .expect_err("allow on bogus ds must fail");
+    assert!(grant.to_string().starts_with("allow:"), "unmapped: {grant}");
+    let revoke = zfs.set_fsacl(&ds, &DelegWho::Everyone, &[], true).expect_err("unallow on bogus ds must fail");
+    assert!(revoke.to_string().starts_with("unallow:"), "unmapped: {revoke}");
+    eprintln!("set_fsacl canaries failed cleanly: {grant}");
+}
+
 #[test]
 fn get_fsacl_reads_delegations() {
     let Some(zfs) = handle() else { return };
@@ -720,12 +746,15 @@ the child, revoke the whole who, and check the child's own delegations are
 gone. The whole-who revoke must be encoded as a *non-nvlist* value — an
 empty perm nvlist fails `zfs_deleg_verify_nvlist` with EINVAL. Only the
 child's entries are touched (inherited playground perms live on the
-parent). Needs the `allow` delegation on the playground; skips otherwise.
+parent). Then the same for a `@set` grant, which must land under the
+uppercase set key and go with the whole who. Needs the `allow` delegation
+on the playground; skips otherwise.
 */
 #[cfg(feature = "write")]
 #[test]
 fn unallow_whole_who_in_playground() {
-    use zfsdev::ioctl::DelegWho;
+    use std::process::Command;
+    use zfsdev::ioctl::{DelegKey, DelegLocality, DelegSubject, DelegWho};
 
     const PLAYGROUND: &str = "data/test";
     let Some(zfs) = handle() else { return };
@@ -739,7 +768,8 @@ fn unallow_whole_who_in_playground() {
         eprintln!("skipping: cannot create {ds}: {e}");
         return;
     }
-    let me = DelegWho::User(unsafe { libc::getuid() } as u64);
+    let uid = unsafe { libc::getuid() } as u64;
+    let me = DelegWho::User(uid);
     let result = (|| -> Result<(), String> {
         if let Err(e) = zfs.set_fsacl(&ds, &me, &["snapshot".into()], false) {
             eprintln!("skipping: no `allow` delegation on {PLAYGROUND}: {e}");
@@ -752,6 +782,37 @@ fn unallow_whole_who_in_playground() {
         assert!(acl.pairs.is_empty(), "whole-who unallow left entries: {acl:?}");
         // an empty *grant* is refused client-side, never sent
         assert!(zfs.set_fsacl(&ds, &me, &[], false).is_err());
+
+        /*
+        A `@set` grant lands under the uppercase set key (`U<loc>$<uid>`),
+        the one the kernel expands; a whole-who revoke removes it too. The
+        set itself is defined via the CLI (`s-$@t`, which `set_fsacl` has
+        no who for) and stays until the child is destroyed.
+        */
+        let def = Command::new("zfs").args(["allow", "-s", "@t", "create", &ds]).output();
+        if !def.as_ref().is_ok_and(|o| o.status.success()) {
+            eprintln!("skipping set round-trip: `zfs allow -s @t` failed: {def:?}");
+            return Ok(());
+        }
+        zfs.set_fsacl(&ds, &me, &["@t".into()], false).map_err(|e| format!("allow @t: {e}"))?;
+        let keys = |zfs: &ZfsHandle| -> Result<Vec<DelegKey>, String> {
+            let acl = zfs.get_fsacl(&ds).map_err(|e| e.to_string())?;
+            let own = acl.get_list(&ds).ok_or_else(|| format!("no {ds} entry: {acl:?}"))?;
+            Ok(own.iter().filter_map(|p| DelegKey::parse(&p.name)).collect())
+        };
+        let got = keys(&zfs)?;
+        let mine = |k: &DelegKey| k.subject == DelegSubject::User(uid);
+        assert!(
+            got.iter().any(|k| mine(k) && k.sets && k.locality == DelegLocality::Local),
+            "@t grant not under the U key: {got:?}"
+        );
+        assert!(!got.iter().any(|k| mine(k) && !k.sets), "@t grant leaked into the u key: {got:?}");
+        let listing = Command::new("zfs").args(["allow", &ds]).output().map_err(|e| e.to_string())?;
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("@t"), "`zfs allow` doesn't show the grant: {listing}");
+        zfs.set_fsacl(&ds, &me, &[], true).map_err(|e| format!("unallow whole who: {e}"))?;
+        let got = keys(&zfs)?;
+        assert!(!got.iter().any(mine), "whole-who unallow left set grants: {got:?}");
         Ok(())
     })();
     let _ = zfs.destroy(&ds, false);
