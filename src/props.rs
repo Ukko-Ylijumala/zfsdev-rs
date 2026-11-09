@@ -127,6 +127,9 @@ enum ZfsProp {
     KeyFormat,
     KeyStatus,
     Encryption,
+    // the wrapping key's derivation parameters (keyformat=passphrase)
+    Pbkdf2Iters,
+    Pbkdf2Salt,
 }
 
 /* ----------------------------- vdev properties --------------------------- */
@@ -392,7 +395,7 @@ pub fn decode_prop_value(name: &str, v: u64) -> Option<PropValue> {
         }
 
         // plain small numbers (ashift 0 = auto)
-        P::Copies => V::Count(v),
+        P::Copies | P::Pbkdf2Iters | P::Pbkdf2Salt => V::Count(v),
         P::Ashift => match v {
             0 => name_of("auto"),
             _ => V::Count(v),
@@ -636,7 +639,9 @@ pub enum PropSettable {
     ReadOnly,
     /// Fixed when the dataset is created (`PROP_ONETIME`, `PROP_ONETIME_DEFAULT`):
     /// `encryption`, `keyformat`, `casesensitivity`, `normalization`, `utf8only`,
-    /// `volblocksize`. Also a pool's `tname`, given at creation or import.
+    /// `volblocksize`, and the `pbkdf2iters`/`pbkdf2salt` of a passphrase key
+    /// (later changed only by CHANGE_KEY). Also a pool's `tname`, given at
+    /// creation or import.
     CreateOnly,
     /// Settable at any time.
     Always,
@@ -784,6 +789,11 @@ fn typed_prop_value(name: &str, input: &str) -> Result<NvData, String> {
             }
         }
 
+        // the kernel checks the iteration minimum itself (dsl_crypt.c)
+        P::Pbkdf2Iters | P::Pbkdf2Salt => {
+            input.parse::<u64>().map_err(|_| format!("invalid number '{input}'")).and_then(u64v)
+        }
+
         // index prop, copies_table "1".."3" (zfs_prop.c)
         P::Copies => match input.parse::<u64>() {
             Ok(n @ 1..=3) => u64v(n),
@@ -890,18 +900,9 @@ enum ReadOnlyProp {
     Name,
     Origin,
     Version,
-    /*
-    the encryption identity/derivation fields: not settable through SET_PROP
-    (encryptionroot is computed; the pbkdf2 pair only changes via CHANGE_KEY,
-    i.e. `zfs change-key`), so from the property editor's viewpoint they are
-    read-only.
-    */
+    // computed from the dataset's place in the encryption hierarchy
     #[strum(serialize = "encryptionroot")]
     EncryptionRoot,
-    #[strum(serialize = "pbkdf2salt")]
-    Pbkdf2Salt,
-    #[strum(serialize = "pbkdf2iters")]
-    Pbkdf2Iters,
     // dataset: string-typed
     Clones,
     ReceiveResumeToken,
@@ -985,7 +986,9 @@ impl ZfsProp {
             | P::CaseSensitivity
             | P::Normalization
             | P::Utf8Only
-            | P::Volblocksize => PropSettable::CreateOnly,
+            | P::Volblocksize
+            | P::Pbkdf2Iters
+            | P::Pbkdf2Salt => PropSettable::CreateOnly,
             _ => PropSettable::Always,
         }
     }
@@ -1276,6 +1279,8 @@ mod tests {
             ("normalization", "formKC"),
             ("utf8only", "on"),
             ("volblocksize", "16K"),
+            ("pbkdf2iters", "350000"),
+            ("pbkdf2salt", "1234567890123456789"),
         ];
         for (prop, value) in create_only {
             assert_eq!(prop_settable(prop), PropSettable::CreateOnly, "{prop}");
@@ -1332,13 +1337,12 @@ mod tests {
     `prop_settable` agrees with the property tables of every verified release
     (`zfs_prop.c` and `zpool_prop.c`, 2.2 at the reference root), by the rule
     libzfs applies: `PROP_READONLY` is never settable, `PROP_ONETIME` and
-    `PROP_ONETIME_DEFAULT` only at creation. `STRICTER` are the ones held
-    read-only on purpose: a `version` upgrade is one-way, and the pbkdf2 pair
-    belongs to the wrapping key (CHANGE_KEY), not to a property edit.
+    `PROP_ONETIME_DEFAULT` only at creation. `version` alone is held
+    read-only on purpose (`STRICTER`): an upgrade is one-way.
     */
     #[test]
     fn settability_matches_vendored_property_tables() {
-        const STRICTER: [&str; 3] = ["version", "pbkdf2iters", "pbkdf2salt"];
+        const STRICTER: [&str; 1] = ["version"];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("doc/reference");
         let mut seen = 0;
         for dir in ["0.8", "2.0", "2.1", "", "2.3", "2.4"] {
