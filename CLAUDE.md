@@ -93,6 +93,11 @@ table, Linux-only), `wrapkey` (libzfs wrapping-key derivation).
   handlers validate innvl key *types* before resolving names: a mistyped key
   fails with ZFS_ERR_IOC_ARG_BADTYPE, which a canary against a nonexistent
   pool would otherwise mask behind ENOENT (CREATE's `type` must be int32).
+- SET_PROP checks a value's *type* and nothing else: the kernel stores a
+  read-only or create-only dataset property it is handed (libzfs is what
+  refuses them, in userspace). `props::prop_settable` is the only gate, so a
+  property added to `ZfsProp` or found read-only upstream must be classified
+  there (`ZfsProp::settable`, `ReadOnlyProp`).
 - Per-ioctl quirks (back-filled ERROR_LOG buffers, USERSPACE_MANY's raw
   `zfs_useracct_t` array, the asymmetric HOLD/RELEASE nvlists, ATTACH using
   `zc_nvlist_conf`, VDEV_GET_PROPS returning computed props only when named,

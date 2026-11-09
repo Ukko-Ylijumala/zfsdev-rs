@@ -35,6 +35,7 @@ const ZPROP_SOURCE_VAL_RECVD: &str = "$recvd";
 /// Every property name we know how to render. Lowercase matching; names
 /// with underscores are spelled out explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+#[cfg_attr(test, derive(EnumIter, IntoStaticStr))]
 #[strum(serialize_all = "lowercase")]
 enum ZfsProp {
     // zio enums
@@ -619,6 +620,27 @@ pub fn prop_str<'a>(props: &'a NvList, name: &str) -> Option<&'a str> {
 
 /* ------------------------------- parsing --------------------------------- */
 
+/**
+Whether, and when, a dataset or pool property can be set: the `zprop_attr_t`
+of its registration in zfs_prop.c / zpool_prop.c. Only libzfs enforces this
+(`zfs_valid_proplist`). The kernel's SET_PROP checks a value's *type* and
+nothing else, and stores a read-only or create-only property it is handed in
+the dataset's props ZAP as a local setting. A stored `encryption` then
+shows on a dataset that isn't encrypted, and `zfs inherit` refuses to clear
+a property of either kind. So this classification is the only gate there is.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PropSettable {
+    /// Computed or informational (`PROP_READONLY`): never settable.
+    ReadOnly,
+    /// Fixed when the dataset is created (`PROP_ONETIME`): `encryption`,
+    /// `keyformat`, `casesensitivity`, `normalization`, `utf8only`, `volblocksize`.
+    CreateOnly,
+    /// Settable at any time.
+    Always,
+}
+
 /// Parse a value enum from its name (case-insensitively), wrapping the repr.
 macro_rules! enum_val {
     ($ty:ty, $input:expr, $name:expr) => {
@@ -631,15 +653,46 @@ macro_rules! enum_val {
 
 /**
 Parse a user-entered property value into the typed [`NvData`] the SET_PROP
-nvlist needs. Read-only properties are rejected with a message; unknown or
-string-valued properties pass through as strings. The kernel re-validates
-every set, so a value that slips through here still fails cleanly rather
-than corrupting anything.
+nvlist needs, for a dataset or pool that exists. Read-only and create-only
+properties ([`prop_settable`]) are rejected with a message; unknown or
+string-valued properties pass through as strings. The kernel re-validates a
+value's type and range, so a bad *value* that slips through here fails
+cleanly. It does not check whether the property may be set at all: that
+gate is here ([`PropSettable`]).
 
 `xattr=on` follows the loaded Linux kernel's version. If that version cannot
 be determined (including on other platforms), use the explicit `dir` or `sa`.
 */
 pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
+    match prop_settable(name) {
+        PropSettable::ReadOnly => Err(read_only(name)),
+        PropSettable::CreateOnly => {
+            Err(format!("'{name}' can only be set when the dataset is created"))
+        }
+        PropSettable::Always => typed_prop_value(name, input),
+    }
+}
+
+/**
+[`parse_prop_value`] for the creation properties of a new dataset (CREATE's
+`props`), which may also carry the create-only ones: `encryption`,
+`casesensitivity`, `volblocksize`, … Read-only properties are still rejected.
+*/
+pub fn parse_create_prop_value(name: &str, input: &str) -> Result<NvData, String> {
+    match prop_settable(name) {
+        PropSettable::ReadOnly => Err(read_only(name)),
+        PropSettable::CreateOnly | PropSettable::Always => typed_prop_value(name, input),
+    }
+}
+
+/// The message a read-only property's set is refused with.
+fn read_only(name: &str) -> String {
+    format!("'{name}' is a read-only property")
+}
+
+/// The typed value of `input` for property `name`, whenever it may be set
+/// (the callers gate that). Read-only properties have no value to parse.
+fn typed_prop_value(name: &str, input: &str) -> Result<NvData, String> {
     let input = input.trim();
     // user properties (module:name) are always free-form strings
     if name.contains(':') {
@@ -679,7 +732,8 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
         | P::BcloneRatio
         | P::Fragmentation
         | P::Mounted
-        | P::KeyStatus => Err(format!("'{name}' is a read-only property")),
+        | P::DeferDestroy
+        | P::KeyStatus => Err(read_only(name)),
 
         // booleans
         P::Atime
@@ -694,7 +748,6 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
         | P::Nbmand
         | P::Utf8Only
         | P::Overlay
-        | P::DeferDestroy
         | P::AutoExpand
         | P::AutoReplace
         | P::Delegation
@@ -807,10 +860,14 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
 
 /**
 Always-read-only informational properties (pool and dataset) that aren't
-modelled as [`ZfsProp`] — purely a membership set for [`is_editable`], so a
-plain `EnumString` is enough. The computed props (used/available/…) live in
+modelled as [`ZfsProp`] — purely a membership set for [`prop_settable`], so
+a plain `EnumString` is enough. The computed props (used/available/…) live in
 `ZfsProp`; these are the identity/state fields that would otherwise fall
-through to "editable string".
+through to "editable string". With the read-only arm of
+[`ZfsProp::settable`] this is every `PROP_READONLY` registration of
+zfs_prop.c and zpool_prop.c from OpenZFS 2.2 to 2.4, hidden ones included.
+The string-typed ones matter most: the kernel takes a string for them (see
+[`PropSettable`]), while a string for a numeric one is a clean EINVAL.
 */
 #[derive(EnumString)]
 #[strum(serialize_all = "snake_case")]
@@ -843,57 +900,110 @@ enum ReadOnlyProp {
     Pbkdf2Salt,
     #[strum(serialize = "pbkdf2iters")]
     Pbkdf2Iters,
+    // dataset: string-typed
+    Clones,
+    ReceiveResumeToken,
+    RedactSnaps,
+    #[strum(serialize = "prevsnap")]
+    PrevSnap,
+    // dataset: counters and state
+    FilesystemCount,
+    SnapshotCount,
+    SnapshotsChanged,
+    #[strum(serialize = "userrefs")]
+    UserRefs,
+    #[strum(serialize = "numclones")]
+    NumClones,
+    Unique,
+    Inconsistent,
+    Redacted,
+    #[strum(serialize = "ivsetguid")]
+    IvsetGuid,
+    #[strum(serialize = "keyguid")]
+    KeyGuid,
+    #[strum(serialize = "remaptxg")]
+    RemapTxg,
+    #[strum(serialize = "useraccounting")]
+    UserAccounting,
+    // pool
+    #[strum(serialize = "dedupcached")]
+    DedupCached,
+    DedupTableSize,
+    LastScrubbedTxg,
+    #[strum(serialize = "maxblocksize")]
+    MaxBlockSize,
+    #[strum(serialize = "maxdnodesize")]
+    MaxDnodeSize,
+}
+
+impl ZfsProp {
+    /// When this property can be set. The read-only arm is the one
+    /// `typed_prop_value` has no value for (a test cross-checks the two).
+    fn settable(self) -> PropSettable {
+        use ZfsProp as P;
+        match self {
+            P::Used
+            | P::Available
+            | P::Referenced
+            | P::UsedBySnapshots
+            | P::UsedByDataset
+            | P::UsedByChildren
+            | P::UsedByRefReservation
+            | P::Written
+            | P::LogicalUsed
+            | P::LogicalReferenced
+            | P::Size
+            | P::Free
+            | P::Allocated
+            | P::Freeing
+            | P::Leaked
+            | P::Checkpoint
+            | P::BcloneUsed
+            | P::BcloneSaved
+            | P::Creation
+            | P::CompressRatio
+            | P::RefCompressRatio
+            | P::BcloneRatio
+            | P::Fragmentation
+            | P::Mounted
+            | P::DeferDestroy
+            | P::KeyStatus => PropSettable::ReadOnly,
+            P::Encryption
+            | P::KeyFormat
+            | P::CaseSensitivity
+            | P::Normalization
+            | P::Utf8Only
+            | P::Volblocksize => PropSettable::CreateOnly,
+            _ => PropSettable::Always,
+        }
+    }
 }
 
 /**
-Whether a dataset/pool property can be set (vs. a computed/read-only one).
-Unknown names — `mountpoint`, `comment`, `module:user` props — are editable
-strings. The read-only set mirrors the rejection arm in [`parse_prop_value`]
-(a test cross-checks the two).
+When a dataset or pool property can be set ([`PropSettable`]). User
+properties (`module:name`) always can. A name this crate doesn't know —
+`mountpoint`, `sharenfs`, `comment`, a property of a newer OpenZFS — counts as
+settable, since the genuinely settable string properties aren't modelled;
+the known read-only ones are (`ReadOnlyProp`, and the read-only arm of
+`ZfsProp::settable`).
+*/
+pub fn prop_settable(name: &str) -> PropSettable {
+    if name.contains(':') {
+        return PropSettable::Always;
+    }
+    if ReadOnlyProp::from_str(name).is_ok() {
+        return PropSettable::ReadOnly;
+    }
+    ZfsProp::from_str(name).map_or(PropSettable::Always, ZfsProp::settable)
+}
+
+/**
+Whether a property of an existing dataset or pool can be set: neither
+read-only nor create-only ([`prop_settable`]). Unknown names — `mountpoint`,
+`comment`, `module:user` props — are editable strings.
 */
 pub fn is_editable(name: &str) -> bool {
-    use ZfsProp as P;
-    /*
-    always-read-only informational props that aren't modelled as `ZfsProp`
-    (pool and dataset alike); without this they'd fall through to "editable
-    string". Genuinely settable string props (mountpoint, sharenfs, user
-    props) are deliberately *not* in [`ReadOnlyProp`] — unknown defaults to
-    editable.
-    */
-    if ReadOnlyProp::from_str(name).is_ok() {
-        return false;
-    }
-    match ZfsProp::from_str(name) {
-        Ok(p) => !matches!(
-            p,
-            P::Used
-                | P::Available
-                | P::Referenced
-                | P::UsedBySnapshots
-                | P::UsedByDataset
-                | P::UsedByChildren
-                | P::UsedByRefReservation
-                | P::Written
-                | P::LogicalUsed
-                | P::LogicalReferenced
-                | P::Size
-                | P::Free
-                | P::Allocated
-                | P::Freeing
-                | P::Leaked
-                | P::Checkpoint
-                | P::BcloneUsed
-                | P::BcloneSaved
-                | P::Creation
-                | P::CompressRatio
-                | P::RefCompressRatio
-                | P::BcloneRatio
-                | P::Fragmentation
-                | P::Mounted
-                | P::KeyStatus
-        ),
-        Err(_) => true,
-    }
+    prop_settable(name) == PropSettable::Always
 }
 
 /// Whether a *vdev* property can be set — the small settable subset (the rest
@@ -1117,6 +1227,63 @@ mod tests {
         assert!(parse_vdev_prop_value("state", "x").is_err());
     }
 
+    /**
+    The kernel's SET_PROP stores whatever property it is handed, so the
+    read-only and create-only ones must stop here: every `PROP_READONLY` /
+    `PROP_ONETIME` dataset property of zfs_prop.c (2.2 through 2.4) that
+    isn't a user-visible statistic already covered above.
+    */
+    #[test]
+    fn read_only_and_create_only_props_are_refused() {
+        let never = [
+            // string-typed: the kernel would take these as given
+            "name", "origin", "clones", "prevsnap", "receive_resume_token", "encryptionroot",
+            "redact_snaps", "type",
+            // numbers and indexes
+            "defer_destroy", "userrefs", "filesystem_count", "snapshot_count", "snapshots_changed",
+            "numclones", "unique", "inconsistent", "redacted", "ivsetguid", "keyguid", "remaptxg",
+            "useraccounting", "keystatus", "mounted", "objsetid", "createtxg", "guid",
+            // pool
+            "dedupcached", "dedup_table_size", "last_scrubbed_txg", "maxblocksize", "maxdnodesize",
+        ];
+        for ro in never {
+            assert_eq!(prop_settable(ro), PropSettable::ReadOnly, "{ro}");
+            assert!(!is_editable(ro), "{ro}");
+            assert_eq!(parse_prop_value(ro, "1"), Err(read_only(ro)), "{ro}");
+            assert_eq!(parse_create_prop_value(ro, "1"), Err(read_only(ro)), "{ro}");
+        }
+        let create_only = [
+            ("encryption", "aes-256-gcm"),
+            ("keyformat", "passphrase"),
+            ("casesensitivity", "mixed"),
+            ("normalization", "formKC"),
+            ("utf8only", "on"),
+            ("volblocksize", "16K"),
+        ];
+        for (prop, value) in create_only {
+            assert_eq!(prop_settable(prop), PropSettable::CreateOnly, "{prop}");
+            assert!(!is_editable(prop), "{prop}");
+            let refused = parse_prop_value(prop, value).unwrap_err();
+            assert!(refused.contains("created"), "{prop}: {refused}");
+            assert!(matches!(parse_create_prop_value(prop, value), Ok(NvData::Uint64(_))), "{prop}");
+        }
+        for ok in ["compression", "readonly", "keylocation", "mountpoint", "com.example:name"] {
+            assert_eq!(prop_settable(ok), PropSettable::Always, "{ok}");
+        }
+    }
+
+    /// `ZfsProp::settable` and the value parser agree on which modelled
+    /// properties are read-only: exactly those have no value to parse.
+    #[test]
+    fn settability_matches_the_value_parser() {
+        for prop in ZfsProp::iter() {
+            let name: &'static str = prop.into();
+            let refused = typed_prop_value(name, "1") == Err(read_only(name));
+            assert_eq!(refused, prop.settable() == PropSettable::ReadOnly, "{name}");
+            assert_eq!(prop_settable(name), prop.settable(), "{name}");
+        }
+    }
+
     #[rustfmt::skip]
     #[test]
     fn parse_typed_values() {
@@ -1151,8 +1318,8 @@ mod tests {
         // value enums, including a mixed-case custom serialize
         assert_eq!(parse_prop_value("canmount", "noauto").unwrap(), Uint64(2));
         assert_eq!(parse_prop_value("sync", "always").unwrap(), Uint64(1));
-        assert_eq!(parse_prop_value("normalization", "formC").unwrap(), Uint64(0x50));
-        assert_eq!(parse_prop_value("normalization", "formD").unwrap(), Uint64(0x10));
+        assert_eq!(parse_create_prop_value("normalization", "formC").unwrap(), Uint64(0x50));
+        assert_eq!(parse_create_prop_value("normalization", "formD").unwrap(), Uint64(0x10));
         // volmode aliases: full and geom are the same kernel value
         assert_eq!(parse_prop_value("volmode", "full").unwrap(), Uint64(1));
         assert_eq!(parse_prop_value("volmode", "geom").unwrap(), Uint64(1));
@@ -1186,8 +1353,8 @@ mod tests {
         assert_eq!(parse_prop_value("ashift", "0").unwrap(), Uint64(0));
         assert!(parse_prop_value("ashift", "8").is_err());
         // encryption suites at their zio_encrypt values
-        assert_eq!(parse_prop_value("encryption", "aes-256-gcm").unwrap(), Uint64(8));
-        assert_eq!(parse_prop_value("encryption", "off").unwrap(), Uint64(2));
+        assert_eq!(parse_create_prop_value("encryption", "aes-256-gcm").unwrap(), Uint64(8));
+        assert_eq!(parse_create_prop_value("encryption", "off").unwrap(), Uint64(2));
         // dnodesize auto
         assert_eq!(parse_prop_value("dnodesize", "auto").unwrap(), Uint64(1));
         assert_eq!(parse_prop_value("dnodesize", "legacy").unwrap(), Uint64(0));
