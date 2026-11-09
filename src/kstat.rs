@@ -97,6 +97,9 @@ const TYPE_WIDTH: usize = 4;
 const KSTAT_DATA_CHAR: u8 = 0;
 /// `KSTAT_DATA_STRING`: a string, printed as is.
 const KSTAT_DATA_STRING: u8 = 7;
+/// The width `import_progress` pads a pool name to when the `notes` column
+/// follows it (`%-16s`).
+const IMPORT_NAME_WIDTH: usize = 16;
 
 /**
 A parsed named kstat: `name → value`. See the module docs for the wire format
@@ -356,7 +359,7 @@ pub fn is_throttled(arc: &Kstat) -> bool {
 /**
 Pool `pool`'s kstat directory, `/proc/spl/kstat/zfs/<pool>`. A name that
 could leave that directory is refused: pool names begin with a letter and
-contain no `/`.
+contain no `/`. They may contain spaces.
 */
 #[cfg(target_os = "linux")]
 pub fn pool_dir(pool: &str) -> io::Result<PathBuf> {
@@ -368,9 +371,10 @@ pub fn pool_dir(pool: &str) -> io::Result<PathBuf> {
 }
 
 /// Whether `name` could be a pool's: pool names begin with a letter, use only
-/// alphanumeric or `-_.:` characters, and are not exactly `mirror`, `raidz`
-/// or `draid` (`pool_namecheck`). Creation/import has stricter prefix rules;
-/// readers must still accept legacy pools such as `mirrorpool` and `spare`.
+/// alphanumeric, `-_.:` or space characters, and are not exactly `mirror`,
+/// `raidz` or `draid` (`pool_namecheck`, whose `valid_char` takes a space).
+/// Creation/import has stricter prefix rules; readers must still accept
+/// legacy pools such as `mirrorpool` and `spare`.
 #[cfg(target_os = "linux")]
 fn is_pool_name(name: &str) -> bool {
     let valid_chars = name.starts_with(|c: char| c.is_ascii_alphabetic())
@@ -378,7 +382,7 @@ fn is_pool_name(name: &str) -> bool {
         && name.len() < 240
         && name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'));
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b' '));
     let reserved = matches!(name, "mirror" | "raidz" | "draid");
     valid_chars && !reserved
 }
@@ -796,7 +800,7 @@ A pool load in progress, from the host-wide `import_progress` table: a
 runs. An import holds the pool namespace lock for its whole load, so while
 one runs every pool ioctl on the host waits for it; this table, which takes
 no ZFS lock, is where that shows. The format is unchanged from ZoL 0.8 to
-OpenZFS 2.3; 2.4 appends the `notes` column.
+OpenZFS 2.2; 2.3 appends the `notes` column.
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -811,33 +815,32 @@ pub struct ImportProgress {
     /// The newest txg the load may use: lowered step by step as a recovery
     /// import rewinds, `u64::MAX` when uncapped.
     pub max_txg: u64,
-    /// What the load is doing, in the kernel's words (2.4 on).
+    /// What the load is doing, in the kernel's words (2.3 on).
     pub notes: Option<String>,
 }
 
 /**
 Parse an `import_progress` table: a header line, then one row per load.
-Columns are found by their header names; `notes` is free text and runs to
-the end of the line. A `-` name or note is absent.
+Columns are found by their header names. The pool name may hold spaces and
+`notes` is free text, so those two are cut out of the row's tail by the
+kernel's column layout, where the rest splits at whitespace. A `-` name or
+note is absent.
 */
 pub fn parse_import_progress(text: &str) -> Vec<ImportProgress> {
     let mut lines = text.lines();
     let Some(header) = lines.next() else { return Vec::new() };
-    let cols: HashMap<&str, usize> =
-        header.split_whitespace().enumerate().map(|(i, c)| (c, i)).collect();
+    let header: Vec<&str> = header.split_whitespace().collect();
+    let cols: HashMap<&str, usize> = header.iter().enumerate().map(|(i, c)| (*c, i)).collect();
     let present = |s: &str| (s != "-").then(|| s.to_string());
     lines
         .filter_map(|line| {
             let row: Vec<&str> = line.split_whitespace().collect();
             let field = |name: &str| row.get(*cols.get(name)?).copied();
             let num = |name: &str| field(name)?.parse::<u64>().ok();
-            let notes = cols
-                .get("notes")
-                .and_then(|&i| token_spans(line).nth(i))
-                .map(|(start, _)| line[start..].trim_end());
+            let (pool, notes) = import_name_and_notes(line, &cols, header.len())?;
             Some(ImportProgress {
                 pool_guid: num("pool_guid")?,
-                pool: present(field("pool_name")?),
+                pool: present(pool),
                 load_state: Coded::new(num("load_state")?),
                 multihost_secs: num("multihost_secs")?,
                 max_txg: num("max_txg")?,
@@ -845,6 +848,46 @@ pub fn parse_import_progress(text: &str) -> Vec<ImportProgress> {
             })
         })
         .collect()
+}
+
+/**
+The `pool_name` and `notes` of an `import_progress` row; `None` for a row
+without a name. The kernel prints the name last (`%s`, up to 2.2) or padded
+to [`IMPORT_NAME_WIDTH`] with the notes after it (`%-16s %s`, 2.3 on), and a
+pool name may hold spaces, so with that layout the two are told apart by
+column, not by whitespace. A name of that width or longer runs straight into
+its notes: it is then cut at its first space, which is wrong only for a
+long name that itself holds one (the line doesn't say where it ends). Any
+other column order falls back to whitespace tokens.
+*/
+fn import_name_and_notes<'a>(
+    line: &'a str,
+    cols: &HashMap<&str, usize>,
+    ncols: usize,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let name_col = *cols.get("pool_name")?;
+    let notes_col = cols.get("notes").copied();
+    let tail_from = |col: usize| {
+        token_spans(line).nth(col).map(|(start, _)| line[start..].trim_end())
+    };
+    let tail = tail_from(name_col)?;
+    let first_word = || tail.split_once(char::is_whitespace);
+    if name_col + 1 == ncols {
+        return Some((tail, None));
+    }
+    if notes_col != Some(name_col + 1) || name_col + 2 != ncols {
+        let name = first_word().map_or(tail, |(name, _)| name);
+        return Some((name, notes_col.and_then(tail_from)));
+    }
+    if tail.len() <= IMPORT_NAME_WIDTH {
+        return Some((tail, None));
+    }
+    // a space is never inside a UTF-8 sequence: both cuts are char boundaries
+    if tail.as_bytes()[IMPORT_NAME_WIDTH] == b' ' {
+        let (name, notes) = tail.split_at(IMPORT_NAME_WIDTH);
+        return Some((name.trim_end(), Some(notes.trim_start())));
+    }
+    Some(first_word().map_or((tail, None), |(name, notes)| (name, Some(notes.trim_start()))))
 }
 
 /// The pool loads in progress on this host ([`parse_import_progress`]).
@@ -1191,13 +1234,15 @@ mod tests {
         assert_eq!(pool_dir("tank").unwrap(), Path::new("/proc/spl/kstat/zfs/tank"));
         for bad in [
             "", "..", ".", "a/../b", "9pool", "/etc", "mirror", "raidz", "draid",
-            "bad$pool", "bad pool",
+            "bad$pool", " pool", "a/b c",
         ] {
             assert!(pool_dir(bad).is_err(), "{bad:?}");
         }
         for legacy in ["mirrorpool", "raidz1", "draid2", "spare", "log"] {
             assert!(pool_dir(legacy).is_ok(), "{legacy:?}");
         }
+        // pool_namecheck's valid_char takes a space
+        assert_eq!(pool_dir("my pool").unwrap(), Path::new("/proc/spl/kstat/zfs/my pool"));
         assert!(pool_dir(&"a".repeat(239)).is_ok());
         assert!(pool_dir(&"a".repeat(240)).is_err());
     }
@@ -1211,7 +1256,7 @@ mod tests {
     #[test]
     fn pool_names_are_the_dirs_with_a_state() {
         let dir = std::env::temp_dir().join(format!("zfsdev-pool-names-{}", std::process::id()));
-        for pool in ["tank", "rpool", "mirrorpool", "spare", "$import"] {
+        for pool in ["tank", "rpool", "mirrorpool", "spare", "my pool", "$import"] {
             fs::create_dir_all(dir.join(pool)).unwrap();
             fs::write(dir.join(pool).join("state"), "ONLINE\n").unwrap();
         }
@@ -1219,10 +1264,10 @@ mod tests {
         fs::write(dir.join("arcstats"), ARC_22).unwrap();
         let names = pool_names_in(&dir);
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(names.unwrap(), ["mirrorpool", "rpool", "spare", "tank"]);
+        assert_eq!(names.unwrap(), ["mirrorpool", "my pool", "rpool", "spare", "tank"]);
     }
 
-    /// Both table eras, as spa_import_progress_show prints them: the 2.4 one
+    /// Both table eras, as spa_import_progress_show prints them: the 2.3 one
     /// adds the free-text `notes` column.
     #[test]
     fn import_progress_parses_both_eras() {
@@ -1237,15 +1282,51 @@ mod tests {
         // a tryimport scan before it knows the name
         assert_eq!((rows[1].pool.as_deref(), rows[1].load_state.to_string().as_str()), (None, "tryimport"));
 
-        let v24 = "pool_guid            load_state     multihost_secs max_txg      pool_name        notes\n\
+        let v23 = "pool_guid            load_state     multihost_secs max_txg      pool_name        notes\n\
                    7                    4              0              1234         tank             Loading checkpoint txg\n\
                    8                    9              0              5            data             -\n";
-        let rows = parse_import_progress(v24);
+        let rows = parse_import_progress(v23);
         assert_eq!(rows[0].notes.as_deref(), Some("Loading checkpoint txg"));
         assert_eq!(rows[0].load_state.get(), Some(SpaLoadState::Recover));
         // a load state newer than this crate keeps its number
         assert_eq!((rows[1].load_state.to_string().as_str(), rows[1].notes.as_deref()), ("?9", None));
         assert!(parse_import_progress("").is_empty());
+    }
+
+    /**
+    A pool name may hold spaces (`pool_namecheck`): the name and the notes
+    are cut by the kernel's columns (`%s` last up to 2.2, `%-16s %s` from
+    2.3), not at whitespace.
+    */
+    #[test]
+    fn import_progress_keeps_spaces_in_pool_names() {
+        let parse = |text: &str| {
+            let rows = parse_import_progress(text);
+            assert_eq!(rows.len(), 1, "{text:?}");
+            assert_eq!((rows[0].pool_guid, rows[0].max_txg), (7, u64::MAX), "{text:?}");
+            (rows[0].pool.clone(), rows[0].notes.clone())
+        };
+        let own = |s: &str| Some(s.to_string());
+        let nums = format!("{:<20} {:<14} {:<14} {:<12}", 7, 2, 0, u64::MAX);
+
+        let head22 = "pool_guid            load_state     multihost_secs max_txg      pool_name";
+        let v22 = |name: &str| format!("{head22}\n{nums} {name}\n");
+        assert_eq!(parse(&v22("my pool")), (own("my pool"), None));
+        assert_eq!(parse(&v22("a b c d e f g h i j k")), (own("a b c d e f g h i j k"), None));
+
+        let head23 = format!("{head22}        notes");
+        let v23 = |name: &str, notes: &str| format!("{head23}\n{nums} {name:<16} {notes}\n");
+        let checking = "Checking feature flags";
+        assert_eq!(parse(&v23("my pool", checking)), (own("my pool"), own(checking)));
+        assert_eq!(parse(&v23("my pool", "-")), (own("my pool"), None));
+        assert_eq!(parse(&v23("tank", checking)), (own("tank"), own(checking)));
+        // exactly the column's width, and wider: the name runs into its notes
+        assert_eq!(parse(&v23("0123456789abcdef", checking)), (own("0123456789abcdef"), own(checking)));
+        assert_eq!(parse(&v23("a_pool_name_past_16", checking)), (own("a_pool_name_past_16"), own(checking)));
+        assert_eq!(parse(&v23("a_pool_name_past_16", "-")), (own("a_pool_name_past_16"), None));
+        // a row cut short after the name
+        assert_eq!(parse(&format!("{head23}\n{nums} my pool\n")), (own("my pool"), None));
+        assert_eq!(parse(&format!("{head23}\n{nums} a_pool_name_past_16\n")), (own("a_pool_name_past_16"), None));
     }
 
     #[test]
