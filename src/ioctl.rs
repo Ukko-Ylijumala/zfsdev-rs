@@ -13,7 +13,7 @@ merely 8 bytes shorter, missing the *trailing* `zc_zoneid` — safe, since
 the kernel copies its own smaller sizeof in both directions); the per-era
 analyses live in `doc/reference/<version>/README.md`. The two pre-2.0
 decode differences (`dds_origin` offset, `pss_skipped` semantics) key off
-[`kernel_pre_2_0`], probed once from `/sys/module/zfs/version`. Ioctl
+[`kernel_pre_2_0`], probed from `/sys/module/zfs/version`. Ioctl
 numbers ([`Ioc`], `0x5a00 + n`, `doc/reference/zfs.h`) live in the
 "legacy" range that has been stable since at least 0.6.3 (2014), the
 platform range (`0x5a80`, events) included.
@@ -53,7 +53,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::{LazyLock, PoisonError, RwLock};
+use std::path::Path;
+use std::sync::{OnceLock, PoisonError, RwLock};
 use strum::{Display, EnumIter, IntoEnumIterator};
 use thiserror::Error;
 
@@ -111,6 +112,8 @@ const DEV_PATCH_LEVEL: u32 = 99;
 
 /// Process-wide options for [`ZfsHandle::open`].
 static DEFAULT_OPTIONS: RwLock<HandleOptions> = RwLock::new(HandleOptions::DEFAULT);
+/// The loaded module's version, once a probe has read it ([`kernel_version`]).
+static KERNEL_VERSION: OnceLock<KernelVersion> = OnceLock::new();
 
 /**
 The `/dev/zfs` ioctls this module issues, by `zfs_ioc_t` ordinal
@@ -1172,7 +1175,8 @@ The loaded ZFS module's release, from `/sys/module/zfs/version` (e.g.
 "2.2.2-0ubuntu9" or "0.8.6-1"). Only major.minor is kept — that is all the
 ABI-era decisions need — except that a development build's `.99` patch level
 counts as the next minor (master after the 2.4 branch is "2.4.99", i.e. the
-2.5 line). Read once per process; `None` when no module is loaded.
+2.5 line). `None` while no module is loaded; once read, the version is kept
+for the life of the process ([`kernel_version`]).
 */
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct KernelVersion {
@@ -1198,12 +1202,23 @@ impl fmt::Display for KernelVersion {
     }
 }
 
-static KERNEL_VERSION: LazyLock<Option<KernelVersion>> =
-    LazyLock::new(|| fs::read_to_string(ZFS_MODULE_VERSION).ok().as_deref().and_then(KernelVersion::parse));
-
-/// The loaded module's version, if one could be probed.
+/**
+The loaded module's version, if one could be probed. Only a version that
+was read is remembered: a failed probe (no module loaded yet) is repeated on
+the next call, so a process that asks before the module loads isn't left
+with an unknown kernel, and its writes refused, until it restarts.
+*/
 pub fn kernel_version() -> Option<KernelVersion> {
-    *KERNEL_VERSION
+    probe_version(&KERNEL_VERSION, Path::new(ZFS_MODULE_VERSION))
+}
+
+/// [`kernel_version`] over `cache` and the version file `path`.
+fn probe_version(cache: &OnceLock<KernelVersion>, path: &Path) -> Option<KernelVersion> {
+    if let Some(v) = cache.get() {
+        return Some(*v);
+    }
+    let read = fs::read_to_string(path).ok().as_deref().and_then(KernelVersion::parse)?;
+    Some(*cache.get_or_init(|| read))
 }
 
 /**
@@ -1256,7 +1271,7 @@ impl fmt::Display for KernelSupport {
     }
 }
 
-/// The loaded module's [`KernelSupport`] (probed once per process).
+/// The loaded module's [`KernelSupport`], from [`kernel_version`].
 pub fn kernel_support() -> KernelSupport {
     KernelSupport::of(kernel_version())
 }
@@ -1322,7 +1337,7 @@ slot 6 — are keyed off the arrays' lengths instead, in [`crate::stats`].) An
 unprobeable version (no module) defaults to the modern layout.
 */
 pub fn kernel_pre_2_0() -> bool {
-    KERNEL_VERSION.is_some_and(|v| v.major == 0)
+    kernel_version().is_some_and(|v| v.major == 0)
 }
 
 /// Decoded `dmu_objset_stats_t` as filled in by OBJSET_STATS / LIST_NEXT.
@@ -2926,6 +2941,25 @@ mod tests {
         assert_eq!(v("2.4.9"), Some(KernelVersion { major: 2, minor: 4 }));
         assert_eq!(v("garbage"), None);
         assert_eq!(v(""), None);
+    }
+
+    /// A failed probe isn't remembered (the module may load later); a
+    /// version that was read is.
+    #[test]
+    fn version_probe_caches_only_a_version() {
+        let path = std::env::temp_dir().join(format!("zfsdev-version-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let cache = OnceLock::new();
+        assert_eq!(probe_version(&cache, &path), None);
+        fs::write(&path, "garbage\n").unwrap();
+        assert_eq!(probe_version(&cache, &path), None);
+        fs::write(&path, "2.2.2-0ubuntu9.1\n").unwrap();
+        let v22 = Some(KernelVersion { major: 2, minor: 2 });
+        assert_eq!(probe_version(&cache, &path), v22);
+        fs::write(&path, "2.4.0\n").unwrap();
+        assert_eq!(probe_version(&cache, &path), v22);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(probe_version(&cache, &path), v22);
     }
 
     #[test]
