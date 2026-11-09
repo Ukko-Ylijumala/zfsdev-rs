@@ -46,7 +46,7 @@ version = "0.4"
 features = ["write"]
 ```
 
-Releases are tagged `vX.Y.Z`; use `tag = "v0.4.7"` instead of `version` to pin
+Releases are tagged `vX.Y.Z`; use `tag = "v0.4.8"` instead of `version` to pin
 one exactly. Rust 1.88 or newer is required.
 
 ### Features
