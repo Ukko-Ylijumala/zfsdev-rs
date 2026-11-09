@@ -76,7 +76,7 @@ pub fn derive_wrapping_key(
             if digits.len() != HEX_KEY_DIGITS {
                 return Err(KeyMaterialError::HexLength(digits.len()));
             }
-            for (i, pair) in digits.chunks_exact(2).enumerate() {
+            for (i, pair) in digits.as_chunks::<2>().0.iter().enumerate() {
                 let (Some(hi), Some(lo)) = (hex_digit(pair[0]), hex_digit(pair[1])) else {
                     return Err(KeyMaterialError::HexDigit(i + 1));
                 };

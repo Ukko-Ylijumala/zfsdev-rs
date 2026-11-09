@@ -1801,7 +1801,7 @@ impl ZfsHandle {
             zc.zc_nvlist_dst_size = buf.len() as u64;
             self.ioctl_named(Ioc::UserspaceMany, &mut zc, dataset)?;
             let filled = (zc.zc_nvlist_dst_size as usize).min(buf.len());
-            for rec in buf[..filled].chunks_exact(REC) {
+            for rec in buf[..filled].as_chunks::<REC>().0 {
                 out.push(UserAcct {
                     domain: cstr_field(&rec[..MAXNAMELEN]),
                     rid: u32::from_ne_bytes(rec[256..260].try_into().unwrap()),
