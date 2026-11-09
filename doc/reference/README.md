@@ -6,9 +6,10 @@ the ioctl numbers, the nvlist wire format, the stat-array layouts, the C enums,
 the innvl/outnvl contracts of the new-style ioctls and the kstat formats.
 
 They are **reference only**. Nothing here is compiled into or linked with the
-crate, and `doc/` is excluded from its package. The one programmatic use is
-the test `ioc_ordinals_match_vendored_headers`, which reads the `zfs.h` copies
-when the tests run.
+crate, and `doc/` is excluded from its package. The programmatic uses are two
+tests that read them when the tests run: `ioc_ordinals_match_vendored_headers`
+(the `zfs.h` copies) and `settability_matches_vendored_property_tables` (the
+`zfs_prop.c` and `zpool_prop.c` copies).
 
 ## License
 
@@ -30,11 +31,14 @@ header unmodified. The `README.md` files are this project's own analyses.
   - the per-pool kstats: `spa_stats.c` (`txgs`, `dmu_tx_assign`, `state`)
     and `dataset_kstats.{c,h}` (the `objset-0x*` counters)
   - on-disk enums mirrored in `enums.rs`: `spa.h`, `zio.h`, `zio_compress.h`
+  - the property tables, for which properties are read-only or create-only:
+    `zfs_prop.c`, `zpool_prop.c`
 - `0.6/`, `0.7/`, `0.8/`, `2.0/`, `2.1/`, `2.3/` and `2.4/` hold the ioctl-ABI
   headers of each release line: `zfs_ioctl.h`, `zfs.h`, `dmu.h` and
   `zfs_stat.h`, from zfs-0.6.5.11, 0.7.13, 0.8.6, 2.0.7, 2.1.15, 2.3.9 and
-  2.4.4. Each directory's `README.md` compares that release's ABI with the
-  2.2 layout and says what support for it takes.
+  2.4.4. The supported ones (0.8 onward) also hold that release's
+  `zfs_prop.c` and `zpool_prop.c`. Each directory's `README.md` compares
+  that release's ABI with the 2.2 layout and says what support for it takes.
 
 The per-version READMEs were written in
 [zfs-browser](https://github.com/Ukko-Ylijumala/zfs-browser), where this layer

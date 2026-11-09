@@ -97,7 +97,10 @@ table, Linux-only), `wrapkey` (libzfs wrapping-key derivation).
   read-only or create-only dataset property it is handed (libzfs is what
   refuses them, in userspace). `props::prop_settable` is the only gate, so a
   property added to `ZfsProp` or found read-only upstream must be classified
-  there (`ZfsProp::settable`, `ReadOnlyProp`).
+  there (`ZfsProp::settable`, `ReadOnlyProp`, `CreateOnlyProp`).
+  `settability_matches_vendored_property_tables` pins it against every
+  vendored `zfs_prop.c` / `zpool_prop.c`, so vendor those too when moving
+  `NEWEST_VERIFIED`.
 - Per-ioctl quirks (back-filled ERROR_LOG buffers, USERSPACE_MANY's raw
   `zfs_useracct_t` array, the asymmetric HOLD/RELEASE nvlists, ATTACH using
   `zc_nvlist_conf`, VDEV_GET_PROPS returning computed props only when named,

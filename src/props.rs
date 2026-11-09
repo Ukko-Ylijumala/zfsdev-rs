@@ -634,8 +634,9 @@ a property of either kind. So this classification is the only gate there is.
 pub enum PropSettable {
     /// Computed or informational (`PROP_READONLY`): never settable.
     ReadOnly,
-    /// Fixed when the dataset is created (`PROP_ONETIME`): `encryption`,
-    /// `keyformat`, `casesensitivity`, `normalization`, `utf8only`, `volblocksize`.
+    /// Fixed when the dataset is created (`PROP_ONETIME`, `PROP_ONETIME_DEFAULT`):
+    /// `encryption`, `keyformat`, `casesensitivity`, `normalization`, `utf8only`,
+    /// `volblocksize`. Also a pool's `tname`, given at creation or import.
     CreateOnly,
     /// Settable at any time.
     Always,
@@ -667,7 +668,7 @@ pub fn parse_prop_value(name: &str, input: &str) -> Result<NvData, String> {
     match prop_settable(name) {
         PropSettable::ReadOnly => Err(read_only(name)),
         PropSettable::CreateOnly => {
-            Err(format!("'{name}' can only be set when the dataset is created"))
+            Err(format!("'{name}' can only be set at creation"))
         }
         PropSettable::Always => typed_prop_value(name, input),
     }
@@ -865,7 +866,8 @@ a plain `EnumString` is enough. The computed props (used/available/…) live in
 `ZfsProp`; these are the identity/state fields that would otherwise fall
 through to "editable string". With the read-only arm of
 [`ZfsProp::settable`] this is every `PROP_READONLY` registration of
-zfs_prop.c and zpool_prop.c from OpenZFS 2.2 to 2.4, hidden ones included.
+zfs_prop.c and zpool_prop.c from ZoL 0.8 to OpenZFS 2.4, hidden ones included
+(pinned against the vendored tables by a test).
 The string-typed ones matter most: the kernel takes a string for them (see
 [`PropSettable`]), while a string for a numeric one is a clean EINVAL.
 */
@@ -934,6 +936,16 @@ enum ReadOnlyProp {
     MaxBlockSize,
     #[strum(serialize = "maxdnodesize")]
     MaxDnodeSize,
+    // ZoL 0.8 only
+    PrivProp,
+}
+
+/// The create-only (`PROP_ONETIME`) properties that aren't modelled as
+/// [`ZfsProp`], likewise a membership set: a pool's temporary name.
+#[derive(EnumString)]
+#[strum(serialize_all = "snake_case")]
+enum CreateOnlyProp {
+    Tname,
 }
 
 impl ZfsProp {
@@ -993,6 +1005,9 @@ pub fn prop_settable(name: &str) -> PropSettable {
     }
     if ReadOnlyProp::from_str(name).is_ok() {
         return PropSettable::ReadOnly;
+    }
+    if CreateOnlyProp::from_str(name).is_ok() {
+        return PropSettable::CreateOnly;
     }
     ZfsProp::from_str(name).map_or(PropSettable::Always, ZfsProp::settable)
 }
@@ -1116,6 +1131,8 @@ fn parse_dedup(s: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
 
     #[rustfmt::skip]
     #[test]
@@ -1264,7 +1281,7 @@ mod tests {
             assert_eq!(prop_settable(prop), PropSettable::CreateOnly, "{prop}");
             assert!(!is_editable(prop), "{prop}");
             let refused = parse_prop_value(prop, value).unwrap_err();
-            assert!(refused.contains("created"), "{prop}: {refused}");
+            assert!(refused.contains("at creation"), "{prop}: {refused}");
             assert!(matches!(parse_create_prop_value(prop, value), Ok(NvData::Uint64(_))), "{prop}");
         }
         for ok in ["compression", "readonly", "keylocation", "mountpoint", "com.example:name"] {
@@ -1282,6 +1299,64 @@ mod tests {
             assert_eq!(refused, prop.settable() == PropSettable::ReadOnly, "{name}");
             assert_eq!(prop_settable(name), prop.settable(), "{name}");
         }
+    }
+
+    /**
+    The `(name, attribute)` of every `zprop_register_*` call in a vendored
+    property table: the first string literal and the `zprop_attr_t` token.
+    */
+    fn registrations(src: &str) -> Vec<(&str, &str)> {
+        const ATTRS: [&str; 5] =
+            ["PROP_DEFAULT", "PROP_READONLY", "PROP_INHERIT", "PROP_ONETIME", "PROP_ONETIME_DEFAULT"];
+        // zpool_prop.c also holds the vdev properties (2.2+), a separate namespace
+        let src = src.split_once("\nvdev_prop_init(").map_or(src, |(pool, _)| pool);
+        src.split("zprop_register_")
+            .skip(1)
+            .map(|call| {
+                let call = call.split_once(';').expect("unterminated registration").0;
+                let name = match call.split(',').nth(1).map(str::trim) {
+                    Some("ZPOOL_DEDUPCACHED_PROP_NAME") => "dedupcached",
+                    Some(lit) => lit.strip_prefix('"').and_then(|l| l.strip_suffix('"')).expect(lit),
+                    None => panic!("registration without a name"),
+                };
+                let attr = call
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .find(|tok| ATTRS.contains(tok))
+                    .unwrap_or_else(|| panic!("no attribute on {name}"));
+                (name, attr)
+            })
+            .collect()
+    }
+
+    /**
+    `prop_settable` agrees with the property tables of every verified release
+    (`zfs_prop.c` and `zpool_prop.c`, 2.2 at the reference root), by the rule
+    libzfs applies: `PROP_READONLY` is never settable, `PROP_ONETIME` and
+    `PROP_ONETIME_DEFAULT` only at creation. `STRICTER` are the ones held
+    read-only on purpose: a `version` upgrade is one-way, and the pbkdf2 pair
+    belongs to the wrapping key (CHANGE_KEY), not to a property edit.
+    */
+    #[test]
+    fn settability_matches_vendored_property_tables() {
+        const STRICTER: [&str; 3] = ["version", "pbkdf2iters", "pbkdf2salt"];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("doc/reference");
+        let mut seen = 0;
+        for dir in ["0.8", "2.0", "2.1", "", "2.3", "2.4"] {
+            for file in ["zfs_prop.c", "zpool_prop.c"] {
+                let src = fs::read_to_string(root.join(dir).join(file)).unwrap();
+                for (name, attr) in registrations(&src) {
+                    let want = match attr {
+                        "PROP_READONLY" => PropSettable::ReadOnly,
+                        "PROP_ONETIME" | "PROP_ONETIME_DEFAULT" => PropSettable::CreateOnly,
+                        _ => PropSettable::Always,
+                    };
+                    let want = if STRICTER.contains(&name) { PropSettable::ReadOnly } else { want };
+                    assert_eq!(prop_settable(name), want, "{name} ({attr}) in {dir:?}/{file}");
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 700, "only {seen} registrations parsed");
     }
 
     #[rustfmt::skip]
